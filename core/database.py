@@ -1246,6 +1246,19 @@ class Database(FollowupStore):
                 return default
             return row["value"]
 
+    async def get_settings_map(self, keys: list[str]) -> dict[str, str | None]:
+        """Read several settings over one connection; hot loops call this per tick."""
+        scoped = [self._setting_key(key) for key in keys]
+        async with _connect() as db:
+            rows = await (
+                await db.execute(
+                    "SELECT key, value FROM settings WHERE key IN (" + ",".join("?" * len(scoped)) + ")",
+                    scoped,
+                )
+            ).fetchall()
+        found = {row[0]: row[1] for row in rows}
+        return {key: found.get(self._setting_key(key)) for key in keys}
+
     async def add_chat(self, username: str, title: str | None = None) -> None:
         chat_value = username.strip()
         if not chat_value:

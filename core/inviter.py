@@ -353,11 +353,11 @@ class InviterEngine:
         return None
 
     async def _is_within_schedule(self) -> bool:
-        schedule_enabled = await self.db.get_setting("schedule_enabled", "0")
-        if schedule_enabled != "1":
+        settings = await self.db.get_settings_map(["schedule_enabled", "schedule_from", "schedule_to"])
+        if settings["schedule_enabled"] != "1":
             return True
-        from_str = await self.db.get_setting("schedule_from", "00:00")
-        to_str = await self.db.get_setting("schedule_to", "23:59")
+        from_str = settings["schedule_from"] or "00:00"
+        to_str = settings["schedule_to"] or "23:59"
         now = datetime.now()
 
         start = time_minutes(str(from_str))

@@ -5,6 +5,7 @@ from typing import Callable
 from core.database import Database
 from core.inviter import InviterEngine
 from core.messenger import MessageEngine
+from core.user_feedback import explain_error
 
 
 class TaskScheduler:
@@ -51,6 +52,14 @@ class TaskScheduler:
             self.engine.start(accounts, message if mode == "messages" else chat, interval_min, interval_max),
             self.loop,
         )
+
+        def observe(result: Future) -> None:
+            # The engine handles its own errors; this surfaces framework bugs
+            # that escape engine.start and would otherwise stay unread in the future.
+            if not result.cancelled() and result.exception() is not None:
+                self.callbacks["log_callback"]("ERROR", "Сбой задачи: " + explain_error(result.exception()))
+
+        self.future.add_done_callback(observe)
 
     def pause(self) -> None:
         self.loop.call_soon_threadsafe(self.engine.pause)
