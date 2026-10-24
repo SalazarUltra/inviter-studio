@@ -158,11 +158,11 @@ class AccountManager:
             await self.disconnect()
         self.account.update(phone=phone, api_id=api_id, api_hash=api_hash)
         if isinstance(proxy, dict):
+            # Proxy is applied before connect(); set_proxy after connect would not
+            # affect the already established connection.
             self.account.update(proxy)
         try:
             await self.connect(require_authorized=False)
-            if proxy is not None and not isinstance(proxy, dict):
-                self.client.set_proxy(proxy)
             return await asyncio.wait_for(self.client.send_code_request(phone), timeout=30)
         except BaseException:
             await self.disconnect()
@@ -179,13 +179,13 @@ class AccountManager:
 
         try:
             if password:
-                await self.client.sign_in(password=password)
+                await asyncio.wait_for(self.client.sign_in(password=password), timeout=30)
             elif code:
-                await self.client.sign_in(phone=phone, code=code)
+                await asyncio.wait_for(self.client.sign_in(phone=phone, code=code), timeout=30)
             else:
                 return {"status": "code_required"}
 
-            if await self.client.is_user_authorized():
+            if await asyncio.wait_for(self.client.is_user_authorized(), timeout=15):
                 return {"status": "ok"}
             return {"status": "unauthorized"}
         except SessionPasswordNeededError:
@@ -202,13 +202,15 @@ class AccountManager:
         resolving_user = True
         try:
             clean_username = normalize_username(username)
-            user_entity = await self.client.get_entity(clean_username)
+            user_entity = await asyncio.wait_for(self.client.get_entity(clean_username), timeout=30)
             if not isinstance(user_entity, User):
                 return {"success": False, "error": "not_found", "message": "Никнейм принадлежит каналу или группе"}
             resolving_user = False
-            chat_entity = await self.client.get_entity(chat)
+            chat_entity = await asyncio.wait_for(self.client.get_entity(chat), timeout=30)
             try:
-                permissions = await self.client.get_permissions(chat_entity, user_entity)
+                permissions = await asyncio.wait_for(
+                    self.client.get_permissions(chat_entity, user_entity), timeout=30
+                )
                 if permissions and not permissions.has_left and not permissions.is_banned:
                     return {"success": False, "error": "already_in"}
             except UserNotParticipantError:
@@ -219,7 +221,7 @@ class AccountManager:
                 request = InviteToChannelRequest(channel=chat_entity, users=[user_entity])
             else:
                 return {"success": False, "error": "need_admin", "message": "Цель должна быть группой или каналом"}
-            response = await self.client(request)
+            response = await asyncio.wait_for(self.client(request), timeout=30)
             if getattr(response, "missing_invitees", None):
                 return {"success": False, "error": "private", "message": "Telegram не разрешил добавить пользователя"}
             return {"success": True, "error": None, "flood_seconds": None}
@@ -252,6 +254,13 @@ class AccountManager:
             return {"success": False, "error": "already_in"}
         except ChatAdminRequiredError:
             return {"success": False, "error": "need_admin"}
+        except asyncio.TimeoutError:
+            # The invite request may have reached Telegram; the outcome is unknown.
+            return {
+                "success": False,
+                "error": "uncertain",
+                "message": "Превышено время ожидания Telegram; результат неизвестен, проверьте вручную",
+            }
         except Exception as exc:
             return {"success": False, "error": "unknown", "message": explain_error(exc)}
 
@@ -338,21 +347,28 @@ class AccountManager:
         """
         if not self.client:
             return []
-        dialogs: list[dict[str, Any]] = []
-        async for dialog in self.client.iter_dialogs():
-            entity = dialog.entity
-            if not isinstance(entity, (Channel, Chat)):
-                continue
-            dialogs.append(
-                {
-                    "id": utils.get_peer_id(entity),
-                    "username": getattr(entity, "username", None) or "",
-                    "title": dialog.name or "",
-                    "type": "channel" if getattr(entity, "broadcast", False) else "group",
-                    "members_count": getattr(entity, "participants_count", 0) or 0,
-                }
-            )
-        return dialogs
+
+        async def fetch() -> list[dict[str, Any]]:
+            dialogs: list[dict[str, Any]] = []
+            async for dialog in self.client.iter_dialogs():
+                entity = dialog.entity
+                if not isinstance(entity, (Channel, Chat)):
+                    continue
+                dialogs.append(
+                    {
+                        "id": utils.get_peer_id(entity),
+                        "username": getattr(entity, "username", None) or "",
+                        "title": dialog.name or "",
+                        "type": "channel" if getattr(entity, "broadcast", False) else "group",
+                        "members_count": getattr(entity, "participants_count", 0) or 0,
+                    }
+                )
+            return dialogs
+
+        try:
+            return await asyncio.wait_for(fetch(), timeout=120)
+        except asyncio.TimeoutError:
+            raise RuntimeError("Не удалось получить список диалогов за отведённое время. Проверьте подключение") from None
 
     async def check_admin_rights(self, chat: str) -> dict[str, Any]:
         if not self.client:
