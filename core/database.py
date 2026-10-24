@@ -654,34 +654,39 @@ class Database(FollowupStore):
             return int(cur.lastrowid)
 
     async def update_account(self, account_id: int, payload: dict[str, Any]) -> None:
-        current = await self.get_account(account_id)
-        if not current:
-            raise ValueError("Аккаунт не найден")
-        merged = validate_account({**current, **payload})
-        payload = {key: merged[key] for key in payload}
-        fields = []
-        values: list[Any] = []
-        for key in (
-            "phone",
-            "api_id",
-            "api_hash",
-            "proxy_type",
-            "proxy_host",
-            "proxy_port",
-            "proxy_login",
-            "proxy_password",
-            "daily_limit",
-            "notes",
-            "status",
-            "flood_until",
-        ):
-            if key in payload:
-                fields.append(f"{key} = ?")
-                values.append(protect(payload[key]) if key in {"api_hash", "proxy_password"} else payload[key])
-        if not fields:
-            return
-        values.append(account_id)
+        # Read and write under one immediate transaction: the engine may update
+        # account status concurrently, and last-write-wins must at least be atomic.
         async with _connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            db.row_factory = aiosqlite.Row
+            row = await (await db.execute("SELECT * FROM accounts WHERE id = ?", (account_id,))).fetchone()
+            if not row:
+                raise ValueError("Аккаунт не найден")
+            merged = validate_account({**reveal_row(row), **payload})
+            changes = {key: merged[key] for key in payload}
+            fields = []
+            values: list[Any] = []
+            for key in (
+                "phone",
+                "api_id",
+                "api_hash",
+                "proxy_type",
+                "proxy_host",
+                "proxy_port",
+                "proxy_login",
+                "proxy_password",
+                "daily_limit",
+                "notes",
+                "status",
+                "flood_until",
+            ):
+                if key in changes:
+                    fields.append(f"{key} = ?")
+                    values.append(protect(changes[key]) if key in {"api_hash", "proxy_password"} else changes[key])
+            if not fields:
+                await db.commit()
+                return
+            values.append(account_id)
             await db.execute(f"UPDATE accounts SET {', '.join(fields)} WHERE id = ?", values)
             await db.commit()
 
@@ -798,7 +803,13 @@ class Database(FollowupStore):
             await db.commit()
 
         # Only the exact validated session belonging to this account is removed.
+        # Re-check ownership: a task may have claimed the session while the row
+        # deletion was committing; an orphaned file is safer than a live one.
         if phone:
+            from core.account_manager import AccountManager
+
+            if AccountManager.is_session_busy(phone, session_name):
+                return
             path = session_path(phone, session_name)
             for suffix in (".session", ".session-journal", ".session-wal", ".session-shm"):
                 path.with_name(path.name + suffix).unlink(missing_ok=True)
@@ -1139,7 +1150,15 @@ class Database(FollowupStore):
             )
             row = await cur.fetchone()
             if not row:
-                return {"total": 0, "added": 0, "pending": 0, "errors": 0, "skipped": 0}
+                return {
+                    "total": 0,
+                    "added": 0,
+                    "sent": 0,
+                    "pending": 0,
+                    "processing": 0,
+                    "errors": 0,
+                    "skipped": 0,
+                }
             return {
                 "total": int(row["total"] or 0),
                 "added": int(row["added"] or 0),
