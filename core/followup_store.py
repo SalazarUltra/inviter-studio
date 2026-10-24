@@ -91,8 +91,9 @@ class FollowupStore:
                 await db.commit()
                 return False
             await db.execute(
-                "UPDATE message_followups SET state='ready',reply_id=? WHERE username=? AND state='waiting'",
-                (message_id, row["username"]),
+                "UPDATE message_followups SET state='ready',reply_id=? "
+                "WHERE campaign_id=? AND username=? AND state='waiting'",
+                (message_id, self.campaign_id, row["username"]),
             )
             await note(db, row, "FOLLOWUP_REPLY", "Получен ответ. Второе сообщение ожидает отправки")
             await db.commit()
@@ -121,8 +122,9 @@ class FollowupStore:
                 return None
             random_id = secrets.randbits(63) or 1
             await db.execute(
-                "UPDATE message_followups SET state='sending',random_id=? WHERE username=? AND state='ready'",
-                (random_id, username),
+                "UPDATE message_followups SET state='sending',random_id=? "
+                "WHERE campaign_id=? AND username=? AND state='ready'",
+                (random_id, self.campaign_id, username),
             )
             await db.commit()
             return dict(row) | {"state": "sending", "random_id": random_id}
@@ -141,9 +143,17 @@ class FollowupStore:
             if not row:
                 raise RuntimeError("Второе сообщение уже обработано")
             await db.execute(
-                "UPDATE message_followups SET state=?,message_id=?,completed_at=? WHERE username=?",
-                (state, message_id, datetime.now().isoformat(), username),
+                "UPDATE message_followups SET state=?,message_id=?,completed_at=? WHERE campaign_id=? AND username=?",
+                (state, message_id, datetime.now().isoformat(), self.campaign_id, username),
             )
+            if state == "sent":
+                # A delivered follow-up consumes its own daily quota, never the first-message one.
+                today = datetime.now().date().isoformat()
+                await db.execute(
+                    "UPDATE accounts SET followups_today=CASE WHEN followup_reset_date=? "
+                    "THEN followups_today+1 ELSE 1 END,followup_reset_date=? WHERE id=?",
+                    (today, today, row["account_id"]),
+                )
             labels = {
                 "sent": ("FOLLOWUP_SENT", "Второе сообщение отправлено после ответа"),
                 "blocked": ("FOLLOWUP_BLOCKED", "Второе сообщение не отправлено: личные сообщения недоступны"),
@@ -166,7 +176,10 @@ class FollowupStore:
                 )
             ).fetchone()
             if row:
-                await db.execute("UPDATE message_followups SET state='blocked' WHERE username=?", (username,))
+                await db.execute(
+                    "UPDATE message_followups SET state='blocked' WHERE campaign_id=? AND username=?",
+                    (self.campaign_id, username),
+                )
                 await note(db, row, "FOLLOWUP_BLOCKED", "Второе сообщение не отправлено: переписка недоступна")
             await db.commit()
 
@@ -181,8 +194,8 @@ class FollowupStore:
             ).fetchall()
             for row in rows:
                 await db.execute(
-                    "UPDATE message_followups SET state='uncertain',completed_at=? WHERE username=?",
-                    (datetime.now().isoformat(), row["username"]),
+                    "UPDATE message_followups SET state='uncertain',completed_at=? WHERE campaign_id=? AND username=?",
+                    (datetime.now().isoformat(), self.campaign_id, row["username"]),
                 )
                 await note(
                     db,

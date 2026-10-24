@@ -420,14 +420,20 @@ class FollowupEngineTests(FollowupFixtures):
             await task
         self.assertTrue(await self.has_state("uncertain"))
 
-    async def test_daily_limit_defers_followup(self):
+    async def test_followup_daily_limit_defers_second(self):
         account = await self.configure(seed=True)
         await self.db.set_setting("task_status", "running")
         await self.db.receive_followup_reply(account["id"], 123, 11)
+        from datetime import date
+
         from core.database import _connect
 
         async with _connect() as connection:
-            await connection.execute("UPDATE accounts SET sent_today=40")
+            # The reply-triggered follow-up consumes its own daily counter (limit 40),
+            # already spent today; the midnight reset must not clear it mid-day.
+            await connection.execute(
+                "UPDATE accounts SET followups_today=40, followup_reset_date=?", (date.today().isoformat(),)
+            )
             await connection.commit()
         task = await self.run_engine(account)
         await asyncio.sleep(0.3)
@@ -435,6 +441,29 @@ class FollowupEngineTests(FollowupFixtures):
         await asyncio.wait_for(task, 5)
         self.manager.send_direct_message.assert_not_called()
         self.assertTrue(await self.has_state("cancelled"))
+
+    async def test_first_message_quota_does_not_block_second(self):
+        account = await self.configure(seed=True)
+        await self.db.set_setting("task_status", "running")
+        await self.db.receive_followup_reply(account["id"], 123, 11)
+        from datetime import date
+
+        from core.database import _connect
+
+        async with _connect() as connection:
+            # Exhausted first-message quota must not defer the follow-up.
+            await connection.execute(
+                "UPDATE accounts SET sent_today=40, last_message_reset_date=?", (date.today().isoformat(),)
+            )
+            await connection.commit()
+        task = await self.run_engine(account)
+        await asyncio.wait_for(task, 5)
+        # The seeded first message is not re-sent; only the follow-up goes out.
+        self.assertEqual(self.manager.send_direct_message.await_count, 1)
+        fresh = await self.db.get_account(account["id"])
+        self.assertEqual(fresh["sent_today"], 40)
+        self.assertEqual(fresh["followups_today"], 1)
+        self.assertTrue(await self.has_state("sent"))
 
 
 class FollowupProtocolTests(DatabaseCase):

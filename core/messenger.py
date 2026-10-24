@@ -390,8 +390,11 @@ class MessageEngine(InviterEngine):
                 account["status"] = "active"
             # The configured daily quota is the number of initial outreach
             # messages. A requested reply-triggered follow-up has its own
-            # counter and must remain sendable once that quota is reached.
+            # counter with the same conservative limit and must remain
+            # sendable once the first-message quota is reached.
             if not followup and int(account.get("sent_today") or 0) >= self.get_safe_daily_limit(account):
+                continue
+            if followup and int(account.get("followups_today") or 0) >= self.get_safe_daily_limit(account):
                 continue
             self._rr_index = (index + 1) % len(accounts)
             return account

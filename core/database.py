@@ -461,10 +461,16 @@ class Database(FollowupStore):
             await db.commit()
 
     async def reset_message_counters(self):
+        today = _today_iso()
         async with _connect() as db:
             await db.execute(
                 "UPDATE accounts SET sent_today=0, last_message_reset_date=? WHERE last_message_reset_date IS NULL OR last_message_reset_date!=?",
-                (_today_iso(), _today_iso()),
+                (today, today),
+            )
+            # Reply-triggered follow-ups keep their own daily counter with the same limits.
+            await db.execute(
+                "UPDATE accounts SET followups_today=0, followup_reset_date=? WHERE followup_reset_date IS NULL OR followup_reset_date!=?",
+                (today, today),
             )
             await db.commit()
 
@@ -579,8 +585,9 @@ class Database(FollowupStore):
             ).fetchone()
             if followup:
                 await db.execute(
-                    "UPDATE message_followups SET state=?,first_message_id=?,checked_id=? WHERE username=?",
-                    (fstate, message_id, message_id or 0, followup["username"]),
+                    "UPDATE message_followups SET state=?,first_message_id=?,checked_id=? "
+                    "WHERE campaign_id=? AND username=?",
+                    (fstate, message_id, message_id or 0, self.campaign_id, followup["username"]),
                 )
                 await followup_note(
                     db,
@@ -1860,6 +1867,8 @@ async def init_db() -> None:
             "accounts": {
                 "sent_today": "INTEGER DEFAULT 0",
                 "last_message_reset_date": "TEXT",
+                "followups_today": "INTEGER DEFAULT 0",
+                "followup_reset_date": "TEXT",
                 "is_enabled": "INTEGER DEFAULT 1",
                 "consecutive_adds": "INTEGER DEFAULT 0",
                 "rotation_break_until": "TEXT",
