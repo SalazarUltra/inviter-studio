@@ -46,14 +46,13 @@ class InviterEngine:
             raise RuntimeError("Задача уже выполняется")
         if not accounts or not chat or not 10 <= interval_min <= interval_max <= 300:
             raise ValueError("Укажите аккаунты, чат и интервал 10–300 секунд")
-        if await self.db.get_campaign_kind() != "invite":
-            raise ValueError("Выберите кампанию приглашений")
-        self.running = not self._stop_requested
+        # Claim the engine synchronously: a concurrent start() must not pass the
+        # guard above across the awaits inside the try block.
+        self.running = True
         self._task = asyncio.current_task()
         self.paused = False
         self._rr_index = 0
-        self._started_at = datetime.now()
-        self.start_time = datetime.now()
+        self._started_at = self.start_time = datetime.now()
         self.session_adds = 0
         claimed_target = None
         self._session_counts = {"added": 0, "skipped": 0, "errors": 0}
@@ -61,8 +60,10 @@ class InviterEngine:
         run_id = None
 
         try:
-            if not self.running:
+            if self._stop_requested:
                 return
+            if await self.db.get_campaign_kind() != "invite":
+                raise ValueError("Выберите кампанию приглашений")
             run_id = await self.db.begin_run(chat)
             await self.db.reset_daily_counters_if_needed()
             await self.db.reset_processing_to_pending()
@@ -283,6 +284,11 @@ class InviterEngine:
         finally:
             if self._stop_requested and outcome != "failed":
                 outcome = "stopped"
+            summary = {
+                **self._session_counts,
+                "outcome": outcome,
+                "duration": str(datetime.now() - self._started_at).split(".")[0],
+            }
             try:
                 if claimed_target is not None:
                     # Cancelled requests may have reached Telegram; leave processing
@@ -290,13 +296,11 @@ class InviterEngine:
                     self.log_callback("WARN", "Незавершённая цель будет восстановлена при следующем запуске")
                 await self.db.set_setting("task_status", "stopped")
                 if run_id is not None:
-                    summary = {
-                        **self._session_counts,
-                        "outcome": outcome,
-                        "duration": str(datetime.now() - self._started_at).split(".")[0],
-                    }
                     await self.db.finish_run(run_id, summary)
                 await self._show_final_report(outcome)
+            except Exception as exc:  # noqa: BLE001
+                # Cleanup failures must not swallow the completion callback.
+                self.log_callback("ERROR", "Ошибка завершения задачи: " + explain_error(exc))
             finally:
                 await self._disconnect_all()
                 self.running = False
@@ -305,10 +309,6 @@ class InviterEngine:
                 if self.status_callback:
                     self.status_callback("Ошибка" if outcome == "failed" else "Остановлено")
             if self.complete_callback:
-                summary = self._session_counts.copy()
-                duration = datetime.now() - (self._started_at or datetime.now())
-                summary["duration"] = str(duration).split(".")[0]
-                summary["outcome"] = outcome
                 self.complete_callback(summary)
 
     async def _wait(self, seconds: float) -> None:

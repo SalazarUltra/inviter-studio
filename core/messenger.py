@@ -22,32 +22,36 @@ from core.validation import validate_message
 class MessageEngine(InviterEngine):
     async def start(self, accounts, text, interval_min, interval_max):
         validate_message(text)
-        if self.running or not accounts or not 10 <= interval_min <= interval_max <= 86400:
+        if self.running:
+            raise RuntimeError("Задача уже выполняется")
+        if not accounts or not 10 <= interval_min <= interval_max <= 86400:
             raise ValueError("Выберите аккаунты и интервал 10–86400 секунд")
-        if await self.db.get_campaign_kind() != "messages":
-            raise ValueError("Выберите кампанию личных сообщений")
-        self.followup_text = (
-            await self.db.get_setting("followup_text", "")
-            if await self.db.get_setting("followup_enabled", "0") == "1"
-            else None
-        )
-        if self.followup_text is not None:
-            validate_message(self.followup_text)
-        self.followups = None
-        self._followup_failed = False
-        self.running = not self._stop_requested
-        self.paused = False
+        # Claim the engine synchronously: a concurrent start() must not pass the
+        # guard above across the awaits inside the try block.
+        self.running = True
         self._task = asyncio.current_task()
+        self.paused = False
         self._started_at = self.start_time = datetime.now()
         self._session_counts = {"added": 0, "sent": 0, "followup_sent": 0, "skipped": 0, "errors": 0}
         self._rr_index = 0
-        streaks = {}
-        self._streaks = streaks
+        self._streaks = {}
+        self.followup_text = None
+        self.followups = None
+        self._followup_failed = False
         claimed = reserved = run_id = None
         outcome = "completed"
         try:
-            if not self.running:
+            if self._stop_requested:
                 return
+            if await self.db.get_campaign_kind() != "messages":
+                raise ValueError("Выберите кампанию личных сообщений")
+            self.followup_text = (
+                await self.db.get_setting("followup_text", "")
+                if await self.db.get_setting("followup_enabled", "0") == "1"
+                else None
+            )
+            if self.followup_text is not None:
+                validate_message(self.followup_text)
             await self.db.recover_message_deliveries()
             await self.db.recover_followups()
             await self.db.reset_processing_to_pending()
@@ -302,6 +306,13 @@ class MessageEngine(InviterEngine):
                 outcome = "failed"
             if self._stop_requested and outcome != "failed":
                 outcome = "stopped"
+            summary = {
+                **self._session_counts,
+                "outcome": outcome,
+                "duration": str(datetime.now() - self._started_at).split(".")[0],
+                "followup_waiting": 0,
+                "followup_cancelled": 0,
+            }
             try:
                 if self.followups:
                     await self.followups.close()
@@ -315,13 +326,8 @@ class MessageEngine(InviterEngine):
                     "Задача завершена или остановлена; второе сообщение отменено и после ответа не отправится"
                 )
                 followup_stats = await self.db.get_followup_stats()
-                summary = {
-                    **self._session_counts,
-                    "outcome": outcome,
-                    "duration": str(datetime.now() - self._started_at).split(".")[0],
-                    "followup_waiting": sum(followup_stats.get(key, 0) for key in ("waiting", "ready")),
-                    "followup_cancelled": cancelled_followups,
-                }
+                summary["followup_waiting"] = sum(followup_stats.get(key, 0) for key in ("waiting", "ready"))
+                summary["followup_cancelled"] = cancelled_followups
                 if run_id is not None:
                     await self.db.finish_run(run_id, summary)
                 await self._progress()
@@ -330,6 +336,9 @@ class MessageEngine(InviterEngine):
                     f"Первых сообщений: {summary['sent']}; вторых после ответа: {summary['followup_sent']}; "
                     f"пропущено: {summary['skipped']}; ошибок: {summary['errors']}",
                 )
+            except Exception as exc:  # noqa: BLE001
+                # Cleanup failures must not swallow the completion callback.
+                self.log_callback("ERROR", "Ошибка завершения задачи: " + explain_error(exc))
             finally:
                 await self._disconnect_all()
                 self.running = self.paused = False
