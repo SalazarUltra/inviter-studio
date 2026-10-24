@@ -208,9 +208,7 @@ class AccountManager:
             resolving_user = False
             chat_entity = await asyncio.wait_for(self.client.get_entity(chat), timeout=30)
             try:
-                permissions = await asyncio.wait_for(
-                    self.client.get_permissions(chat_entity, user_entity), timeout=30
-                )
+                permissions = await asyncio.wait_for(self.client.get_permissions(chat_entity, user_entity), timeout=30)
                 if permissions and not permissions.has_left and not permissions.is_banned:
                     return {"success": False, "error": "already_in"}
             except UserNotParticipantError:
@@ -368,7 +366,9 @@ class AccountManager:
         try:
             return await asyncio.wait_for(fetch(), timeout=120)
         except asyncio.TimeoutError:
-            raise RuntimeError("Не удалось получить список диалогов за отведённое время. Проверьте подключение") from None
+            raise RuntimeError(
+                "Не удалось получить список диалогов за отведённое время. Проверьте подключение"
+            ) from None
 
     async def check_admin_rights(self, chat: str) -> dict[str, Any]:
         if not self.client:
