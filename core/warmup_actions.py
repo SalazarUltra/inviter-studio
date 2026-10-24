@@ -13,7 +13,8 @@ from typing import Any
 from telethon import TelegramClient, utils
 from telethon.errors import AuthKeyUnregisteredError, FloodWaitError, PeerFloodError
 from telethon.tl.functions.messages import GetHistoryRequest, SendReactionRequest
-from telethon.tl.types import Channel, ReactionEmoji
+from telethon.tl.functions.users import GetFullUserRequest
+from telethon.tl.types import Channel, InputUser, ReactionEmoji, User
 
 from core.user_feedback import explain_error
 
@@ -113,11 +114,45 @@ class WarmupActions:
         except Exception as exc:  # noqa: BLE001
             return {"success": False, "detail": explain_error(exc)}
 
-    async def view_profile(self, username: str) -> dict[str, Any]:
+    async def view_profile(self, channel: str) -> dict[str, Any]:
+        """Open a real participant profile via GetFullUser, not just a cached channel lookup."""
         try:
-            await self.client.get_entity(username)
+            entity = await self.client.get_entity(channel)
+            if isinstance(entity, Channel) and entity.broadcast:
+                # Broadcast channels expose no member dialogue to sample from.
+                await asyncio.sleep(random.uniform(3, 10))
+                title = getattr(entity, "username", None) or channel
+                return {"success": True, "detail": f"Обновлены данные канала @{title}"}
+            history = await self.client(
+                GetHistoryRequest(
+                    peer=entity,
+                    limit=10,
+                    offset_date=None,
+                    offset_id=0,
+                    max_id=0,
+                    min_id=0,
+                    add_offset=0,
+                    hash=0,
+                )
+            )
+            candidates = [
+                user
+                for user in history.users
+                if isinstance(user, User)
+                and not user.is_self
+                and not user.bot
+                and not user.deleted
+                and getattr(user, "access_hash", None)
+            ]
+            if not candidates:
+                await asyncio.sleep(random.uniform(3, 10))
+                title = getattr(entity, "title", None) or channel
+                return {"success": True, "detail": f"Обновлены данные чата {title}"}
+            person = random.choice(candidates)
+            await self.client(GetFullUserRequest(InputUser(person.id, person.access_hash)))
             await asyncio.sleep(random.uniform(5, 20))
-            return {"success": True, "detail": f"Просмотр профиля @{username}"}
+            name = f"@{person.username}" if person.username else (person.first_name or str(person.id))
+            return {"success": True, "detail": f"Просмотр профиля {name}"}
         except (FloodWaitError, PeerFloodError, AuthKeyUnregisteredError):
             raise
         except Exception as exc:  # noqa: BLE001

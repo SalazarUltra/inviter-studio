@@ -158,7 +158,9 @@ class EngineTests(DatabaseCase):
             task = asyncio.create_task(engine.start(account, "medium", "test"))
             await asyncio.wait_for(entered.wait(), 3)
             engine.stop()
-            await asyncio.wait_for(task, 1)
+            # Cancellation must propagate: the task ends cancelled, not "successfully".
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 1)
         self.assertFalse(engine.running)
         manager.disconnect.assert_awaited_once()
         self.assertEqual((await self.db.get_warmup_session(account["id"]))["status"], "paused")

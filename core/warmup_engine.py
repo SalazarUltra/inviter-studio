@@ -95,6 +95,8 @@ class WarmupEngine:
                 outcome = "completed"
         except asyncio.CancelledError:
             self.log_callback("INFO", "Прогрев приостановлен")
+            # Cancellation must propagate; swallowing it hides the task's real state.
+            raise
         except FloodWaitError as exc:
             await self.db.set_flood_wait(account["id"], int(exc.seconds))
             self.log_callback("WARN", f"Telegram требует ожидание {exc.seconds} сек. Прогрев остановлен")

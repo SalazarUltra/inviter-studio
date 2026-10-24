@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import CancelledError as FutureCancelledError
 from datetime import datetime
 
 import customtkinter as ctk
@@ -826,6 +827,9 @@ class TabWarmup(ctk.CTkFrame):
         def done(f):
             try:
                 _ = f.result()
+            except FutureCancelledError:
+                # The engine re-raises cancellation after logging "приостановлен".
+                pass
             except Exception as exc:  # noqa: BLE001
                 self._safe_after(lambda exc=exc: self._log("ERROR", f"Ошибка прогрева: {exc}"))
             finally:
