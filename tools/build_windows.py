@@ -37,6 +37,62 @@ def find_compiler():
     )
 
 
+def find_signtool():
+    explicit = os.environ.get("SIGNTOOL_PATH")
+    candidates = [Path(explicit)] if explicit else []
+    on_path = shutil.which("signtool.exe")
+    if on_path:
+        candidates.append(Path(on_path))
+    for variable in ("ProgramFiles(x86)", "ProgramFiles", "ProgramW6432"):
+        base = os.environ.get(variable)
+        if base:
+            kits = Path(base) / "Windows Kits" / "10" / "bin"
+            if kits.is_dir():
+                # Versioned SDK folders: pick the newest installed kit.
+                candidates += sorted(kits.glob("*/x64/signtool.exe"), reverse=True)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    raise RuntimeError(
+        "signtool.exe не найден. Установите Windows SDK или задайте SIGNTOOL_PATH на signtool.exe для подписи сборки."
+    )
+
+
+def sign_artifacts(paths):
+    """Sign release artifacts when a certificate is configured; otherwise build unsigned.
+
+    Set INVITER_SIGNING_THUMBPRINT to the SHA-1 thumbprint of a certificate from the
+    current user's store (optional INVITER_TIMESTAMP_URL overrides the RFC3161 server).
+    """
+    thumbprint = os.environ.get("INVITER_SIGNING_THUMBPRINT", "").strip()
+    if not thumbprint:
+        print("Подпись отключена: INVITER_SIGNING_THUMBPRINT не задан (сборка остаётся без подписи).")
+        return
+    signtool = find_signtool()
+    timestamp = os.environ.get("INVITER_TIMESTAMP_URL", "http://timestamp.digicert.com")
+    for artifact in paths:
+        if not artifact.is_file():
+            continue
+        subprocess.run(
+            [
+                str(signtool),
+                "sign",
+                "/fd",
+                "SHA256",
+                "/td",
+                "SHA256",
+                "/tr",
+                timestamp,
+                "/sha1",
+                thumbprint,
+                str(artifact),
+            ],
+            check=True,
+            timeout=180,
+        )
+        print(f"Подписан: {artifact}")
+
+
 def validate_package(package):
     if not (package / "InviterStudio.exe").is_file() or not (package / "_internal").is_dir():
         raise RuntimeError("Нет полной сборки приложения: нужны InviterStudio.exe и _internal")
@@ -117,7 +173,8 @@ def main():
         )
         if not package.resolve().is_relative_to((ROOT / "dist").resolve()):
             raise RuntimeError("Путь сборки должен находиться внутри dist")
-    validate_package(package)
+        validate_package(package)
+        sign_artifacts([package / "InviterStudio.exe"])
     subprocess.run(
         [
             str(compiler),
@@ -140,6 +197,7 @@ def main():
         '@echo off\nsetlocal\nset "INVITER_HOME=%~dp0.."\nstart "" "%~dp0' + batch_path + '\\InviterStudio.exe"\n',
         encoding="ascii",
     )
+    sign_artifacts([ROOT / "dist/InviterStudioSetup.exe"])
     handoff = prepare_handoff(ROOT, ROOT / "dist/InviterStudioSetup.exe")
     print(f"Built: {package / 'InviterStudio.exe'}; handoff: {handoff}")
 

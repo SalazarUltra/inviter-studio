@@ -7,7 +7,13 @@ if (-not (Test-Path -LiteralPath $python)) {
     throw "Python virtual environment not found: .venv"
 }
 if (-not (Test-Path -LiteralPath $ruff)) {
-    throw "Ruff not found in .audit/tooling"
+    # Builds run this gate too; fall back to a ruff installed in .venv.
+    $fallback = Join-Path $root ".venv\Scripts\ruff.exe"
+    if (Test-Path -LiteralPath $fallback) {
+        $ruff = $fallback
+    } else {
+        throw "Ruff not found in .audit/tooling or .venv. Run: .audit\tooling\Scripts\pip.exe install -r requirements-dev.txt"
+    }
 }
 
 $oldSslKeyLog = $env:SSLKEYLOGFILE

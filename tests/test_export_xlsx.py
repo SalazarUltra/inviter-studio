@@ -71,9 +71,7 @@ class TargetsXlsxExportTests(unittest.TestCase):
                 sheet = ET.fromstring(workbook.read("xl/worksheets/sheet1.xml"))
             ns = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
             cells = [node.findtext("x:is/x:t", namespaces=ns) for node in sheet.findall(".//x:c", ns)]
-            self.assertEqual(
-                cells[:5], ["Получатель", "Результат", "Причина", "Аккаунт", "Дата обработки"]
-            )
+            self.assertEqual(cells[:5], ["Получатель", "Результат", "Причина", "Аккаунт", "Дата обработки"])
             self.assertEqual(
                 cells[5:10],
                 ["@=cmd", "Отправлено", "", "+380500000001", "2026-10-24 12:00:00"],

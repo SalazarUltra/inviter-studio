@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-lock.txt ruff==0.17.0
+      - name: Lint
+        run: ruff check core ui tests tools
+      - name: Formatting
+        run: ruff format --check core ui tests tools
+      - name: Compile
+        run: python -m compileall -q core ui tests tools
+      - name: Unit tests
+        run: python -m unittest discover -s tests -t .
+      - name: Dependency consistency
+        run: pip check
