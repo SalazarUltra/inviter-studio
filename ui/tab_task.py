@@ -476,16 +476,17 @@ class TaskTab(ctk.CTkFrame):
             self.message_frame, text="Отменить ожидающие вторые сообщения", height=30, command=self.cancel_followups
         )
         apply_button_role(self.cancel_followups_btn, "secondary")
-        self.cancel_followups_btn.pack(anchor="w", padx=16, pady=(0, 8))
-        ctk.CTkLabel(
+        # Shown by update_counter only while waiting/ready follow-ups exist;
+        # re-packed before the note to keep the original order.
+        self.followup_note = ctk.CTkLabel(
             self.message_frame,
-            text="Первое сообщение каждому — один раз. Интервал первых сообщений общий для всех аккаунтов.\n"
-            "Укажите людей, которые ожидают ваше сообщение.",
+            text="Первое сообщение каждому — один раз. Интервал первых сообщений общий для всех аккаунтов.",
             justify="left",
             font=FONTS["small"],
             wraplength=500,
             text_color=COLORS["muted"],
-        ).pack(anchor="w", padx=16, pady=(0, 10))
+        )
+        self.followup_note.pack(anchor="w", padx=16, pady=(0, 10))
         interval_block = self._block("Интервал между действиями")
         intervals = ctk.CTkFrame(interval_block, fg_color="transparent")
         intervals.pack(fill="x", padx=UI["space_4"], pady=(0, UI["space_3"]))
@@ -621,6 +622,11 @@ class TaskTab(ctk.CTkFrame):
                         f"Недоступно: {followups.get('blocked', 0)} · Проверить: {followups.get('uncertain', 0)} · "
                         f"Отменено: {followups.get('cancelled', 0)}"
                     )
+                    pending_cancel = followups.get("waiting", 0) + followups.get("ready", 0)
+                    if pending_cancel and not self.cancel_followups_btn.winfo_manager():
+                        self.cancel_followups_btn.pack(anchor="w", padx=16, pady=(0, 8), before=self.followup_note)
+                    elif not pending_cancel and self.cancel_followups_btn.winfo_manager():
+                        self.cancel_followups_btn.pack_forget()
                     self.update_readiness()
                     self.progress_top.configure(
                         text=f"Успешно: {stats['added'] + stats.get('sent', 0)} из {stats['total']}"
