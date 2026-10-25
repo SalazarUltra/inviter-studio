@@ -4,6 +4,7 @@ import asyncio
 import json
 import tempfile
 import threading
+import traceback
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -53,6 +54,8 @@ def main():
             def failed(kind, exc, trace):
                 nonlocal failure_patch
                 errors.append(f"{kind.__name__}: {exc}")
+                if trace:
+                    errors.append("".join(traceback.format_exception(kind, exc, trace)).strip())
                 if failure_patch:
                     failure_patch.stop()
                     failure_patch = None
@@ -63,18 +66,40 @@ def main():
             app.report_callback_exception = failed
 
             def read(coro):
-                return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=3)
+                # A single-shot 3s limit occasionally loses to Windows stalling the
+                # background loop thread (focus changes, DPI, AV scans); retry once.
+                future = asyncio.run_coroutine_threadsafe(coro, loop)
+                try:
+                    return future.result(timeout=10)
+                except TimeoutError:
+                    future.cancel()
+                    for task in asyncio.all_tasks(loop):
+                        errors.append(f"loop task {task.get_coro()}: {task.get_stack(limit=3)}")
+                    raise
 
             def pending(scope=db):
                 return [row["username"] for row in read(scope.get_pending_list())]
 
             def wait_for(predicate, callback, attempts=100):
+                def diagnose():
+                    if editor and editor.winfo_exists():
+                        state = f"busy={editor.busy} status={editor.status.cget('text')!r}"
+                    else:
+                        state = "editor=closed"
+                    return (
+                        f"timeout state: {state} loop_running={loop.is_running()} "
+                        f"queue={app.ui_dispatcher.queue.qsize()} closed={app.ui_dispatcher.closed}"
+                    )
+
                 if predicate():
                     callback()
                 elif attempts:
                     app.after(50, lambda: wait_for(predicate, callback, attempts - 1))
                 else:
-                    raise AssertionError("Audience editor callback timed out")
+                    errors.append(diagnose())
+                    for task in asyncio.all_tasks(loop):
+                        errors.append(f"loop task {task.get_coro()}: {task.get_stack(limit=4)}")
+                    raise AssertionError(f"Timed out waiting before {callback.__name__}")
 
             def open_editor(callback):
                 nonlocal editor
@@ -88,7 +113,9 @@ def main():
                 field.clipboard_get = Mock(return_value=text)
                 field.event_generate("<KeyPress>", keycode=65, state=4)
                 field.event_generate("<KeyPress>", keycode=86, state=4)
-                assert editor.textbox.get("1.0", "end-1c") == text.replace("\r\n", "\n").replace("\r", "\n")
+                actual = editor.textbox.get("1.0", "end-1c")
+                expected = text.replace("\r\n", "\n").replace("\r", "\n")
+                assert actual == expected, f"paste produced {actual!r}, expected {expected!r}"
 
             def capture(path, window):
                 window.update_idletasks()
@@ -124,7 +151,15 @@ def main():
                 )
                 failure_patch.start()
                 editor.save_button.invoke()
-                wait_for(lambda: not editor.busy, failed_save)
+                # Wait for the error itself, not just for busy=False: the status
+                # line is written in the same UI tick and polling it earlier races.
+                # Extra attempts absorb rare multi-second stalls of the loop thread
+                # under window-manager load; the global 25s timeout still bounds us.
+                wait_for(
+                    lambda: not editor.busy and "Тест ошибки записи" in editor.status.cget("text"),
+                    failed_save,
+                    attempts=400,
+                )
 
             def failed_save():
                 nonlocal failure_patch

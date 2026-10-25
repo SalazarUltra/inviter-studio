@@ -59,23 +59,6 @@ def write_logs_xlsx(
     message_formatter: Callable[[str], str] | None = None,
 ) -> None:
     """Write a small, dependency-free Excel workbook with safe inline text cells."""
-    destination = Path(path)
-    temporary = None
-    spreadsheet = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-    office_rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-    ET.register_namespace("", spreadsheet)
-    ET.register_namespace("r", office_rel)
-
-    def cell(reference: str, value: object, *, header=False) -> ET.Element:
-        element = ET.Element(f"{{{spreadsheet}}}c", {"r": reference, "t": "inlineStr"})
-        inline = ET.SubElement(element, f"{{{spreadsheet}}}is")
-        text = ET.SubElement(inline, f"{{{spreadsheet}}}t")
-        text.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-        text.text = str(value or "")
-        if header:
-            element.set("s", "1")
-        return element
-
     headers = ("Дата и время", "Аккаунт", "Получатель", "Событие", "Описание")
     rows = [headers]
     labels = action_labels or {}
@@ -93,6 +76,66 @@ def write_logs_xlsx(
                 message,
             )
         )
+    write_xlsx_book(path, "Журнал", rows, (21, 20, 25, 36, 80))
+
+
+TARGET_STATUS_LABELS = {
+    "pending": "Ожидает",
+    "processing": "В процессе",
+    "added": "Добавлен",
+    "sent": "Отправлено",
+    "error": "Ошибка",
+    "not_found": "Не найден",
+    "private": "Закрытый",
+    "already_in": "Уже в чате",
+    "already_sent": "Без повтора",
+    "uncertain": "Проверить",
+}
+
+
+def write_targets_xlsx(path: str, rows: list[dict], phone_by_id: dict | None = None) -> None:
+    """Per-recipient campaign outcome: status, reason and the account that acted."""
+    phones = phone_by_id or {}
+    book_rows = [
+        (
+            "Получатель",
+            "Результат",
+            "Причина",
+            "Аккаунт",
+            "Дата обработки",
+        )
+    ]
+    for row in rows:
+        username = str(row.get("username") or "")
+        book_rows.append(
+            (
+                "@" + username if username else "",
+                TARGET_STATUS_LABELS.get(str(row.get("status")), str(row.get("status") or "")),
+                str(row.get("error_message") or ""),
+                str(phones.get(row.get("added_by_account_id")) or ""),
+                str(row.get("processed_at") or ""),
+            )
+        )
+    write_xlsx_book(path, "Аудитория", book_rows, (25, 16, 48, 20, 21))
+
+
+def write_xlsx_book(path: str, sheet_name: str, rows: list[tuple], widths: tuple[int, ...]) -> None:
+    destination = Path(path)
+    temporary = None
+    spreadsheet = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    office_rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    ET.register_namespace("", spreadsheet)
+    ET.register_namespace("r", office_rel)
+
+    def cell(reference: str, value: object, *, header=False) -> ET.Element:
+        element = ET.Element(f"{{{spreadsheet}}}c", {"r": reference, "t": "inlineStr"})
+        inline = ET.SubElement(element, f"{{{spreadsheet}}}is")
+        text = ET.SubElement(inline, f"{{{spreadsheet}}}t")
+        text.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+        text.text = str(value or "")
+        if header:
+            element.set("s", "1")
+        return element
 
     try:
         with tempfile.NamedTemporaryFile(dir=destination.parent, suffix=".xlsx", delete=False) as handle:
@@ -105,7 +148,7 @@ def write_logs_xlsx(
                 reference = f"{chr(65 + column)}{row_number}"
                 row_element.append(cell(reference, value, header=row_number == 1))
         widths = ET.SubElement(sheet, f"{{{spreadsheet}}}cols")
-        for index, width in enumerate((21, 20, 25, 36, 80), start=1):
+        for index, width in enumerate(widths, start=1):
             ET.SubElement(
                 widths,
                 f"{{{spreadsheet}}}col",
@@ -138,7 +181,7 @@ def write_logs_xlsx(
                 '<?xml version="1.0" encoding="UTF-8"?>'
                 '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
                 'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-                '<sheets><sheet name="Журнал" sheetId="1" r:id="rId1"/></sheets></workbook>',
+                f'<sheets><sheet name="{sheet_name}" sheetId="1" r:id="rId1"/></sheets></workbook>',
             )
             workbook.writestr(
                 "xl/_rels/workbook.xml.rels",

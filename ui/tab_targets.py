@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+from pathlib import Path
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
 from core.database import Database
-from core.export import write_targets_csv
+from core.export import write_targets_csv, write_targets_xlsx
 from core.user_feedback import explain_error
 from core.validation import parse_usernames
 from ui.campaigns import CampaignBar
@@ -153,7 +154,7 @@ class TargetsTab(ctk.CTkFrame):
         top.grid_columnconfigure(3, weight=1)
         btn_export = ctk.CTkButton(
             top,
-            text="Экспорт CSV",
+            text="Экспорт",
             command=self.export_csv,
             corner_radius=12,
             height=36,
@@ -177,7 +178,7 @@ class TargetsTab(ctk.CTkFrame):
                 btn_clear,
                 "Удалить всю аудиторию выбранной кампании, включая результаты. Для удаления только ожидающих используйте редактор.",
             ),
-            (btn_export, "Сохранить всю аудиторию и результаты в CSV, независимо от страницы и выбранного фильтра."),
+            (btn_export, "Сохранить всю аудиторию и результаты в Excel (XLSX) или CSV, независимо от страницы и выбранного фильтра. Формат выбирается в окне сохранения."),
         ):
             tip(button, text)
 
@@ -467,16 +468,21 @@ class TargetsTab(ctk.CTkFrame):
 
     def export_csv(self) -> None:
         path = filedialog.asksaveasfilename(
-            title="Экспорт CSV",
-            defaultextension=".csv",
-            filetypes=[("CSV", "*.csv")],
+            title="Экспорт аудитории",
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx"), ("CSV", "*.csv")],
         )
         if not path:
             return
 
         async def export():
             rows = list(reversed(await self.db.get_targets(status="all", limit=None)))
-            await asyncio.to_thread(write_targets_csv, path, rows)
+            if Path(path).suffix.lower() == ".xlsx":
+                accounts = await self.db.get_accounts()
+                phones = {account["id"]: account.get("phone") or "" for account in accounts}
+                await asyncio.to_thread(write_targets_xlsx, path, rows, phones)
+            else:
+                await asyncio.to_thread(write_targets_csv, path, rows)
 
         fut = self.run_coro(export())
 
@@ -486,7 +492,7 @@ class TargetsTab(ctk.CTkFrame):
             except Exception as exc:
                 self._safe_after(lambda exc=exc: messagebox.showerror("Ошибка экспорта", explain_error(exc)))
                 return
-            self._safe_after(lambda: messagebox.showinfo("Готово", "CSV экспортирован"))
+            self._safe_after(lambda: messagebox.showinfo("Готово", "Файл экспортирован"))
 
         fut.add_done_callback(done)
 
