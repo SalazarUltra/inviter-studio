@@ -16,3 +16,14 @@ build/
 ДЛЯ_УСТАНОВКИ/
 *.rar
 *.lnk
+
+# Internal development notes; kept locally, not part of the public repository.
+AUDIT*.md
+DESIGN.md
+DISTRIBUTION_SECURITY.md
+MARKET_REVIEW.md
+PARSING.md
+TELEGRAM_AND_VPN_AUDIT.md
+RELEASE_*.md
+test_auth.py
+test_resolve.py

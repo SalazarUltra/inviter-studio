@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import sys
 import time
 from concurrent.futures import Future
 from tkinter import messagebox
@@ -30,6 +32,7 @@ from ui.tab_targets import TargetsTab
 from ui.tab_task import TaskTab
 from ui.tab_warmup import TabWarmup
 from ui.theme import APP_PROFILES, COLORS, FONTS, apply_button_role, init_fonts, style_tree
+from ui.update_dialog import UpdateDialog
 
 
 class App(ctk.CTk):
@@ -118,8 +121,10 @@ class App(ctk.CTk):
             self.bind(f"<Control-Key-{index}>", lambda event, tab=key: self._switch_tab(tab))
         self._drain_ui()
         self._poll_ui()
+        self._update_installer = None
         if show_startup_support:
             self._support_intro_job = self.after(1800, self._load_support_intro)
+        self._maybe_check_updates()
 
     def _build_shell(self):
         self.grid_columnconfigure(1, weight=1)
@@ -308,6 +313,37 @@ class App(ctk.CTk):
             self.notifications_switch,
             "Уведомлять о завершении задачи и парсинга. Без текстов переписки и номеров аккаунтов. Windows может скрыть уведомление в режиме «Не беспокоить». Выбор сохраняется.",
         )
+
+    def _maybe_check_updates(self) -> None:
+        """Silent GitHub check in the installed app only; source runs stay offline."""
+        if not getattr(sys, "frozen", False) or self._closing:
+            return
+
+        async def check():
+            from core import updates
+
+            if await self.db.get_setting("update_check_enabled", "1") == "0":
+                return None
+            return await updates.fetch_latest_release()
+
+        future = self.run_coro(check())
+
+        def done(result):
+            def show():
+                if self._closing or result.cancelled() or result.exception():
+                    return
+                release = result.result()
+                if release:
+                    UpdateDialog(self, release)
+
+            self._safe_after(show)
+
+        future.add_done_callback(done)
+
+    def start_installer_after_close(self, installer_path: str) -> None:
+        """Run the verified installer right after the Tk window is destroyed."""
+        self._update_installer = installer_path
+        self._on_close()
 
     def show_help(self, topic=None):
         if self._closing:
@@ -920,5 +956,9 @@ class App(ctk.CTk):
             for timer_id in self.tk.call("after", "info"):
                 self.tk.call("after", "cancel", timer_id)
             self.destroy()
+            # The app is fully closed by now, so the installer will not meet a
+            # running instance; detached launch lets it show its own wizard.
+            if self._update_installer:
+                os.startfile(self._update_installer)  # noqa: PTH110 - Windows shell launch
 
         self.after(50, finish)
