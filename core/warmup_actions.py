@@ -14,11 +14,62 @@ from telethon import TelegramClient, utils
 from telethon.errors import AuthKeyUnregisteredError, FloodWaitError, PeerFloodError
 from telethon.tl.functions.messages import GetHistoryRequest, SendReactionRequest
 from telethon.tl.functions.users import GetFullUserRequest
-from telethon.tl.types import Channel, InputUser, ReactionEmoji, User
+from telethon.tl.types import Channel, InputUser, Message, PeerUser, ReactionEmoji, User
 
 from core.user_feedback import explain_error
 
 REACTIONS = ["👍", "❤️", "🔥", "👏", "😍", "🤔", "💯"]
+
+CONTEXT_MESSAGES = 20
+CONTEXT_ENTRIES = 6
+REPLY_MIN_LEN = 5
+REPLY_MAX_LEN = 300
+
+
+def author_name(user) -> str:
+    if user is None:
+        return "Участник"
+    if getattr(user, "username", None):
+        return "@" + user.username
+    if getattr(user, "first_name", None):
+        name = user.first_name
+        if getattr(user, "last_name", None):
+            name += " " + user.last_name
+        return name
+    return "Участник"
+
+
+def select_chat_context(history, users: dict, *, history_limit: int = CONTEXT_MESSAGES):
+    """Turn a GetHistory page into a conversation snapshot for the AI.
+
+    Returns entries oldest→newest with author labels, flags whether the newest
+    text message is our own (nothing to add until someone replies), the best
+    candidate worth answering, and our recent own texts for anti-repeat.
+    """
+    entries = []
+    for message in reversed(list(history.messages[:history_limit])):
+        if not isinstance(message, Message):
+            continue
+        text = (getattr(message, "message", "") or "").strip()
+        if not text:
+            continue
+        sender_id = getattr(message.from_id, "user_id", None) if isinstance(message.from_id, PeerUser) else None
+        own = bool(getattr(message, "out", False))
+        sender = users.get(sender_id) if sender_id is not None else None
+        entries.append({"name": "Вы" if own else author_name(sender), "text": text, "own": own, "message": message})
+    newest_own = bool(entries and entries[-1]["own"])
+    reply = None
+    for entry in reversed(entries):
+        sender_id = getattr(entry["message"].from_id, "user_id", None)
+        sender = users.get(sender_id)
+        if entry["own"] or (sender is not None and getattr(sender, "bot", False)):
+            continue
+        if not REPLY_MIN_LEN <= len(entry["text"]) <= REPLY_MAX_LEN:
+            continue
+        reply = {"name": entry["name"], "text": entry["text"], "message": entry["message"]}
+        break
+    own_texts = [entry["text"] for entry in entries if entry["own"]][-3:]
+    return {"entries": entries, "newest_own": newest_own, "reply": reply, "own_texts": own_texts}
 
 
 class WarmupActions:
@@ -175,10 +226,10 @@ class WarmupActions:
                 ):
                     return {"success": False, "detail": "Пропуск: слишком рано писать повторно в этот чат"}
 
-            messages = await self.client(
+            history = await self.client(
                 GetHistoryRequest(
                     peer=entity,
-                    limit=5,
+                    limit=CONTEXT_MESSAGES,
                     offset_date=None,
                     offset_id=0,
                     max_id=0,
@@ -187,7 +238,35 @@ class WarmupActions:
                     hash=0,
                 )
             )
-            context = " | ".join([m.message for m in messages.messages if hasattr(m, "message") and m.message][:3])
+            users = {user.id: user for user in history.users if isinstance(user, User)}
+            snapshot = select_chat_context(history, users)
+            if not snapshot["entries"]:
+                return {"success": False, "detail": "Пропуск: в чате пока нет сообщений для контекста"}
+            if snapshot["newest_own"]:
+                # Writing again would put two of our messages in a row with nobody
+                # answering in between; a live participant waits for the room.
+                return {
+                    "success": False,
+                    "detail": "Пропуск: последнее сообщение в чате наше; ждём реакции собеседников",
+                }
+
+            memory_own: list[str] = []
+            memory_count = 0
+            if self.account_id and getattr(self.ai, "db", None) and self.memory_enabled:
+                recent_memory = await self.ai.db.get_ai_messages(self.account_id, chat_key, limit=40)
+                memory_own = [
+                    (item.get("content") or "").strip()
+                    for item in recent_memory
+                    if (item.get("role") or "") == "assistant" and (item.get("content") or "").strip()
+                ]
+                memory_count = len(memory_own)
+            own_recent = (memory_own[-3:] or []) + snapshot["own_texts"]
+            first_in_chat = memory_count == 0 and not any(entry["own"] for entry in snapshot["entries"])
+
+            reply = snapshot["reply"]
+            context = " | ".join(
+                f"{entry['name']}: {entry['text'][:200]}" for entry in snapshot["entries"][-CONTEXT_ENTRIES:]
+            )
             text = await self.ai.generate_message(
                 context=context,
                 account_id=self.account_id,
@@ -195,12 +274,19 @@ class WarmupActions:
                 peer_name=peer_name,
                 memory_enabled=self.memory_enabled,
                 tone=self.tone,
+                reply_to=reply,
+                chat_title=peer_name,
+                own_recent=own_recent,
+                first_in_chat=first_in_chat,
             )
             if not text:
                 return {"success": False, "detail": "AI не сгенерировал текст"}
 
             await asyncio.sleep(random.uniform(10, 30))
-            await self.client.send_message(entity, text)
+            if reply is not None:
+                await self.client.send_message(entity, text, reply_to=reply["message"].id)
+            else:
+                await self.client.send_message(entity, text)
             if self.account_id and getattr(self.ai, "db", None):
                 await self.ai.db.record_ai_send(self.account_id, chat_key)
             if hasattr(self.ai, "remember_sent_message"):
@@ -211,7 +297,9 @@ class WarmupActions:
                     peer_name=peer_name,
                     memory_enabled=self.memory_enabled,
                 )
-            return {"success": True, "detail": f"Сообщение отправлено в {channel}"}
+            if reply is not None:
+                return {"success": True, "detail": f"Ответ {reply['name']} в {peer_name}: {text[:60]}"}
+            return {"success": True, "detail": f"Сообщение отправлено в {peer_name}: {text[:60]}"}
         except (FloodWaitError, PeerFloodError, AuthKeyUnregisteredError):
             raise
         except Exception as exc:  # noqa: BLE001
