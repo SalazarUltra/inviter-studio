@@ -266,6 +266,16 @@ class App(ctk.CTk):
             "Плотность меняет отступы и высоту строк в таблицах разделов «Обзор», "
             "«Аккаунты» и «Аудитория». Настройка сохраняется для следующего запуска.",
         )
+        self.update_button = ctk.CTkButton(
+            settings, text="Обновления", width=96, height=32, font=FONTS["small"], command=self.check_updates_now
+        )
+        apply_button_role(self.update_button, "secondary")
+        self.update_button.pack(side="left", padx=(0, 8))
+        tip(
+            self.update_button,
+            "Проверить обновления Inviter Studio на GitHub. Установка запускается только с вашего согласия; "
+            "файл проверяется по SHA-256. Установленная программа проверяет обновления и автоматически при запуске.",
+        )
         self.help_button = ctk.CTkButton(settings, text="?", width=32, height=32, command=self.show_help)
         apply_button_role(self.help_button, "secondary")
         self.help_button.pack(side="left", padx=(0, 10))
@@ -315,14 +325,30 @@ class App(ctk.CTk):
         )
 
     def _maybe_check_updates(self) -> None:
-        """Silent GitHub check in the installed app only; source runs stay offline."""
-        if not getattr(sys, "frozen", False) or self._closing:
+        """Silent GitHub check in the installed app only; source runs and smoke tests stay offline."""
+        if not getattr(sys, "frozen", False) or self._closing or "--smoke-test" in sys.argv:
             return
+        self._check_updates(silent=True, respect_opt_out=True)
+
+    def check_updates_now(self) -> None:
+        """Manual check from the header button; explains itself when unavailable."""
+        if getattr(self, "_update_checking", False):
+            return
+        self._check_updates(silent=False, respect_opt_out=False)
+
+    def _check_updates(self, *, silent: bool, respect_opt_out: bool) -> None:
+        self._update_checking = True
+
+        def busy():
+            if hasattr(self, "update_button"):
+                self.update_button.configure(state="disabled", text="Проверяем…")
+
+        self._safe_after(busy)
 
         async def check():
             from core import updates
 
-            if await self.db.get_setting("update_check_enabled", "1") == "0":
+            if respect_opt_out and await self.db.get_setting("update_check_enabled", "1") == "0":
                 return None
             return await updates.fetch_latest_release()
 
@@ -330,11 +356,27 @@ class App(ctk.CTk):
 
         def done(result):
             def show():
-                if self._closing or result.cancelled() or result.exception():
+                self._update_checking = False
+                if hasattr(self, "update_button"):
+                    self.update_button.configure(state="normal", text="Обновления")
+                if self._closing:
+                    return
+                if result.cancelled():
+                    return
+                if result.exception():
+                    # Silence auto-checks: only the manual button explains failures.
+                    if not silent:
+                        messagebox.showwarning("Обновления", explain_error(result.exception()))
                     return
                 release = result.result()
                 if release:
                     UpdateDialog(self, release)
+                elif not silent:
+                    self.set_status("У вас последняя версия Inviter Studio.", COLORS["success"])
+                    self.notify(
+                        "Обновления",
+                        "У вас последняя версия Inviter Studio.",
+                    )
 
             self._safe_after(show)
 
