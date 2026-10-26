@@ -164,6 +164,10 @@ def main():
             check=True,
         )
         package = release_root / "InviterStudio"
+        # Sign the executable before Inno Setup embeds it. Signing only the
+        # outer installer leaves the installed application untrusted by
+        # Windows Smart App Control.
+        sign_artifacts([package / "InviterStudio.exe"])
     else:
         manifest = ROOT / "dist/release.json"
         package = (
