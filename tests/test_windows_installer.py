@@ -81,6 +81,8 @@ class InstallerBuildTests(unittest.TestCase):
                 self.assertIn("InviterStudio.exe", names)
                 self.assertIn("_internal/runtime.dll", names)
                 self.assertIn("start.bat", names)
+                self.assertIn("update.bat", names)
+                self.assertIn("update.ps1", names)
                 self.assertIn("ПРОЧТИ_ПЕРЕД_ЗАПУСКОМ.txt", names)
                 self.assertNotIn("profile/", names)
             installer = root / "dist/InviterStudioSetup.exe"

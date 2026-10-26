@@ -29,6 +29,67 @@ def _portable_launcher() -> str:
     )
 
 
+def _portable_updater() -> str:
+    return (
+        "@echo off\n"
+        "setlocal\n"
+        'cd /d "%~dp0"\n'
+        "echo Проверяю последнюю portable-версию Inviter Studio...\n"
+        'powershell.exe -NoProfile -File "%~dp0update.ps1"\n'
+        "if errorlevel 1 (\n"
+        "    echo Обновление не выполнено. Папка profile сохранена.\n"
+        "    pause\n"
+        "    exit /b 1\n"
+        ")\n"
+        "exit /b 0\n"
+    )
+
+
+def _portable_updater_script() -> str:
+    return r"""$ErrorActionPreference = "Stop"
+$root = (Resolve-Path (Join-Path $PSScriptRoot ".")).Path
+$api = "https://api.github.com/repos/SalazarUltra/inviter-studio/releases/latest"
+$headers = @{ "User-Agent" = "InviterStudio-portable-updater" }
+$temp = Join-Path ([IO.Path]::GetTempPath()) ("InviterStudio-update-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $temp | Out-Null
+try {
+    $release = Invoke-RestMethod -Uri $api -Headers $headers
+    $zipAsset = @($release.assets) | Where-Object name -eq "InviterStudioPortable.zip" | Select-Object -First 1
+    $shaAsset = @($release.assets) | Where-Object name -eq "SHA256.txt" | Select-Object -First 1
+    if (-not $zipAsset -or -not $shaAsset) {
+        throw "В последнем GitHub-релизе нет portable-архива или SHA256.txt."
+    }
+    $zipPath = Join-Path $temp "InviterStudioPortable.zip"
+    $shaPath = Join-Path $temp "SHA256.txt"
+    Invoke-WebRequest -Uri $zipAsset.browser_download_url -Headers $headers -OutFile $zipPath
+    Invoke-WebRequest -Uri $shaAsset.browser_download_url -Headers $headers -OutFile $shaPath
+    $line = Get-Content -LiteralPath $shaPath | Where-Object { $_ -match "InviterStudioPortable\.zip$" } | Select-Object -First 1
+    $expected = ($line -split "\s+")[0].ToLowerInvariant()
+    $actual = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($expected -notmatch "^[0-9a-f]{64}$" -or $expected -ne $actual) {
+        throw "Проверка SHA-256 не пройдена. Архив не заменён."
+    }
+    $stage = Join-Path $temp "stage"
+    Expand-Archive -LiteralPath $zipPath -DestinationPath $stage -Force
+    $source = Join-Path $stage "InviterStudioPortable"
+    if (-not (Test-Path (Join-Path $source "InviterStudio.exe"))) {
+        throw "В архиве нет InviterStudio.exe."
+    }
+    if (Get-Process -Name "InviterStudio" -ErrorAction SilentlyContinue) {
+        throw "Сначала закройте Inviter Studio, затем запустите update.bat ещё раз."
+    }
+    & robocopy $source $root /E /PURGE /R:1 /W:1 /XD "profile"
+    if ($LASTEXITCODE -gt 7) {
+        throw "Не удалось заменить файлы приложения (код robocopy $LASTEXITCODE)."
+    }
+    Write-Host "Обновление установлено: $($release.tag_name)"
+    Start-Process -FilePath (Join-Path $root "start.bat")
+} finally {
+    Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+}
+"""
+
+
 def prepare_portable_handoff(root: Path, package: Path) -> Path:
     """Create a self-contained ZIP with the onedir runtime and a launcher."""
 
@@ -45,6 +106,8 @@ def prepare_portable_handoff(root: Path, package: Path) -> Path:
         staging = Path(temporary_root) / portable_name
         shutil.copytree(package, staging)
         (staging / "start.bat").write_text(_portable_launcher(), encoding="utf-8")
+        (staging / "update.bat").write_text(_portable_updater(), encoding="utf-8")
+        (staging / "update.ps1").write_text(_portable_updater_script(), encoding="utf-8-sig")
         (staging / "ПРОЧТИ_ПЕРЕД_ЗАПУСКОМ.txt").write_text(
             "INVITER STUDIO — PORTABLE\n\n"
             "1. Распакуйте весь ZIP в обычную папку, например C:\\Apps\\InviterStudio.\n"
@@ -52,6 +115,8 @@ def prepare_portable_handoff(root: Path, package: Path) -> Path:
             "3. Папку profile рядом с приложением удалять не нужно — в ней хранятся\n"
             "   локальная база, аккаунты и Telegram-сессии portable-версии.\n"
             "4. Python и библиотеки уже встроены. Интернет нужен для Telegram и AI-функций.\n\n"
+            "Для обновления закройте программу и запустите update.bat. Архив берётся\n"
+            "только из официального GitHub-релиза и проверяется по SHA-256.\n\n"
             "Portable-версия не обходит Smart App Control. Если Windows блокирует\n"
             "неподписанный InviterStudio.exe, нужен доверенный сертификат издателя.\n"
             "Не отключайте защиту Windows ради запуска неизвестного файла.\n",
