@@ -30,6 +30,9 @@ def _portable_launcher() -> str:
         "    pause\n"
         "    exit /b 1\n"
         ")\n"
+        "rem Снимаем пометку «скачано из интернета», которую Windows расставляет при\n"
+        "rem распаковке ZIP: после этого SmartScreen не останавливает программу.\n"
+        'powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-ChildItem -LiteralPath \'%~dp0\' -Recurse | Unblock-File" >nul 2>&1\n'
         'start "" "%~dp0InviterStudio.exe"\n'
         "timeout /t 4 /nobreak >nul\n"
         'tasklist /fi "IMAGENAME eq InviterStudio.exe" | find /i "InviterStudio.exe" >nul\n'
@@ -118,10 +121,11 @@ def prepare_portable_handoff(root: Path, package: Path) -> Path:
         (staging / "ПРОЧТИ_ПЕРЕД_ЗАПУСКОМ.txt").write_text(
             "INVITER STUDIO — PORTABLE\n\n"
             "1. Распакуйте весь ZIP в обычную папку, например C:\\Apps\\InviterStudio.\n"
-            "2. Запустите start.bat. Не запускайте InviterStudio.exe отдельно.\n"
-            "3. Если программа не запустилась: щёлкните правой кнопкой по InviterStudio.exe,\n"
-            "   выберите Свойства, внизу вкладки «Общие» отметьте «Разблокировать» и нажмите ОК,\n"
-            "   затем снова start.bat. Так Windows снимает блокировку файлов, скачанных из интернета.\n"
+            "2. Запустите start.bat — он сам снимает блокировку «скачано из интернета»\n"
+            "   и запускает программу. Отдельно InviterStudio.exe запускать не нужно.\n"
+            "3. Если программа всё же не запустилась: щёлкните правой кнопкой по\n"
+            "   InviterStudio.exe, выберите Свойства, внизу вкладки «Общие» отметьте\n"
+            "   «Разблокировать», нажмите ОК и снова start.bat.\n"
             "4. Папку profile рядом с приложением удалять не нужно — в ней хранятся\n"
             "   локальная база, аккаунты и Telegram-сессии portable-версии.\n"
             "5. Python и библиотеки уже встроены. Интернет нужен для Telegram и AI-функций.\n\n"

@@ -70,6 +70,7 @@ class InstallerBuildTests(unittest.TestCase):
                 self.assertNotIn("profile/", names)
                 launcher = archive.read("start.bat").decode("utf-8")
                 self.assertIn("_internal", launcher)
+                self.assertIn("Unblock-File", launcher)
                 self.assertIn("Разблокировать", launcher)
                 updater = archive.read("update.bat").decode("utf-8")
                 self.assertIn("certutil -hashfile", updater)
