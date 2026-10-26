@@ -1,6 +1,6 @@
 """Release identity shared by the app and the Windows installer."""
 
-VERSION = "1.2.18"
+VERSION = "1.2.19"
 UPDATE_REPO = "SalazarUltra/inviter-studio"
 APP_COPYRIGHT = "Copyright (c) 2026 Inviter Studio"
 APP_MUTEX = r"Local\InviterStudio.Running"

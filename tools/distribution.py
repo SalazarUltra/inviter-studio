@@ -34,60 +34,49 @@ def _portable_updater() -> str:
         "@echo off\n"
         "setlocal\n"
         'cd /d "%~dp0"\n'
+        "chcp 65001 >nul\n"
         "echo Проверяю последнюю portable-версию Inviter Studio...\n"
-        'powershell.exe -NoProfile -File "%~dp0update.ps1"\n'
-        "if errorlevel 1 (\n"
-        "    echo Обновление не выполнено. Папка profile сохранена.\n"
-        "    pause\n"
-        "    exit /b 1\n"
-        ")\n"
+        'set "TMP=%TEMP%\\InviterStudio-update-%RANDOM%"\n'
+        'mkdir "%TMP%" >nul 2>&1\n'
+        'curl.exe -fL --retry 2 "https://github.com/SalazarUltra/inviter-studio/releases/latest/download/InviterStudioPortable.zip" -o "%TMP%\\InviterStudioPortable.zip"\n'
+        "if errorlevel 1 goto download_error\n"
+        'curl.exe -fL --retry 2 "https://github.com/SalazarUltra/inviter-studio/releases/latest/download/SHA256.txt" -o "%TMP%\\SHA256.txt"\n'
+        "if errorlevel 1 goto download_error\n"
+        'for /f "tokens=1" %%H in (\'findstr /i "InviterStudioPortable.zip" "%TMP%\\SHA256.txt"\') do if not defined EXPECTED set "EXPECTED=%%H"\n'
+        'for /f "skip=1 tokens=1" %%H in (\'certutil -hashfile "%TMP%\\InviterStudioPortable.zip" SHA256 ^| findstr /r /v "CertUtil"\') do if not defined ACTUAL set "ACTUAL=%%H"\n'
+        'if /i not "%EXPECTED%"=="%ACTUAL%" goto checksum_error\n'
+        'mkdir "%TMP%\\stage" >nul 2>&1\n'
+        'tar.exe -xf "%TMP%\\InviterStudioPortable.zip" -C "%TMP%\\stage"\n'
+        "if errorlevel 1 goto archive_error\n"
+        'if not exist "%TMP%\\stage\\InviterStudioPortable\\InviterStudio.exe" goto archive_error\n'
+        'tasklist /fi "IMAGENAME eq InviterStudio.exe" | find /i "InviterStudio.exe" >nul\n'
+        "if not errorlevel 1 goto running_error\n"
+        'robocopy "%TMP%\\stage\\InviterStudioPortable" "%~dp0." /E /PURGE /R:1 /W:1 /XD "profile"\n'
+        "if errorlevel 8 goto copy_error\n"
+        'rmdir /s /q "%TMP%" >nul 2>&1\n'
+        "echo Обновление установлено. Запускаю программу.\n"
+        'start "" "%~dp0start.bat"\n'
         "exit /b 0\n"
+        ":download_error\n"
+        "echo Не удалось скачать официальный релиз. Проверьте интернет.\n"
+        "goto failed\n"
+        ":checksum_error\n"
+        "echo Проверка SHA-256 не пройдена. Файлы не заменены.\n"
+        "goto failed\n"
+        ":archive_error\n"
+        "echo Архив повреждён или имеет неверную структуру.\n"
+        "goto failed\n"
+        ":running_error\n"
+        "echo Сначала закройте Inviter Studio. Профиль не изменён.\n"
+        "goto failed\n"
+        ":copy_error\n"
+        "echo Не удалось заменить файлы приложения. Профиль сохранён.\n"
+        "goto failed\n"
+        ":failed\n"
+        'rmdir /s /q "%TMP%" >nul 2>&1\n'
+        "pause\n"
+        "exit /b 1\n"
     )
-
-
-def _portable_updater_script() -> str:
-    return r"""$ErrorActionPreference = "Stop"
-$root = (Resolve-Path (Join-Path $PSScriptRoot ".")).Path
-$api = "https://api.github.com/repos/SalazarUltra/inviter-studio/releases/latest"
-$headers = @{ "User-Agent" = "InviterStudio-portable-updater" }
-$temp = Join-Path ([IO.Path]::GetTempPath()) ("InviterStudio-update-" + [guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Path $temp | Out-Null
-try {
-    $release = Invoke-RestMethod -Uri $api -Headers $headers
-    $zipAsset = @($release.assets) | Where-Object name -eq "InviterStudioPortable.zip" | Select-Object -First 1
-    $shaAsset = @($release.assets) | Where-Object name -eq "SHA256.txt" | Select-Object -First 1
-    if (-not $zipAsset -or -not $shaAsset) {
-        throw "В последнем GitHub-релизе нет portable-архива или SHA256.txt."
-    }
-    $zipPath = Join-Path $temp "InviterStudioPortable.zip"
-    $shaPath = Join-Path $temp "SHA256.txt"
-    Invoke-WebRequest -Uri $zipAsset.browser_download_url -Headers $headers -OutFile $zipPath
-    Invoke-WebRequest -Uri $shaAsset.browser_download_url -Headers $headers -OutFile $shaPath
-    $line = Get-Content -LiteralPath $shaPath | Where-Object { $_ -match "InviterStudioPortable\.zip$" } | Select-Object -First 1
-    $expected = ($line -split "\s+")[0].ToLowerInvariant()
-    $actual = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($expected -notmatch "^[0-9a-f]{64}$" -or $expected -ne $actual) {
-        throw "Проверка SHA-256 не пройдена. Архив не заменён."
-    }
-    $stage = Join-Path $temp "stage"
-    Expand-Archive -LiteralPath $zipPath -DestinationPath $stage -Force
-    $source = Join-Path $stage "InviterStudioPortable"
-    if (-not (Test-Path (Join-Path $source "InviterStudio.exe"))) {
-        throw "В архиве нет InviterStudio.exe."
-    }
-    if (Get-Process -Name "InviterStudio" -ErrorAction SilentlyContinue) {
-        throw "Сначала закройте Inviter Studio, затем запустите update.bat ещё раз."
-    }
-    & robocopy $source $root /E /PURGE /R:1 /W:1 /XD "profile"
-    if ($LASTEXITCODE -gt 7) {
-        throw "Не удалось заменить файлы приложения (код robocopy $LASTEXITCODE)."
-    }
-    Write-Host "Обновление установлено: $($release.tag_name)"
-    Start-Process -FilePath (Join-Path $root "start.bat")
-} finally {
-    Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
-}
-"""
 
 
 def prepare_portable_handoff(root: Path, package: Path) -> Path:
@@ -107,7 +96,6 @@ def prepare_portable_handoff(root: Path, package: Path) -> Path:
         shutil.copytree(package, staging)
         (staging / "start.bat").write_text(_portable_launcher(), encoding="utf-8")
         (staging / "update.bat").write_text(_portable_updater(), encoding="utf-8")
-        (staging / "update.ps1").write_text(_portable_updater_script(), encoding="utf-8-sig")
         (staging / "ПРОЧТИ_ПЕРЕД_ЗАПУСКОМ.txt").write_text(
             "INVITER STUDIO — PORTABLE\n\n"
             "1. Распакуйте весь ZIP в обычную папку, например C:\\Apps\\InviterStudio.\n"
