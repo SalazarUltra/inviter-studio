@@ -32,7 +32,7 @@ def _portable_launcher() -> str:
         ")\n"
         "rem Снимаем пометку «скачано из интернета», которую Windows расставляет при\n"
         "rem распаковке ZIP: после этого SmartScreen не останавливает программу.\n"
-        'powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-ChildItem -LiteralPath \'%~dp0\' -Recurse | Unblock-File" >nul 2>&1\n'
+        "powershell -NoProfile -ExecutionPolicy Bypass -Command \"Get-ChildItem -LiteralPath '%~dp0' -Recurse | Unblock-File\" >nul 2>&1\n"
         'start "" "%~dp0InviterStudio.exe"\n'
         "timeout /t 4 /nobreak >nul\n"
         'tasklist /fi "IMAGENAME eq InviterStudio.exe" | find /i "InviterStudio.exe" >nul\n'
