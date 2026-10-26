@@ -12,13 +12,14 @@ from typing import Any
 
 from telethon import TelegramClient, utils
 from telethon.errors import AuthKeyUnregisteredError, FloodWaitError, PeerFloodError
-from telethon.tl.functions.messages import GetHistoryRequest, SendReactionRequest
+from telethon.tl.functions.messages import GetHistoryRequest, GetRepliesRequest, SendReactionRequest
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.types import Channel, InputUser, Message, PeerUser, ReactionEmoji, User
 
 from core.user_feedback import explain_error
 
 REACTIONS = ["👍", "❤️", "🔥", "👏", "😍", "🤔", "💯"]
+REPLY_REACTIONS = ["👍", "🔥", "❤️", "🤔", "💯"]
 
 CONTEXT_MESSAGES = 20
 CONTEXT_ENTRIES = 6
@@ -83,6 +84,7 @@ class WarmupActions:
         tone: str = "neutral",
         hourly_limit: int = 6,
         chat_cooldown_min: int = 12,
+        reply_chance: int = 100,
     ):
         self.client = client
         self.ai = ai_writer
@@ -92,6 +94,10 @@ class WarmupActions:
         self.tone = tone
         self.hourly_limit = max(1, int(hourly_limit or 6))
         self.chat_cooldown_min = max(1, int(chat_cooldown_min or 12))
+        self.reply_chance = max(0, min(100, int(reply_chance if reply_chance is not None else 100)))
+        # Messages we already reacted to in this run; re-sending the same
+        # reaction on Telegram would toggle it off.
+        self._reacted: set[tuple[str, int]] = set()
 
     async def go_online(self) -> dict[str, Any]:
         try:
@@ -209,6 +215,70 @@ class WarmupActions:
         except Exception as exc:  # noqa: BLE001
             return {"success": False, "detail": explain_error(exc)}
 
+    async def _mark_read(self, entity, messages: list) -> None:
+        """Leave read receipts: a participant who replies has read the room."""
+        if not messages:
+            return
+        try:
+            await self.client.send_read_acknowledge(entity, messages)
+        except Exception:  # noqa: BLE001 - receipts are a nicety, never block the send
+            pass
+
+    async def _read_thread(self, entity, reply_message) -> dict | None:
+        """Fetch the discussion thread under a post before answering it.
+
+        Works only for channel discussion threads (messages.getReplies);
+        returns the thread snapshot or None when there is nothing to read.
+        """
+        if not isinstance(entity, Channel):
+            return None
+        if getattr(reply_message, "replies", None) is None:
+            return None
+        try:
+            response = await asyncio.wait_for(
+                self.client(
+                    GetRepliesRequest(
+                        peer=entity,
+                        msg_id=reply_message.id,
+                        offset_id=0,
+                        offset_date=None,
+                        add_offset=0,
+                        limit=CONTEXT_MESSAGES,
+                        max_id=0,
+                        min_id=0,
+                        hash=0,
+                    )
+                ),
+                20,
+            )
+        except (FloodWaitError, PeerFloodError, AuthKeyUnregisteredError):
+            raise
+        except Exception:  # noqa: BLE001 - not every group supports threads
+            return None
+        users = {user.id: user for user in response.users if isinstance(user, User)}
+        snapshot = select_chat_context(response, users)
+        if snapshot["entries"]:
+            await self._mark_read(entity, [entry["message"] for entry in snapshot["entries"]])
+            return snapshot
+        return None
+
+    async def _react_to_reply(self, entity, chat_key: str, reply_message) -> str | None:
+        """Add a small reaction to the message we are about to answer."""
+        if (chat_key, reply_message.id) in self._reacted:
+            return None
+        reaction = random.choice(REPLY_REACTIONS)
+        try:
+            await self.client(
+                SendReactionRequest(peer=entity, msg_id=reply_message.id, reaction=[ReactionEmoji(emoticon=reaction)])
+            )
+        except (FloodWaitError, PeerFloodError, AuthKeyUnregisteredError):
+            raise
+        except Exception as exc:  # noqa: BLE001 - reaction must not block the reply
+            self.log_callback("INFO", f"Реакция не удалась, отвечаю текстом: {explain_error(exc)}")
+            return None
+        self._reacted.add((chat_key, reply_message.id))
+        return reaction
+
     async def send_message_to_chat(self, channel: str) -> dict[str, Any]:
         try:
             entity = await self.client.get_entity(channel)
@@ -264,8 +334,32 @@ class WarmupActions:
             first_in_chat = memory_count == 0 and not any(entry["own"] for entry in snapshot["entries"])
 
             reply = snapshot["reply"]
+            # Not every action must answer someone: the reply-chance setting
+            # mixes replies with standalone on-topic messages.
+            if reply is not None and random.randint(1, 100) > self.reply_chance:
+                reply = None
+
+            context_entries = snapshot["entries"]
+            thread = None
+            if reply is not None:
+                thread = await self._read_thread(entity, reply["message"])
+                if thread is not None and thread["newest_own"]:
+                    return {
+                        "success": False,
+                        "detail": "Пропуск: последнее сообщение в ветке наше; ждём ответа собеседников",
+                    }
+                if thread is not None and thread["entries"]:
+                    context_entries = thread["entries"]
+            await self._mark_read(entity, [entry["message"] for entry in context_entries[-CONTEXT_ENTRIES:]])
+
+            reaction = None
+            if reply is not None:
+                reaction = await self._react_to_reply(entity, chat_key, reply["message"])
+                if reaction is not None:
+                    await asyncio.sleep(random.uniform(1.5, 4))
+
             context = " | ".join(
-                f"{entry['name']}: {entry['text'][:200]}" for entry in snapshot["entries"][-CONTEXT_ENTRIES:]
+                f"{entry['name']}: {entry['text'][:200]}" for entry in context_entries[-CONTEXT_ENTRIES:]
             )
             text = await self.ai.generate_message(
                 context=context,
@@ -298,7 +392,8 @@ class WarmupActions:
                     memory_enabled=self.memory_enabled,
                 )
             if reply is not None:
-                return {"success": True, "detail": f"Ответ {reply['name']} в {peer_name}: {text[:60]}"}
+                reacted = f" с реакцией {reaction}" if reaction else ""
+                return {"success": True, "detail": f"Ответ {reply['name']}{reacted} в {peer_name}: {text[:60]}"}
             return {"success": True, "detail": f"Сообщение отправлено в {peer_name}: {text[:60]}"}
         except (FloodWaitError, PeerFloodError, AuthKeyUnregisteredError):
             raise

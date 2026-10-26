@@ -243,13 +243,29 @@ class TabWarmup(ctk.CTkFrame):
         self.ai_hourly_entry.insert(0, "6")
 
         cooldown_row = ctk.CTkFrame(ai_behavior, fg_color="transparent")
-        cooldown_row.pack(fill="x", padx=10, pady=(0, 8))
+        cooldown_row.pack(fill="x", padx=10, pady=(0, 6))
         ctk.CTkLabel(cooldown_row, text="Пауза в чате (мин)", font=FONTS["small"], text_color=COLORS["muted"]).pack(
             side="left"
         )
         self.ai_cooldown_entry = ctk.CTkEntry(cooldown_row, width=80, height=30, font=FONTS["small"])
         self.ai_cooldown_entry.pack(side="right")
         self.ai_cooldown_entry.insert(0, "12")
+
+        reply_row = ctk.CTkFrame(ai_behavior, fg_color="transparent")
+        reply_row.pack(fill="x", padx=10, pady=(0, 8))
+        reply_label = ctk.CTkLabel(
+            reply_row, text="Вероятность ответа, %", font=FONTS["small"], text_color=COLORS["muted"]
+        )
+        reply_label.pack(side="left")
+        self.ai_reply_entry = ctk.CTkEntry(reply_row, width=80, height=30, font=FONTS["small"])
+        self.ai_reply_entry.pack(side="right")
+        self.ai_reply_entry.insert(0, "100")
+        tip(
+            reply_label,
+            "Как часто действие «сообщение в чат» становится ответом на реплику участника "
+            "(с реакцией и чтением ветки). Ниже значение — реже отвечает, чаще пишет самостоятельно. "
+            "Часовой лимит остаётся общим ограничением частоты.",
+        )
 
         ctk.CTkButton(
             ai_behavior,
@@ -408,10 +424,12 @@ class TabWarmup(ctk.CTkFrame):
             tone = await self.db.get_setting("ai_style_tone", "neutral")
             hourly = await self.db.get_setting("ai_hourly_limit", "6")
             cooldown = await self.db.get_setting("ai_chat_cooldown_min", "12")
+            reply_chance = await self.db.get_setting("ai_reply_chance", "100")
             return {
                 "tone": str(tone or "neutral").strip().lower(),
                 "hourly": str(hourly or "6").strip(),
                 "cooldown": str(cooldown or "12").strip(),
+                "reply_chance": str(reply_chance or "100").strip(),
             }
 
         fut = self.run_coro(load_all())
@@ -420,7 +438,7 @@ class TabWarmup(ctk.CTkFrame):
             try:
                 data = f.result()
             except Exception:
-                data = {"tone": "neutral", "hourly": "6", "cooldown": "12"}
+                data = {"tone": "neutral", "hourly": "6", "cooldown": "12", "reply_chance": "100"}
 
             def apply():
                 tone = data.get("tone", "neutral")
@@ -431,6 +449,8 @@ class TabWarmup(ctk.CTkFrame):
                 self.ai_hourly_entry.insert(0, data.get("hourly", "6"))
                 self.ai_cooldown_entry.delete(0, "end")
                 self.ai_cooldown_entry.insert(0, data.get("cooldown", "12"))
+                self.ai_reply_entry.delete(0, "end")
+                self.ai_reply_entry.insert(0, data.get("reply_chance", "100"))
 
             self._safe_after(apply)
 
@@ -442,18 +462,20 @@ class TabWarmup(ctk.CTkFrame):
         try:
             hourly_limit = int(self.ai_hourly_entry.get().strip() or "6")
             cooldown_min = int(self.ai_cooldown_entry.get().strip() or "12")
+            reply_chance = int(self.ai_reply_entry.get().strip() or "100")
         except Exception:
-            self._log("ERROR", "Лимиты должны быть целыми числами")
+            self._log("ERROR", "Лимиты и вероятность должны быть целыми числами")
             return
 
-        if not 1 <= hourly_limit <= 30 or not 1 <= cooldown_min <= 180:
-            self._log("ERROR", "Укажите лимит от 1 до 30 сообщений в час и паузу от 1 до 180 минут")
+        if not 1 <= hourly_limit <= 30 or not 1 <= cooldown_min <= 180 or not 0 <= reply_chance <= 100:
+            self._log("ERROR", "Укажите лимит 1–30 сообщений в час, паузу 1–180 минут и вероятность 0–100%")
             return
 
         async def save_all():
             await self.db.set_setting("ai_style_tone", tone)
             await self.db.set_setting("ai_hourly_limit", str(hourly_limit))
             await self.db.set_setting("ai_chat_cooldown_min", str(cooldown_min))
+            await self.db.set_setting("ai_reply_chance", str(reply_chance))
 
         fut = self.run_coro(save_all())
 

@@ -19,4 +19,4 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\check_quality.ps
 if errorlevel 1 exit /b 1
 "%INVITER_PY%" -m tools.build_windows
 if errorlevel 1 exit /b 1
-echo Application and installer are in dist.
+echo Application and portable package are in dist.

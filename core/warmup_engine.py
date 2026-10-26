@@ -160,6 +160,11 @@ class WarmupEngine:
             chat_cooldown_min = int(await self.db.get_setting("ai_chat_cooldown_min", "12") or 12)
         except Exception:
             chat_cooldown_min = 12
+        try:
+            reply_chance = int(await self.db.get_setting("ai_reply_chance", "100") or 100)
+        except Exception:
+            reply_chance = 100
+        reply_chance = max(0, min(100, reply_chance))
         actions_obj = WarmupActions(
             self.client,
             self.ai_writer,
@@ -169,12 +174,14 @@ class WarmupEngine:
             tone=tone,
             hourly_limit=hourly_limit,
             chat_cooldown_min=chat_cooldown_min,
+            reply_chance=reply_chance,
         )
         self.log_callback(
             "INFO",
             (
                 f"Память AI: {'включена' if memory_enabled else 'выключена'} | "
-                f"Тон: {tone} | Лимит: {hourly_limit}/ч | Пауза чат: {chat_cooldown_min} мин"
+                f"Тон: {tone} | Лимит: {hourly_limit}/ч | Пауза чат: {chat_cooldown_min} мин | "
+                f"Ответы: {reply_chance}%"
             ),
         )
 

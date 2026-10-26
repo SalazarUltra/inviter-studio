@@ -1,9 +1,9 @@
 """In-app update checks against the official GitHub Releases channel.
 
-The release must carry two assets: InviterStudioSetup.exe and SHA256.txt
-("hex  filename" per line, as produced by tools.distribution). The installer
-is downloaded to a temp folder and its SHA-256 is verified before the user
-is offered to run it; nothing is ever launched with an unknown checksum.
+The release must carry two assets: InviterStudioPortable.zip and SHA256.txt
+("hex  filename" per line, as produced by tools.distribution). The portable
+archive is downloaded to a temp folder and its SHA-256 is verified before the
+user is offered to open it; nothing is ever opened with an unknown checksum.
 """
 
 from __future__ import annotations
@@ -19,7 +19,9 @@ import aiohttp
 from core.version import UPDATE_REPO, VERSION
 
 API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
-SETUP_ASSET = "InviterStudioSetup.exe"
+PORTABLE_ASSET = "InviterStudioPortable.zip"
+# Compatibility alias for older callers.
+SETUP_ASSET = PORTABLE_ASSET
 CHECKSUM_ASSET = "SHA256.txt"
 _TAG_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 
@@ -39,8 +41,8 @@ def is_newer(tag: str, current: str = VERSION) -> bool:
     return candidate > running
 
 
-def expected_checksum(checksum_text: str, filename: str = SETUP_ASSET) -> str | None:
-    """Return the recorded hex digest for the setup asset, if present."""
+def expected_checksum(checksum_text: str, filename: str = PORTABLE_ASSET) -> str | None:
+    """Return the recorded hex digest for the portable asset, if present."""
     for line in str(checksum_text or "").splitlines():
         parts = line.split()
         if len(parts) >= 2 and parts[0] and Path(parts[1]).name == filename:
@@ -80,12 +82,12 @@ async def fetch_latest_release() -> dict | None:
     assets = {
         str(item.get("name") or ""): str(item.get("browser_download_url") or "") for item in data.get("assets", [])
     }
-    if SETUP_ASSET not in assets:
-        raise RuntimeError("В последнем релизе нет файла установщика; скачайте его со страницы релизов")
+    if PORTABLE_ASSET not in assets:
+        raise RuntimeError("В последнем релизе нет portable-архива; откройте страницу релиза вручную")
     return {
         "version": tag.lstrip("v"),
         "notes": str(data.get("body") or "").strip()[:4000],
-        "setup_url": assets[SETUP_ASSET],
+        "portable_url": assets[PORTABLE_ASSET],
         "checksum_url": assets.get(CHECKSUM_ASSET, ""),
         "page_url": str(data.get("html_url") or ""),
     }
@@ -110,7 +112,7 @@ async def download_installer(
     expected: str | None = None,
     progress=None,
 ) -> Path:
-    """Stream the installer to destination, verify SHA-256, return the path.
+    """Stream a release asset to destination, verify SHA-256, return the path.
 
     Raises RuntimeError on network failure or checksum mismatch; the partial
     file is always removed.
@@ -135,7 +137,7 @@ async def download_installer(
                             progress(done, total)
         actual = digest.hexdigest()
         if expected and actual != expected.lower():
-            raise RuntimeError("Контрольная сумма установщика не совпала. Файл удалён; скачайте позже")
+            raise RuntimeError("Контрольная сумма portable-архива не совпала. Файл удалён; скачайте позже")
         os.replace(temporary, destination)
         return destination
     except aiohttp.ClientError:
@@ -146,10 +148,10 @@ async def download_installer(
         temporary.unlink(missing_ok=True)
 
 
-async def download_update(setup_url: str, checksum_url: str, folder: str | Path, progress=None) -> Path:
-    """Download setup + checksum, verify, and return the checked installer path."""
+async def download_update(portable_url: str, checksum_url: str, folder: str | Path, progress=None) -> Path:
+    """Download portable archive + checksum, verify, and return the checked ZIP."""
     expected = expected_checksum(await fetch_checksum(checksum_url) or "") if checksum_url else None
     if checksum_url and expected is None:
         raise RuntimeError("Не удалось получить контрольную сумму из релиза; обновление отменено")
-    destination = Path(folder) / SETUP_ASSET
-    return await download_installer(setup_url, destination, expected, progress)
+    destination = Path(folder) / PORTABLE_ASSET
+    return await download_installer(portable_url, destination, expected, progress)

@@ -24,13 +24,13 @@ class VersionCompareTests(unittest.TestCase):
 
 
 class ChecksumTests(unittest.TestCase):
-    def test_expected_checksum_matches_setup_asset_only(self):
+    def test_expected_checksum_matches_portable_asset_only(self):
         digest = "a" * 64
-        text = f"{'b' * 64}  other.txt\n{digest}  InviterStudioSetup.exe\n"
+        text = f"{'b' * 64}  other.txt\n{digest}  InviterStudioPortable.zip\n"
         self.assertEqual(updates.expected_checksum(text), digest)
 
     def test_expected_checksum_rejects_malformed_digests(self):
-        self.assertIsNone(updates.expected_checksum("zzz  InviterStudioSetup.exe"))
+        self.assertIsNone(updates.expected_checksum("zzz  InviterStudioPortable.zip"))
         self.assertIsNone(updates.expected_checksum("abc  readme.txt"))
         self.assertIsNone(updates.expected_checksum(""))
 

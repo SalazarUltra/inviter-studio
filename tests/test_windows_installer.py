@@ -11,7 +11,7 @@ from unittest.mock import patch
 from core.instance_lock import InstanceLock
 from tools.build_assets import create_assets
 from tools.build_windows import validate_package, version_resource
-from tools.distribution import prepare_handoff, prepare_portable_handoff
+from tools.distribution import prepare_portable_handoff
 
 
 class InstallerBuildTests(unittest.TestCase):
@@ -49,24 +49,7 @@ class InstallerBuildTests(unittest.TestCase):
             self.assertIn("ProductName','Inviter Studio", (root / "version.txt").read_text())
             self.assertIn("LegalCopyright", (root / "version.txt").read_text())
 
-    def test_handoff_has_only_installer_instructions_and_matching_checksum(self):
-        with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder)
-            source = root / "dist/InviterStudioSetup.exe"
-            source.parent.mkdir()
-            source.write_bytes(b"installer fixture")
-            target = prepare_handoff(root, source)
-            self.assertEqual(
-                {path.name for path in target.iterdir()}, {"InviterStudioSetup.exe", "СНАЧАЛА_ПРОЧТИ.txt", "SHA256.txt"}
-            )
-            self.assertEqual((target / "InviterStudioSetup.exe").read_bytes(), source.read_bytes())
-            self.assertIn(hashlib.sha256(source.read_bytes()).hexdigest(), (target / "SHA256.txt").read_text())
-            self.assertIn("РЕКОМЕНДУЕМЫЙ ВАРИАНТ", (target / "СНАЧАЛА_ПРОЧТИ.txt").read_text(encoding="utf-8-sig"))
-            source.write_bytes(b"updated installer")
-            self.assertEqual(prepare_handoff(root, source), target)
-            self.assertEqual((target / "InviterStudioSetup.exe").read_bytes(), b"updated installer")
-
-    def test_portable_handoff_contains_runtime_launcher_and_checksum(self):
+    def test_portable_handoff_contains_runtime_launcher_checksum_and_guide(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             package = root / "dist/releases/test/InviterStudio"
@@ -85,15 +68,21 @@ class InstallerBuildTests(unittest.TestCase):
                 self.assertNotIn("update.ps1", names)
                 self.assertIn("ПРОЧТИ_ПЕРЕД_ЗАПУСКОМ.txt", names)
                 self.assertNotIn("profile/", names)
+                launcher = archive.read("start.bat").decode("utf-8")
+                self.assertIn("_internal", launcher)
+                self.assertIn("Разблокировать", launcher)
                 updater = archive.read("update.bat").decode("utf-8")
                 self.assertIn("certutil -hashfile", updater)
                 self.assertIn("curl.exe", updater)
                 self.assertNotIn("powershell.exe", updater)
-            installer = root / "dist/InviterStudioSetup.exe"
-            installer.write_bytes(b"installer fixture")
-            target = prepare_handoff(root, installer, portable)
-            checksums = (target / "SHA256.txt").read_text(encoding="ascii")
-            self.assertIn("InviterStudioPortable.zip", checksums)
+                self.assertIn("\\stage\\InviterStudio.exe", updater)
+                self.assertNotIn("InviterStudioPortable\\InviterStudio.exe", updater)
+            handoff = portable.parent
+            self.assertEqual(
+                {path.name for path in handoff.iterdir()},
+                {"InviterStudioPortable.zip", "SHA256.txt", "ПЕРЕДАЙТЕ_ПОЛЬЗОВАТЕЛЮ.txt"},
+            )
+            checksums = (handoff / "SHA256.txt").read_text(encoding="ascii")
             self.assertIn(hashlib.sha256(portable.read_bytes()).hexdigest(), checksums)
 
     @unittest.skipUnless(os.name == "nt", "Windows named mutex")

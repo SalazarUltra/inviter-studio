@@ -1,4 +1,4 @@
-"""Build the standalone Windows app and a native Inno Setup installer."""
+"""Build the standalone Windows app and the portable distribution package."""
 
 import argparse
 import json
@@ -12,29 +12,9 @@ from pathlib import Path
 
 from core.version import APP_COPYRIGHT, VERSION
 from tools.build_assets import create_assets
-from tools.distribution import prepare_handoff, prepare_portable_handoff
+from tools.distribution import prepare_portable_handoff
 
 ROOT = Path(__file__).resolve().parent.parent
-
-
-def find_compiler():
-    explicit = os.environ.get("INNO_SETUP_COMPILER")
-    candidates = [Path(explicit)] if explicit else []
-    candidates += [ROOT / ".audit/tooling/inno/ISCC.exe"]
-    on_path = shutil.which("ISCC.exe")
-    if on_path:
-        candidates.append(Path(on_path))
-    for variable in ("ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA"):
-        base = os.environ.get(variable)
-        if base:
-            candidates += [Path(base) / f"Inno Setup {version}/ISCC.exe" for version in (6, 7)]
-            candidates += [Path(base) / f"Programs/Inno Setup {version}/ISCC.exe" for version in (6, 7)]
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate.resolve()
-    raise RuntimeError(
-        "Не найден Inno Setup 6.7.3+. Выполните powershell -File tools/bootstrap_inno.ps1 или задайте INNO_SETUP_COMPILER."
-    )
 
 
 def find_signtool():
@@ -125,14 +105,13 @@ def version_resource(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--installer-only", action="store_true", help="Use the already built standalone application")
+    parser.add_argument("--package-only", action="store_true", help="Reuse the already built standalone application")
     options = parser.parse_args()
-    compiler = find_compiler()
     assets = ROOT / "build/installer-assets"
     create_assets(assets)
     resource = assets / "version.txt"
     version_resource(resource)
-    if not options.installer_only:
+    if not options.package_only:
         release_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
         release_root = ROOT / "dist/releases" / release_id
         subprocess.run(
@@ -164,10 +143,6 @@ def main():
             check=True,
         )
         package = release_root / "InviterStudio"
-        # Sign the executable before Inno Setup embeds it. Signing only the
-        # outer installer leaves the installed application untrusted by
-        # Windows Smart App Control.
-        sign_artifacts([package / "InviterStudio.exe"])
     else:
         manifest = ROOT / "dist/release.json"
         package = (
@@ -177,21 +152,10 @@ def main():
         )
         if not package.resolve().is_relative_to((ROOT / "dist").resolve()):
             raise RuntimeError("Путь сборки должен находиться внутри dist")
-        validate_package(package)
-        sign_artifacts([package / "InviterStudio.exe"])
-    subprocess.run(
-        [
-            str(compiler),
-            "/Qp",
-            f"/DSourceRoot={ROOT}",
-            f"/DAppVersion={VERSION}",
-            f"/DSourcePackage={package}",
-            str(ROOT / "tools/installer/inviter.iss"),
-        ],
-        cwd=ROOT,
-        check=True,
-        timeout=180,
-    )
+    validate_package(package)
+    # Signing the executable itself is what Windows Smart App Control trusts;
+    # a wrapper archive inherits nothing.
+    sign_artifacts([package / "InviterStudio.exe"])
     relative = package.relative_to(ROOT).as_posix()
     (ROOT / "dist/release.json").write_text(
         json.dumps({"version": VERSION, "package": relative}, indent=2), encoding="utf-8"
@@ -201,10 +165,8 @@ def main():
         '@echo off\nsetlocal\nset "INVITER_HOME=%~dp0.."\nstart "" "%~dp0' + batch_path + '\\InviterStudio.exe"\n',
         encoding="ascii",
     )
-    sign_artifacts([ROOT / "dist/InviterStudioSetup.exe"])
     portable = prepare_portable_handoff(ROOT, package)
-    handoff = prepare_handoff(ROOT, ROOT / "dist/InviterStudioSetup.exe", portable)
-    print(f"Built: {package / 'InviterStudio.exe'}; installer handoff: {handoff}; portable: {portable}")
+    print(f"Built: {package / 'InviterStudio.exe'}; portable: {portable}")
 
 
 if __name__ == "__main__":

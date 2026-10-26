@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import sys
 import time
 from concurrent.futures import Future
 from tkinter import messagebox
@@ -32,7 +30,6 @@ from ui.tab_targets import TargetsTab
 from ui.tab_task import TaskTab
 from ui.tab_warmup import TabWarmup
 from ui.theme import APP_PROFILES, COLORS, FONTS, apply_button_role, init_fonts, style_tree
-from ui.update_dialog import UpdateDialog
 
 
 class App(ctk.CTk):
@@ -121,10 +118,8 @@ class App(ctk.CTk):
             self.bind(f"<Control-Key-{index}>", lambda event, tab=key: self._switch_tab(tab))
         self._drain_ui()
         self._poll_ui()
-        self._update_installer = None
         if show_startup_support:
             self._support_intro_job = self.after(1800, self._load_support_intro)
-        self._maybe_check_updates()
 
     def _build_shell(self):
         self.grid_columnconfigure(1, weight=1)
@@ -266,16 +261,6 @@ class App(ctk.CTk):
             "Плотность меняет отступы и высоту строк в таблицах разделов «Обзор», "
             "«Аккаунты» и «Аудитория». Настройка сохраняется для следующего запуска.",
         )
-        self.update_button = ctk.CTkButton(
-            settings, text="Обновления", width=96, height=32, font=FONTS["small"], command=self.check_updates_now
-        )
-        apply_button_role(self.update_button, "secondary")
-        self.update_button.pack(side="left", padx=(0, 8))
-        tip(
-            self.update_button,
-            "Проверить обновления Inviter Studio на GitHub. Установка запускается только с вашего согласия; "
-            "файл проверяется по SHA-256. Установленная программа проверяет обновления и автоматически при запуске.",
-        )
         self.help_button = ctk.CTkButton(settings, text="?", width=32, height=32, command=self.show_help)
         apply_button_role(self.help_button, "secondary")
         self.help_button.pack(side="left", padx=(0, 10))
@@ -323,69 +308,6 @@ class App(ctk.CTk):
             self.notifications_switch,
             "Уведомлять о завершении задачи и парсинга. Без текстов переписки и номеров аккаунтов. Windows может скрыть уведомление в режиме «Не беспокоить». Выбор сохраняется.",
         )
-
-    def _maybe_check_updates(self) -> None:
-        """Silent GitHub check in the installed app only; source runs and smoke tests stay offline."""
-        if not getattr(sys, "frozen", False) or self._closing or "--smoke-test" in sys.argv:
-            return
-        self._check_updates(silent=True, respect_opt_out=True)
-
-    def check_updates_now(self) -> None:
-        """Manual check from the header button; explains itself when unavailable."""
-        if getattr(self, "_update_checking", False):
-            return
-        self._check_updates(silent=False, respect_opt_out=False)
-
-    def _check_updates(self, *, silent: bool, respect_opt_out: bool) -> None:
-        self._update_checking = True
-
-        def busy():
-            if hasattr(self, "update_button"):
-                self.update_button.configure(state="disabled", text="Проверяем…")
-
-        self._safe_after(busy)
-
-        async def check():
-            from core import updates
-
-            if respect_opt_out and await self.db.get_setting("update_check_enabled", "1") == "0":
-                return None
-            return await updates.fetch_latest_release()
-
-        future = self.run_coro(check())
-
-        def done(result):
-            def show():
-                self._update_checking = False
-                if hasattr(self, "update_button"):
-                    self.update_button.configure(state="normal", text="Обновления")
-                if self._closing:
-                    return
-                if result.cancelled():
-                    return
-                if result.exception():
-                    # Silence auto-checks: only the manual button explains failures.
-                    if not silent:
-                        messagebox.showwarning("Обновления", explain_error(result.exception()))
-                    return
-                release = result.result()
-                if release:
-                    UpdateDialog(self, release)
-                elif not silent:
-                    self.set_status("У вас последняя версия Inviter Studio.", COLORS["success"])
-                    self.notify(
-                        "Обновления",
-                        "У вас последняя версия Inviter Studio.",
-                    )
-
-            self._safe_after(show)
-
-        future.add_done_callback(done)
-
-    def start_installer_after_close(self, installer_path: str) -> None:
-        """Run the verified installer right after the Tk window is destroyed."""
-        self._update_installer = installer_path
-        self._on_close()
 
     def show_help(self, topic=None):
         if self._closing:
@@ -998,9 +920,5 @@ class App(ctk.CTk):
             for timer_id in self.tk.call("after", "info"):
                 self.tk.call("after", "cancel", timer_id)
             self.destroy()
-            # The app is fully closed by now, so the installer will not meet a
-            # running instance; detached launch lets it show its own wizard.
-            if self._update_installer:
-                os.startfile(self._update_installer)  # noqa: PTH110 - Windows shell launch
 
         self.after(50, finish)
