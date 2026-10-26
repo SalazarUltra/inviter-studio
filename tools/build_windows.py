@@ -12,7 +12,7 @@ from pathlib import Path
 
 from core.version import APP_COPYRIGHT, VERSION
 from tools.build_assets import create_assets
-from tools.distribution import prepare_handoff
+from tools.distribution import prepare_handoff, prepare_portable_handoff
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -202,8 +202,9 @@ def main():
         encoding="ascii",
     )
     sign_artifacts([ROOT / "dist/InviterStudioSetup.exe"])
-    handoff = prepare_handoff(ROOT, ROOT / "dist/InviterStudioSetup.exe")
-    print(f"Built: {package / 'InviterStudio.exe'}; handoff: {handoff}")
+    portable = prepare_portable_handoff(ROOT, package)
+    handoff = prepare_handoff(ROOT, ROOT / "dist/InviterStudioSetup.exe", portable)
+    print(f"Built: {package / 'InviterStudio.exe'}; installer handoff: {handoff}; portable: {portable}")
 
 
 if __name__ == "__main__":

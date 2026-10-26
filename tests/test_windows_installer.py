@@ -4,13 +4,14 @@ import os
 import tempfile
 import unittest
 import uuid
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
 from core.instance_lock import InstanceLock
 from tools.build_assets import create_assets
 from tools.build_windows import validate_package, version_resource
-from tools.distribution import prepare_handoff
+from tools.distribution import prepare_handoff, prepare_portable_handoff
 
 
 class InstallerBuildTests(unittest.TestCase):
@@ -60,10 +61,34 @@ class InstallerBuildTests(unittest.TestCase):
             )
             self.assertEqual((target / "InviterStudioSetup.exe").read_bytes(), source.read_bytes())
             self.assertIn(hashlib.sha256(source.read_bytes()).hexdigest(), (target / "SHA256.txt").read_text())
-            self.assertIn("ДОСТАТОЧНО ОДНОГО ФАЙЛА", (target / "СНАЧАЛА_ПРОЧТИ.txt").read_text(encoding="utf-8-sig"))
+            self.assertIn("РЕКОМЕНДУЕМЫЙ ВАРИАНТ", (target / "СНАЧАЛА_ПРОЧТИ.txt").read_text(encoding="utf-8-sig"))
             source.write_bytes(b"updated installer")
             self.assertEqual(prepare_handoff(root, source), target)
             self.assertEqual((target / "InviterStudioSetup.exe").read_bytes(), b"updated installer")
+
+    def test_portable_handoff_contains_runtime_launcher_and_checksum(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            package = root / "dist/releases/test/InviterStudio"
+            package.mkdir(parents=True)
+            (package / "InviterStudio.exe").write_bytes(b"app fixture")
+            (package / "_internal").mkdir()
+            (package / "_internal/runtime.dll").write_bytes(b"runtime fixture")
+            portable = prepare_portable_handoff(root, package)
+            self.assertTrue(portable.is_file())
+            with zipfile.ZipFile(portable) as archive:
+                names = set(archive.namelist())
+                self.assertIn("InviterStudio.exe", names)
+                self.assertIn("_internal/runtime.dll", names)
+                self.assertIn("start.bat", names)
+                self.assertIn("ПРОЧТИ_ПЕРЕД_ЗАПУСКОМ.txt", names)
+                self.assertNotIn("profile/", names)
+            installer = root / "dist/InviterStudioSetup.exe"
+            installer.write_bytes(b"installer fixture")
+            target = prepare_handoff(root, installer, portable)
+            checksums = (target / "SHA256.txt").read_text(encoding="ascii")
+            self.assertIn("InviterStudioPortable.zip", checksums)
+            self.assertIn(hashlib.sha256(portable.read_bytes()).hexdigest(), checksums)
 
     @unittest.skipUnless(os.name == "nt", "Windows named mutex")
     def test_named_mutex_lifetime_and_independent_profile_locks(self):
