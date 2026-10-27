@@ -1092,7 +1092,9 @@ class TaskTab(ctk.CTkFrame):
             return
         if low >= MESSAGES_MIN_INTERVAL:
             return
-        for entry, value in zip((self.interval_min_entry, self.interval_max_entry), MESSAGES_DEFAULT_INTERVAL):
+        for entry, value in zip(
+            (self.interval_min_entry, self.interval_max_entry), MESSAGES_DEFAULT_INTERVAL, strict=True
+        ):
             entry.delete(0, "end")
             entry.insert(0, str(value))
         self.set_status(

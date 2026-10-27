@@ -8,7 +8,6 @@ from core.inviter import InviterEngine
 from core.user_feedback import explain_error
 from core.validation import normalize_username, validate_message
 
-
 UNUSABLE_STATUSES = {"restricted", "unauthorized", "inactive"}
 
 
@@ -39,9 +38,7 @@ def estimate_messages_eta(accounts, pending, interval_min, interval_max, schedul
     for account in usable:
         first, second = message_usage_today(account)
         used_first, used_second = used_first + first, used_second + second
-    remaining = sum(
-        max(0, InviterEngine.get_safe_daily_limit(a) - sum(message_usage_today(a))) for a in usable
-    )
+    remaining = sum(max(0, InviterEngine.get_safe_daily_limit(a) - sum(message_usage_today(a))) for a in usable)
     average = max(1.0, (max(1, int(interval_min)) + max(1, int(interval_max))) / 2)
     window = 86400 if not schedule_hours else max(0.1, min(24, schedule_hours)) * 3600
     # The interval is shared by all accounts, so it can be the real bottleneck.

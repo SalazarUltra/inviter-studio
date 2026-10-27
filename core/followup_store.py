@@ -7,7 +7,6 @@ from datetime import datetime, timedelta
 
 import aiosqlite
 
-
 # A reply must never trigger an instant answer: wait a human-like random time first.
 FOLLOWUP_DELAY_RANGE = (30, 180)
 FOLLOWUP_WAIT_HOURS_DEFAULT = 24

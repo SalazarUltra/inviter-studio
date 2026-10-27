@@ -105,7 +105,7 @@ class PrivateBridgeSettingsTests(DatabaseCase):
 
     async def test_bridge_campaign_gets_conservative_settings(self):
         await self.db.bulk_insert_targets(["alice", "bobby"])
-        for name in ("alice", "bobby"):
+        for _name in ("alice", "bobby"):
             target = await self.db.claim_next_pending_target()
             await self.db.mark_target(target["id"], "private")
         await self.db.save_campaign_settings(
