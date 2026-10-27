@@ -9,9 +9,17 @@ import aiosqlite
 
 from core.followup_store import FollowupStore
 from core.followup_store import note as followup_note
+from core.message_template import clean_name
 from core.paths import DATA_DIR, session_name, session_path
 from core.secrets import protect, reveal_row
-from core.validation import normalize_username, validate_account, validate_message
+from core.validation import (
+    is_id_recipient,
+    normalize_recipient,
+    normalize_username,
+    recipient_user_id,
+    validate_account,
+    validate_message,
+)
 
 DB_PATH = str(DATA_DIR / "inviter.db")
 
@@ -99,6 +107,8 @@ CAMPAIGN_SETTINGS = {
     "schedule_enabled",
     "schedule_from",
     "schedule_to",
+    "schedule_days",
+    "smart_interval_tz",
     "protection_consecutive",
     "protection_break_min",
     "protection_break_max",
@@ -110,6 +120,8 @@ CAMPAIGN_SETTINGS = {
     "followup_text",
     "followup_wait_hours",
     "invite_order",
+    "campaign_daily_cap",
+    "require_warmup_ready",
 }
 
 INVITE_ORDERS = ("shuffle", "as_is")
@@ -139,10 +151,11 @@ def chat_key(chat) -> str:
 
 def user_keys(username=None, user_id=None) -> list[str]:
     keys = []
+    user_id = user_id or recipient_user_id(username)
     if user_id:
         keys.append(f"id:{int(user_id)}")
     name = str(username or "").strip().lstrip("@").lower()
-    if name:
+    if name and not is_id_recipient(name):  # «id:123» placeholders carry no username
         keys.append("u:" + name)
     return keys
 
@@ -388,6 +401,12 @@ class Database(FollowupStore):
             )
             return [dict(row) for row in await cursor.fetchall()], sources
 
+    async def get_parse_user_ids(self, run_id) -> set[int]:
+        """Distinct Telegram ids stored for one parsing run (for «new since previous run» comparisons)."""
+        async with _connect() as db:
+            cursor = await db.execute("SELECT DISTINCT user_id FROM parsed_members WHERE run_id=?", (run_id,))
+            return {int(row[0]) for row in await cursor.fetchall()}
+
     async def delete_parse_run(self, run_id):
         async with _connect() as db:
             await db.execute("BEGIN IMMEDIATE")
@@ -508,6 +527,40 @@ class Database(FollowupStore):
             )
             await db.commit()
 
+    async def get_campaign_daily_count(self, day: str | None = None) -> int:
+        """Successful first actions (invites added / first messages sent) of this campaign for a day."""
+        async with _connect() as db:
+            row = await (
+                await db.execute(
+                    "SELECT successes FROM campaign_daily_counters WHERE campaign_id=? AND day=?",
+                    (self.campaign_id, day or _today_iso()),
+                )
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    async def add_campaign_daily_success(self, amount: int = 1) -> int:
+        """Count one more first action for today; returns the new total."""
+        today = _today_iso()
+        async with _connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute(
+                "INSERT INTO campaign_daily_counters(campaign_id,day,successes) VALUES (?,?,?) "
+                "ON CONFLICT(campaign_id,day) DO UPDATE SET successes=successes+excluded.successes",
+                (self.campaign_id, today, int(amount)),
+            )
+            row = await (
+                await db.execute(
+                    "SELECT successes FROM campaign_daily_counters WHERE campaign_id=? AND day=?",
+                    (self.campaign_id, today),
+                )
+            ).fetchone()
+            # Old days are never read again: keep the table tiny.
+            await db.execute(
+                "DELETE FROM campaign_daily_counters WHERE campaign_id=? AND day<?", (self.campaign_id, today)
+            )
+            await db.commit()
+        return int(row[0])
+
     async def get_campaigns(self):
         async with _connect() as db:
             db.row_factory = aiosqlite.Row
@@ -549,7 +602,7 @@ class Database(FollowupStore):
                 "UPDATE message_followups SET text='',state=CASE WHEN state IN ('waiting','ready') THEN 'cancelled' ELSE state END,completed_at=COALESCE(completed_at,?) WHERE campaign_id=?",
                 (now, self.campaign_id),
             )
-            for table in ("targets", "logs", "campaign_runs"):
+            for table in ("targets", "logs", "campaign_runs", "campaign_daily_counters"):
                 await db.execute(f"DELETE FROM {table} WHERE campaign_id=?", (self.campaign_id,))
             await db.execute("DELETE FROM settings WHERE key GLOB ?", (f"campaign:{self.campaign_id}:*",))
             # A tombstone prevents startup migrations from recreating campaign 1
@@ -681,7 +734,9 @@ class Database(FollowupStore):
             )
             return (await cur.fetchone())[0]
 
-    async def reserve_delivery(self, target_id, account_id, user_id, *, followup_text=None, access_hash=None):
+    async def reserve_delivery(
+        self, target_id, account_id, user_id, *, followup_text=None, access_hash=None, first_name=None
+    ):
         if followup_text is not None:
             validate_message(followup_text)
             if access_hash is None:
@@ -702,9 +757,19 @@ class Database(FollowupStore):
             )
             if cur.rowcount == 1 and followup_text is not None:
                 await db.execute(
-                    "INSERT INTO message_followups(username,user_id,access_hash,campaign_id,target_id,account_id,text,state,created_at) "
-                    "VALUES (?,?,?,?,?,?,?,'armed',?)",
-                    (row[0], user_id, access_hash, self.campaign_id, target_id, account_id, followup_text, _now_iso()),
+                    "INSERT INTO message_followups(username,user_id,access_hash,campaign_id,target_id,account_id,text,state,created_at,first_name) "
+                    "VALUES (?,?,?,?,?,?,?,'armed',?,?)",
+                    (
+                        row[0],
+                        user_id,
+                        access_hash,
+                        self.campaign_id,
+                        target_id,
+                        account_id,
+                        followup_text,
+                        _now_iso(),
+                        clean_name(first_name) or None,
+                    ),
                 )
             await db.commit()
             return random_id if cur.rowcount == 1 else None
@@ -721,7 +786,7 @@ class Database(FollowupStore):
             )
             await db.commit()
 
-    async def finish_delivery(self, target_id, status, message_id=None):
+    async def finish_delivery(self, target_id, status, message_id=None, first_name=None):
         if status not in {"sent", "uncertain", "private"}:
             raise ValueError("Неизвестный результат отправки")
         async with _connect() as db:
@@ -768,9 +833,16 @@ class Database(FollowupStore):
             ).fetchone()
             if followup:
                 await db.execute(
-                    "UPDATE message_followups SET state=?,first_message_id=?,checked_id=? "
-                    "WHERE campaign_id=? AND username=?",
-                    (fstate, message_id, message_id or 0, self.campaign_id, followup["username"]),
+                    "UPDATE message_followups SET state=?,first_message_id=?,checked_id=?,"
+                    "first_name=COALESCE(?,first_name) WHERE campaign_id=? AND username=?",
+                    (
+                        fstate,
+                        message_id,
+                        message_id or 0,
+                        clean_name(first_name) or None,
+                        self.campaign_id,
+                        followup["username"],
+                    ),
                 )
                 await followup_note(
                     db,
@@ -1148,13 +1220,24 @@ class Database(FollowupStore):
     def _audience_item(item) -> dict:
         if isinstance(item, dict):
             user_id = item.get("user_id")
+            user_id = int(user_id) if user_id else None
+            raw_name = str(item.get("username") or "").strip()
+            if raw_name and not is_id_recipient(raw_name):
+                username = normalize_username(raw_name)
+            elif user_id or raw_name:
+                # Known only by Telegram id: stored as «id:<number>» (the inviter resolves it by id).
+                username = normalize_recipient(raw_name if raw_name else user_id)
+                user_id = user_id or recipient_user_id(username)
+            else:
+                username = normalize_username("")  # raises the usual «Никнейм: …» message
             return {
-                "username": normalize_username(item.get("username") or ""),
-                "user_id": int(user_id) if user_id else None,
+                "username": username,
+                "user_id": user_id,
                 "activity": item.get("activity") or None,
                 "source": (str(item.get("source")) if item.get("source") else None),
             }
-        return {"username": normalize_username(item), "user_id": None, "activity": None, "source": None}
+        username = normalize_recipient(item)
+        return {"username": username, "user_id": recipient_user_id(username), "activity": None, "source": None}
 
     async def bulk_insert_targets(self, usernames: list, *, preserve_order: bool = False) -> int:
         """Add usernames (or dicts with user_id/activity/source); returns how many rows were inserted."""
@@ -1171,7 +1254,15 @@ class Database(FollowupStore):
         exclude_usernames=(),
     ) -> dict[str, int]:
         """Insert recipients keeping Telegram identity; optionally drop chat members and already invited people."""
-        result = {"inserted": 0, "duplicates": 0, "excluded": 0, "skipped_invited": 0, "total": 0}
+        result = {
+            "inserted": 0,
+            "duplicates": 0,
+            "excluded": 0,
+            "skipped_invited": 0,
+            "total": 0,
+            "id_only": 0,
+            "no_username": 0,
+        }
         if not items:
             return result
         prepared: dict[str, dict] = {}
@@ -1181,6 +1272,10 @@ class Database(FollowupStore):
             for field in ("user_id", "activity", "source"):
                 if known[field] is None and item[field] is not None:
                     known[field] = item[field]
+        # A person listed both as @name (with id) and as a bare id is one recipient.
+        named_ids = {item["user_id"] for key, item in prepared.items() if item["user_id"] and not is_id_recipient(key)}
+        for key in [key for key in prepared if is_id_recipient(key) and prepared[key]["user_id"] in named_ids]:
+            del prepared[key]
         result["total"] = len(prepared)
         excluded_ids = {int(value) for value in exclude_user_ids or ()}
         excluded_names = {str(value).lstrip("@").lower() for value in exclude_usernames or () if value}
@@ -1200,12 +1295,24 @@ class Database(FollowupStore):
             if ledger_chat:
                 cursor = await db.execute("SELECT user_key FROM invited_ledger WHERE chat_key=?", (ledger_chat,))
                 invited = {row[0] for row in await cursor.fetchall()}
+            known_ids = set()
+            if any(is_id_recipient(key) for key in prepared):
+                cursor = await db.execute(
+                    "SELECT user_id FROM targets WHERE campaign_id=? AND user_id IS NOT NULL", (self.campaign_id,)
+                )
+                known_ids = {row[0] for row in await cursor.fetchall()}
             kept = []
             for item in prepared.values():
-                if (item["user_id"] and item["user_id"] in excluded_ids) or item["username"] in excluded_names:
+                id_only = is_id_recipient(item["username"])
+                if id_only and messages:
+                    # Direct messages are keyed by @username in the shared delivery ledger.
+                    result["no_username"] += 1
+                elif (item["user_id"] and item["user_id"] in excluded_ids) or item["username"] in excluded_names:
                     result["excluded"] += 1
                 elif invited and any(key in invited for key in user_keys(item["username"], item["user_id"])):
                     result["skipped_invited"] += 1
+                elif id_only and item["user_id"] in known_ids:
+                    result["duplicates"] += 1  # same person is already in this campaign (under a username)
                 else:
                     kept.append(item)
             base = 0
@@ -1258,7 +1365,8 @@ class Database(FollowupStore):
                     ],
                 )
             result["inserted"] = db.total_changes - before
-            result["duplicates"] = len(kept) - result["inserted"]
+            result["duplicates"] += len(kept) - result["inserted"]
+            result["id_only"] = sum(1 for item in kept if is_id_recipient(item["username"]))
             # Rows that already existed as plain usernames gain the Telegram id for safer resolving.
             await db.executemany(
                 "UPDATE targets SET user_id=? WHERE campaign_id=? AND username=? AND user_id IS NULL",
@@ -1312,10 +1420,19 @@ class Database(FollowupStore):
 
     async def replace_pending_targets(self, usernames: list[str], expected: list[dict]) -> dict[str, int]:
         """Edit only the waiting queue, leaving outcomes and the global delivery ledger intact."""
-        usernames = list(dict.fromkeys(normalize_username(item) for item in usernames))
+        usernames = list(dict.fromkeys(normalize_recipient(item) for item in usernames))
         async with _connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             await _require_active_campaign(db, self.campaign_id)
+            if any(is_id_recipient(name) for name in usernames):
+                kind_row = await (
+                    await db.execute("SELECT kind FROM campaigns WHERE id=?", (self.campaign_id,))
+                ).fetchone()
+                if kind_row and kind_row[0] == "messages":
+                    raise ValueError(
+                        "Получатели без никнейма (id:…) поддерживаются только в приглашениях; "
+                        "для личных сообщений нужен @username"
+                    )
             cursor = await db.execute(
                 "SELECT value FROM settings WHERE key=?",
                 (self._setting_key("task_status"),),
@@ -1357,9 +1474,12 @@ class Database(FollowupStore):
                 )
             else:
                 await db.executemany(
-                    "INSERT OR IGNORE INTO targets(username,status,created_at,campaign_id,sort_order) "
-                    "VALUES (?,'pending',?,?,?)",
-                    [(name, now, self.campaign_id, order) for order, name in enumerate(usernames)],
+                    "INSERT OR IGNORE INTO targets(username,status,created_at,campaign_id,sort_order,user_id) "
+                    "VALUES (?,'pending',?,?,?,?)",
+                    [
+                        (name, now, self.campaign_id, order, recipient_user_id(name))
+                        for order, name in enumerate(usernames)
+                    ],
                 )
             inserted = db.total_changes - before
             await db.executemany(
@@ -2353,6 +2473,13 @@ async def init_db() -> None:
                 PRIMARY KEY(chat_key, user_key)
             );
 
+            CREATE TABLE IF NOT EXISTS campaign_daily_counters (
+                campaign_id INTEGER NOT NULL,
+                day TEXT NOT NULL,
+                successes INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(campaign_id, day)
+            );
+
             """
         )
         migrations = {
@@ -2436,38 +2563,21 @@ async def init_db() -> None:
             "CREATE TABLE IF NOT EXISTS message_followups(username TEXT PRIMARY KEY,user_id INTEGER NOT NULL,access_hash INTEGER NOT NULL,"
             "campaign_id INTEGER NOT NULL,target_id INTEGER NOT NULL,account_id INTEGER NOT NULL,text TEXT NOT NULL,state TEXT NOT NULL,"
             "first_message_id INTEGER,reply_id INTEGER,random_id INTEGER,message_id INTEGER,checked_id INTEGER NOT NULL DEFAULT 0,"
-            "checked_at TEXT,created_at TEXT,completed_at TEXT,UNIQUE(account_id,user_id))"
+            "checked_at TEXT,created_at TEXT,completed_at TEXT,ready_at TEXT,first_name TEXT,UNIQUE(account_id,user_id))"
         )
         cursor = await db.execute("PRAGMA table_info(message_followups)")
-        if "ready_at" not in {row[1] for row in await cursor.fetchall()}:
+        followup_columns = {row[1] for row in await cursor.fetchall()}
+        if "ready_at" not in followup_columns:
             # Earliest time a reply-triggered second message may be sent (human-like delay).
             await db.execute("ALTER TABLE message_followups ADD COLUMN ready_at TEXT")
+        if "first_name" not in followup_columns:
+            # Recipient first name captured at the first delivery so {имя} works in the second message.
+            await db.execute("ALTER TABLE message_followups ADD COLUMN first_name TEXT")
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_followups_campaign_state ON message_followups(campaign_id,state)"
         )
         await db.execute("UPDATE message_followups SET state='uncertain' WHERE state IN ('armed','sending')")
-        interrupted_followups = await (
-            await db.execute(
-                "SELECT campaign_id,username,account_id FROM message_followups WHERE state IN ('waiting','ready')"
-            )
-        ).fetchall()
-        for campaign_id, username, account_id in interrupted_followups:
-            await db.execute(
-                "UPDATE message_followups SET state='cancelled',completed_at=? "
-                "WHERE campaign_id=? AND username=? AND state IN ('waiting','ready')",
-                (_now_iso(), campaign_id, username),
-            )
-            await db.execute(
-                "INSERT INTO logs(account_phone,username,action,message,created_at,campaign_id) "
-                "VALUES ((SELECT phone FROM accounts WHERE id=?),?,'FOLLOWUP_CANCELLED',?,?,?)",
-                (
-                    account_id,
-                    username,
-                    "Приложение закрывалось; отложенное второе сообщение отменено",
-                    _now_iso(),
-                    campaign_id,
-                ),
-            )
+        # waiting/ready follow-ups are durable: they resume when the campaign is started again.
         await db.execute(
             "UPDATE targets SET status='uncertain',error_message='Результат неизвестен: проверьте переписку вручную' "
             "WHERE status IN ('pending','processing') AND EXISTS "

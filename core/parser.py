@@ -2,8 +2,9 @@
 
 import asyncio
 import json
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from telethon import utils
 from telethon.errors import (
@@ -39,7 +40,7 @@ from telethon.tl.types import (
 
 from core.account_manager import AccountManager
 from core.user_feedback import explain_error
-from core.validation import normalize_username
+from core.validation import id_recipient, normalize_username
 
 MAX_SOURCES = 10
 MAX_PER_SOURCE = 5000
@@ -248,17 +249,40 @@ def audience_usernames(rows, *, include_admins=False):
     return list(dict.fromkeys(names)), skipped
 
 
-def audience_members(rows, *, include_admins=False):
-    """Like audience_usernames, but keeps Telegram identity (id, activity, source) for the audience table."""
+def audience_members(rows, *, include_admins=False, include_id_only=False):
+    """Like audience_usernames, but keeps Telegram identity (id, activity, source) for the audience table.
+
+    With `include_id_only`, people without a @username but with a known Telegram id are kept too (their
+    «username» is the stored key «id:<number>»); bots and deleted accounts are still skipped.
+    """
     names, skipped = audience_usernames(rows, include_admins=include_admins)
     allowed = set(names)
     members, seen = [], set()
+    id_only_added = 0
     for row in rows:
         try:
             username = normalize_username(row["username"]) if row.get("username") else ""
         except ValueError:
+            username = ""
+            if not include_id_only:
+                continue
+        if not username:
+            user_id = row.get("user_id")
+            roles = set(row.get("roles") or ()) | {row.get("role")}
+            if not (
+                include_id_only
+                and user_id
+                and not row.get("is_bot")
+                and not row.get("is_deleted")
+                and (include_admins or not roles & {"creator", "admin"})
+            ):
+                continue
+            username = id_recipient(int(user_id))
+            if username not in seen:
+                id_only_added += 1
+        elif username not in allowed:
             continue
-        if username not in allowed or username in seen:
+        if username in seen:
             continue
         seen.add(username)
         members.append(
@@ -272,6 +296,10 @@ def audience_members(rows, *, include_admins=False):
                 "parse_seq": row.get("parse_seq"),
             }
         )
+    if id_only_added:
+        skipped = dict(skipped)
+        skipped["id_only"] = id_only_added
+        skipped["no_username"] = max(0, skipped["no_username"] - id_only_added)
     return members, skipped
 
 
@@ -567,9 +595,10 @@ class ParserEngine:
             await manager.disconnect()
 
     async def start(self, account, sources, limit):
+        """Collect members. `account` is one account dict, or a list: sources are then shared between accounts."""
         if not 1 <= limit <= MAX_PER_SOURCE or not 1 <= len(sources) <= MAX_SOURCES:
             raise ValueError("Некорректное число групп или лимит участников")
-        return await self._run(account, sources, limit)
+        return await self._run(_account_list(account), sources, limit)
 
     async def resume(self, account, run_id):
         """Continue an interrupted member run: only sources that are not complete are requested again."""
@@ -582,129 +611,245 @@ class ParserEngine:
         if not pending:
             raise ValueError("Все источники этого запуска уже получены")
         limit = min(max(int(run.get("limit_per_source") or 500), 1), MAX_PER_SOURCE)
-        return await self._run(account, pending, limit, run_id=run_id)
+        return await self._run(_account_list(account), pending, limit, run_id=run_id)
 
-    async def _run(self, account, sources, limit, run_id=None):
+    async def _run(self, accounts, sources, limit, run_id=None):
         self._task = asyncio.current_task()
         self.run_id = None
-        manager = AccountManager(account, self.db)
-        outcome, detail, budget, successful, collected = "completed", "", MAX_RUN_RECORDS, 0, 0
-        seen_sources = set()
-        resumed = run_id is not None
+        ctx = SimpleNamespace(
+            limit=limit,
+            outcome="completed",
+            detail="",
+            budget=MAX_RUN_RECORDS,  # records not yet reserved by a source
+            outstanding=0,  # records reserved by sources that are being read right now
+            successful=0,
+            collected=0,
+            seen_sources=set(),
+            saved_sources={},
+            resumed=run_id is not None,
+            stop=False,
+            alive={account["id"] for account in accounts},
+            orphans=deque(),  # sources handed over by an account that hit a limit
+            handed_over=set(),  # references that an account started and left half-read
+            notes=[],
+        )
         try:
-            if resumed:
-                await self.db.reopen_parse_run(run_id, account["id"])
+            if ctx.resumed:
+                await self.db.reopen_parse_run(run_id, accounts[0]["id"])
                 self.run_id = run_id
-                budget = max(0, MAX_RUN_RECORDS - await self.db.count_parsed_members(run_id))
-                saved_sources = {str(row["reference"]): row for row in await self.db.get_parse_sources(run_id)}
-                seen_sources = {
+                ctx.budget = max(0, MAX_RUN_RECORDS - await self.db.count_parsed_members(run_id))
+                ctx.saved_sources = {str(row["reference"]): row for row in await self.db.get_parse_sources(run_id)}
+                ctx.seen_sources = {
                     row["source_id"]
-                    for row in saved_sources.values()
+                    for row in ctx.saved_sources.values()
                     if row["source_id"] is not None and row["status"] == "completed"
                 }
             else:
-                saved_sources = {}
-                self.run_id = await self.db.create_parse_run(account["id"], sources, limit_per_source=limit)
-            await manager.connect()
-            for reference in sources:
-                source_id = None
-                try:
-                    entity, info, basic = await self.open_source(manager.client, reference)
-                    source_id = info["source_id"]
-                    if source_id in seen_sources:
-                        continue
-                    seen_sources.add(source_id)
-                    seen = await self.db.get_parse_resume_state(self.run_id, source_id) if resumed else set()
-                    search_pos = int((saved_sources.get(str(reference)) or {}).get("search_pos") or 0)
-                    await self.db.save_parse_source(self.run_id, str(reference), info, "running", "", len(seen))
-                    self.progress(f"Получение участников: {info['title']}")
-                    cap = min(limit, budget + len(seen))
-
-                    async def save(batch, new_count, reference=reference, info=info, seen=seen):
-                        nonlocal collected, budget
-                        await self.db.save_parsed_members(self.run_id, batch)
-                        collected += len(batch)
-                        budget -= new_count
-                        await self.db.save_parse_source(
-                            self.run_id, str(reference), info, "running", "Получение доступного списка", len(seen)
-                        )
-                        self.progress(f"{info['title']}: получено {len(seen)}; результаты сохраняются")
-
-                    async def remember_search(position, reference=reference):
-                        await self.db.set_parse_search_pos(self.run_id, str(reference), position)
-
-                    await self._read_source(
-                        manager.client,
-                        entity,
-                        info,
-                        basic,
-                        cap=cap,
-                        seen=seen,
-                        source_id=source_id,
-                        save=save,
-                        search_pos=search_pos,
-                        on_search=remember_search,
-                    )
-                    count = len(seen)
-                    partial = info["count_hint"] is None or count < info["count_hint"] or basic is None and count >= cap
-                    source_detail = (
-                        "Получена доступная часть списка. Полнота не гарантируется."
-                        if partial
-                        else "Получен доступный Telegram список на момент запроса."
-                    )
-                    await self.db.save_parse_source(
-                        self.run_id, str(reference), info, "partial" if partial else "completed", source_detail, count
-                    )
-                    successful += 1
-                    if partial:
-                        outcome = "partial"
-                    if budget <= 0:
-                        detail = "Достигнут общий предел 20000 записей; оставшиеся группы не запрашивались."
-                        outcome = "partial"
-                        break
-                except FloodWaitError as exc:
-                    await self.db.set_flood_wait(account["id"], exc.seconds)
-                    detail = access_error(exc)
-                    await self.db.save_parse_source(
-                        self.run_id, str(reference), {"source_id": source_id}, "failed", detail
-                    )
-                    outcome = "partial" if successful or collected else "failed"
-                    break
-                except ACCOUNT_ERRORS as exc:
-                    detail = access_error(exc)
-                    await self.db.save_parse_source(
-                        self.run_id, str(reference), {"source_id": source_id}, "failed", detail
-                    )
-                    outcome = "partial" if successful or collected else "failed"
-                    break
-                except (ValueError, RPCError, asyncio.TimeoutError, ConnectionError, OSError) as exc:
-                    detail = access_error(exc)
-                    await self.db.save_parse_source(
-                        self.run_id, str(reference), {"source_id": source_id}, "failed", detail
-                    )
-                    outcome = "partial"
-                    self.progress(detail)
-                if budget <= 0:
-                    outcome, detail = (
-                        "partial",
-                        "Достигнут общий предел 20000 записей; оставшиеся группы не запрашивались.",
-                    )
-                    break
-            if not successful and not collected and outcome != "stopped":
-                outcome = "partial" if resumed else "failed"
-            if resumed and outcome == "completed":
+                self.run_id = await self.db.create_parse_run(accounts[0]["id"], sources, limit_per_source=limit)
+            queues = {
+                account_id: deque(items)
+                for account_id, items in split_sources_round_robin(sources, [a["id"] for a in accounts]).items()
+            }
+            await self._drain(accounts, queues, ctx)
+            while ctx.orphans and ctx.alive and not ctx.stop:
+                # Sources handed over after the other workers had already finished: a second pass.
+                survivors = [account for account in accounts if account["id"] in ctx.alive]
+                await self._drain(survivors, {}, ctx)
+            if ctx.orphans and not ctx.stop:
+                ctx.outcome = "partial"
+                ctx.detail = ctx.detail or "Не все источники запрошены: аккаунты достигли ограничений Telegram."
+            if not ctx.successful and not ctx.collected and ctx.outcome != "stopped":
+                ctx.outcome = "partial" if ctx.resumed else "failed"
+            if ctx.resumed and ctx.outcome == "completed":
                 rows = await self.db.get_parse_sources(self.run_id)
                 if any(row["status"] != "completed" for row in rows):
-                    outcome = "partial"
+                    ctx.outcome = "partial"
+            if ctx.notes:
+                ctx.detail = (ctx.detail + " " if ctx.detail else "") + "Аккаунты: " + "; ".join(ctx.notes)
         except asyncio.CancelledError:
-            outcome, detail = "stopped", "Остановлено. Уже полученные записи сохранены."
+            ctx.outcome, ctx.detail = "stopped", "Остановлено. Уже полученные записи сохранены."
         except Exception as exc:
-            outcome, detail = "partial" if collected or resumed else "failed", access_error(exc)
+            ctx.outcome = "partial" if ctx.collected or ctx.resumed else "failed"
+            ctx.detail = access_error(exc)
         finally:
+            if self.run_id is not None:
+                await self.db.finish_parse_run(self.run_id, ctx.outcome, ctx.detail)
+            self._task = None
+        return {"run_id": self.run_id, "status": ctx.outcome, "detail": ctx.detail}
+
+    async def _drain(self, accounts, queues, ctx):
+        """Run one worker per account until its own list and the shared hand-over list are empty."""
+        if len(accounts) == 1:  # single account: exactly the old sequential behaviour, in the same task
+            await self._worker(accounts[0], queues.setdefault(accounts[0]["id"], deque()), ctx)
+            return
+        tasks = [
+            asyncio.ensure_future(self._worker(account, queues.setdefault(account["id"], deque()), ctx))
+            for account in accounts
+        ]
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        except asyncio.CancelledError:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
+    async def _worker(self, account, own, ctx):
+        if (not own and not ctx.orphans) or ctx.stop:
+            return
+        manager = AccountManager(account, self.db)
+        try:
             try:
-                await manager.disconnect()
-            finally:
-                if self.run_id is not None:
-                    await self.db.finish_parse_run(self.run_id, outcome, detail)
-                self._task = None
-        return {"run_id": self.run_id, "status": outcome, "detail": detail}
+                await manager.connect()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if self._hand_over(account, own, None, exc, ctx):
+                    return
+                raise
+            while not ctx.stop and ctx.alive:
+                if own:
+                    reference = own.popleft()
+                elif ctx.orphans:
+                    reference = ctx.orphans.popleft()
+                else:
+                    break
+                if await self._process_source(manager, account, reference, own, ctx) != "ok":
+                    break
+        finally:
+            await manager.disconnect()
+
+    def _hand_over(self, account, own, reference, exc, ctx) -> bool:
+        """Give this account's unfinished sources to the other accounts (False when none is left)."""
+        if not ctx.alive - {account["id"]}:
+            return False
+        ctx.alive.discard(account["id"])
+        phone = account.get("phone") or account["id"]
+        detail = access_error(exc)
+        ctx.notes.append(f"{phone}: {detail}")
+        pending = ([reference] if reference is not None else []) + list(own)
+        own.clear()
+        ctx.handed_over.update(item for item in pending if item is not None)
+        ctx.orphans.extendleft(reversed(pending))  # they run before sources nobody has started
+        self.progress(f"{phone}: {detail} Источники переданы другим аккаунтам: {len(pending)}")
+        return True
+
+    async def _process_source(self, manager, account, reference, own, ctx):
+        """Read one source. Returns «ok» to continue, anything else to stop this account's loop."""
+        source_id = None
+        initial, seen, reserved = 0, set(), 0
+        try:
+            # Several accounts reserve from one record budget: wait while it is fully reserved elsewhere.
+            while ctx.budget <= 0 and ctx.outstanding > 0:
+                await asyncio.sleep(0.2)
+            entity, info, basic = await self.open_source(manager.client, reference)
+            source_id = info["source_id"]
+            if source_id in ctx.seen_sources:
+                return "ok"
+            ctx.seen_sources.add(source_id)
+            continuing = ctx.resumed or reference in ctx.handed_over
+            seen = await self.db.get_parse_resume_state(self.run_id, source_id) if continuing else set()
+            initial = len(seen)
+            saved = ctx.saved_sources.get(str(reference))
+            if reference in ctx.handed_over:
+                saved = {str(row["reference"]): row for row in await self.db.get_parse_sources(self.run_id)}.get(
+                    str(reference)
+                )
+            search_pos = int((saved or {}).get("search_pos") or 0)
+            await self.db.save_parse_source(self.run_id, str(reference), info, "running", "", len(seen))
+            self.progress(f"Получение участников: {info['title']}")
+            cap = min(ctx.limit, ctx.budget + len(seen))
+            reserved = max(0, cap - len(seen))
+            ctx.budget -= reserved
+            ctx.outstanding += reserved
+
+            async def save(batch, new_count, reference=reference, info=info, seen=seen):
+                ctx.collected += len(batch)
+                await self.db.save_parsed_members(self.run_id, batch)
+                await self.db.save_parse_source(
+                    self.run_id, str(reference), info, "running", "Получение доступного списка", len(seen)
+                )
+                self.progress(f"{info['title']}: получено {len(seen)}; результаты сохраняются")
+
+            async def remember_search(position, reference=reference):
+                await self.db.set_parse_search_pos(self.run_id, str(reference), position)
+
+            await self._read_source(
+                manager.client,
+                entity,
+                info,
+                basic,
+                cap=cap,
+                seen=seen,
+                source_id=source_id,
+                save=save,
+                search_pos=search_pos,
+                on_search=remember_search,
+            )
+            count = len(seen)
+            partial = info["count_hint"] is None or count < info["count_hint"] or basic is None and count >= cap
+            source_detail = (
+                "Получена доступная часть списка. Полнота не гарантируется."
+                if partial
+                else "Получен доступный Telegram список на момент запроса."
+            )
+            await self.db.save_parse_source(
+                self.run_id, str(reference), info, "partial" if partial else "completed", source_detail, count
+            )
+            ctx.successful += 1
+            if partial:
+                ctx.outcome = "partial"
+        except FloodWaitError as exc:
+            await self.db.set_flood_wait(account["id"], exc.seconds)
+            return await self._account_limited(account, reference, source_id, own, exc, ctx)
+        except ACCOUNT_ERRORS as exc:
+            return await self._account_limited(account, reference, source_id, own, exc, ctx)
+        except (ValueError, RPCError, asyncio.TimeoutError, ConnectionError, OSError) as exc:
+            ctx.detail = access_error(exc)
+            await self.db.save_parse_source(self.run_id, str(reference), {"source_id": source_id}, "failed", ctx.detail)
+            ctx.outcome = "partial"
+            self.progress(ctx.detail)
+        finally:
+            # Unused part of the reservation goes back to the shared budget.
+            ctx.outstanding -= reserved
+            ctx.budget += max(0, reserved - max(0, len(seen) - initial))
+        if ctx.budget <= 0 and ctx.outstanding <= 0:
+            ctx.outcome = "partial"
+            ctx.detail = "Достигнут общий предел 20000 записей; оставшиеся группы не запрашивались."
+            ctx.stop = True
+            return "budget"
+        return "ok"
+
+    async def _account_limited(self, account, reference, source_id, own, exc, ctx):
+        """FloodWait / revoked session on one account: hand its sources to the others, or stop the run."""
+        if self._hand_over(account, own, reference, exc, ctx):
+            # The next account reads this source from scratch (rows already saved are skipped via resume state).
+            ctx.seen_sources.discard(source_id)
+            return "handed_over"
+        ctx.detail = access_error(exc)
+        await self.db.save_parse_source(self.run_id, str(reference), {"source_id": source_id}, "failed", ctx.detail)
+        ctx.outcome = "partial" if ctx.successful or ctx.collected else "failed"
+        ctx.stop = True
+        return "account_limited"
+
+
+def _account_list(account) -> list[dict]:
+    """One account dict or an iterable of them -> unique, non-empty list."""
+    accounts = [account] if isinstance(account, dict) else list(account or ())
+    unique = list({item["id"]: item for item in accounts}.values())
+    if not unique:
+        raise ValueError("Выберите хотя бы один Telegram-аккаунт")
+    return unique
+
+
+def split_sources_round_robin(sources, account_ids) -> dict:
+    """Share sources between accounts in turn: the 1st source to the 1st account, the 2nd to the 2nd, ..."""
+    ids = list(dict.fromkeys(account_ids))
+    shares = {account_id: [] for account_id in ids}
+    for index, source in enumerate(sources):
+        if ids:
+            shares[ids[index % len(ids)]].append(source)
+    return shares

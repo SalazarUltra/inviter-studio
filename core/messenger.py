@@ -2,7 +2,7 @@
 
 import asyncio
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from telethon.errors import (
     AuthKeyUnregisteredError,
@@ -22,11 +22,25 @@ from core.validation import validate_message
 
 
 class MessageEngine(InviterEngine):
+    PACE_MODE = "messages"
     # Consecutive transient resolve failures across *different* recipients (network outage)
     # before the whole run stops.
     MAX_TRANSIENT_FAILURES = 5
     # Transient resolve failures for the SAME recipient before that recipient is marked "error".
     MAX_RESOLVE_RETRIES = 3
+    # Set by shutdown(): app close must not cancel durable waiting/ready second messages.
+    keep_followups = False
+
+    def shutdown(self) -> None:
+        """Stop because the application is closing; waiting follow-ups survive for the next start."""
+        self.keep_followups = True
+        self.stop()
+
+    # Uncertain send, history clearly shows nothing was delivered: requeue this many times, then "error".
+    MAX_VERIFY_REQUEUES = 1
+    # History checks after an uncertain send (the second one follows a short wait).
+    VERIFY_ATTEMPTS = 2
+    VERIFY_DELAY = 3.0
 
     async def start(self, accounts, text, interval_min, interval_max):
         validate_message(text)
@@ -46,6 +60,7 @@ class MessageEngine(InviterEngine):
         self.interval_min = interval_min  # follow-ups keep the same minimum gap since the last send
         self._streaks = {}
         self._resolve_retries = {}
+        self._verify_requeues = {}
         self.followup_text = None
         self.followups = None
         self._followup_failed = False
@@ -68,6 +83,7 @@ class MessageEngine(InviterEngine):
             await self.db.reset_processing_to_pending()
             run_id = await self.db.begin_run("Личные сообщения")
             await self.db.reset_message_counters()
+            await self._load_daily_cap()
             self.max_consecutive = int(await self.db.get_setting("protection_consecutive", "5"))
             self.break_min = int(await self.db.get_setting("protection_break_min", "5"))
             self.break_max = int(await self.db.get_setting("protection_break_max", "15"))
@@ -142,6 +158,8 @@ class MessageEngine(InviterEngine):
                         continue
                     break
                 await self.db.reset_message_counters()
+                if await self._daily_cap_hold():
+                    continue
                 account = await self._pick_available_account(accounts)
                 if not account:
                     current = await self.db.get_accounts_by_ids(list(self.account_managers))
@@ -313,6 +331,7 @@ class MessageEngine(InviterEngine):
                     user.id,
                     followup_text=self.followup_text,
                     access_hash=getattr(user, "access_hash", None),
+                    first_name=getattr(user, "first_name", None),
                 )
                 if random_id is None:
                     await self._skip_duplicate(target)
@@ -327,11 +346,13 @@ class MessageEngine(InviterEngine):
                     continue
                 if self.status_callback:
                     self.status_callback(f"Сообщение @{target['username']} через {account['phone']}")
+                send_started = datetime.now(timezone.utc)
                 result = await manager.send_direct_message(user, rendered, random_id)
                 if result.get("success"):
                     await self.db.finish_delivery(reserved, "sent", result.get("message_id"))
                     claimed = reserved = None
                     self._session_counts["sent"] += 1
+                    self._daily_done = await self.db.add_campaign_daily_success()
                     await self.db.add_log(account["phone"], target["username"], "MESSAGE_SENT", "Сообщение отправлено")
                     await self._record_streak(account["id"])
                 elif result.get("error") == "private":
@@ -386,18 +407,80 @@ class MessageEngine(InviterEngine):
                     await self.db.mark_target(claimed, "pending")
                     await self._pause_account(account, target, result["error"], result.get("flood_seconds"))
                 else:
-                    await self.db.finish_delivery(reserved, "uncertain")
-                    claimed = reserved = None
-                    self._session_counts["errors"] += 1
-                    await self.db.add_log(
-                        account["phone"],
-                        target["username"],
-                        "MESSAGE_UNCERTAIN",
-                        "Результат неизвестен. Проверьте переписку вручную; автоматического повтора не будет",
+                    # Unknown outcome (timeout, empty answer, 5xx, dropped connection): look at the
+                    # chat history before deciding. One uncertain recipient never stops the run.
+                    verdict = await self._verify_uncertain_send(
+                        manager, user, rendered, random_id, send_started, result
                     )
-                    self.log_callback("ERROR", "Результат отправки неизвестен. Проверьте переписку вручную.")
-                    outcome = "failed"
-                    self.stop()
+                    if verdict["found"] is True:
+                        await self.db.finish_delivery(reserved, "sent", verdict.get("message_id"))
+                        claimed = reserved = None
+                        self._verify_requeues.pop(target["id"], None)
+                        self._session_counts["sent"] += 1
+                        await self.db.add_log(
+                            account["phone"],
+                            target["username"],
+                            "MESSAGE_SENT",
+                            "Сообщение отправлено (подтверждено по истории переписки после неопределённого ответа)",
+                        )
+                        self.log_callback(
+                            "INFO", f"@{target['username']}: ответ Telegram был неопределённым, но сообщение найдено"
+                        )
+                        await self._record_streak(account["id"])
+                    elif verdict["found"] is False:
+                        # History was read and the message is clearly absent: nothing was delivered.
+                        await self.db.release_delivery(reserved)
+                        reserved = None
+                        requeues = self._verify_requeues.get(target["id"], 0)
+                        if requeues < self.MAX_VERIFY_REQUEUES:
+                            self._verify_requeues[target["id"]] = requeues + 1
+                            await self.db.mark_target(claimed, "pending")
+                            claimed = None
+                            await self.db.add_log(
+                                account["phone"],
+                                target["username"],
+                                "MESSAGE_RETRY",
+                                "Неопределённый ответ, в переписке сообщения нет; получатель возвращён в очередь",
+                            )
+                            self.log_callback(
+                                "WARN",
+                                f"@{target['username']}: сообщение не доставлено (проверено по истории). "
+                                "Повтор позже, кампания продолжается",
+                            )
+                        else:
+                            self._verify_requeues.pop(target["id"], None)
+                            await self.db.mark_target(
+                                claimed,
+                                "error",
+                                error_message="Отправка не подтверждена: Telegram не ответил, сообщения в переписке нет",
+                            )
+                            claimed = None
+                            self._session_counts["errors"] += 1
+                            await self.db.add_log(
+                                account["phone"],
+                                target["username"],
+                                "MESSAGE_ERROR",
+                                "Повторная отправка тоже не подтверждена; сообщения в переписке нет",
+                            )
+                            self.log_callback("ERROR", f"@{target['username']}: сообщение не доставлено; идём дальше")
+                    else:
+                        # Could not verify either way: never auto-retry (would risk a duplicate),
+                        # but keep the campaign and its follow-ups running.
+                        await self.db.finish_delivery(reserved, "uncertain")
+                        claimed = reserved = None
+                        self._verify_requeues.pop(target["id"], None)
+                        self._session_counts["errors"] += 1
+                        await self.db.add_log(
+                            account["phone"],
+                            target["username"],
+                            "MESSAGE_UNCERTAIN",
+                            "Результат неизвестен. Проверьте переписку вручную; автоматического повтора не будет",
+                        )
+                        self.log_callback(
+                            "ERROR",
+                            f"@{target['username']}: результат отправки неизвестен. "
+                            "Проверьте переписку вручную; кампания продолжается",
+                        )
                 claimed = reserved = None
                 await self._progress()
                 if self.running and (await self.db.get_targets_stats())["pending"]:
@@ -431,8 +514,13 @@ class MessageEngine(InviterEngine):
                 elif claimed is not None:
                     await self.db.mark_target(claimed, "pending")
                 await self.db.set_setting("task_status", "stopped")
-                cancelled_followups = await self.db.cancel_followups(
-                    "Задача завершена или остановлена; второе сообщение отменено и после ответа не отправится"
+                # Closing the app keeps waiting/ready second messages; a user stop or normal finish cancels them.
+                cancelled_followups = (
+                    0
+                    if self.keep_followups
+                    else await self.db.cancel_followups(
+                        "Задача завершена или остановлена; второе сообщение отменено и после ответа не отправится"
+                    )
                 )
                 followup_stats = await self.db.get_followup_stats()
                 summary["followup_waiting"] = sum(followup_stats.get(key, 0) for key in ("waiting", "ready"))
@@ -454,6 +542,31 @@ class MessageEngine(InviterEngine):
                 self._task = None
             if self.complete_callback:
                 self.complete_callback(summary)
+
+    async def _verify_uncertain_send(self, manager, user, text, random_id, since, result):
+        """Check the chat history after an uncertain send.
+
+        Returns ``{"found": True, "message_id": ...}`` (delivered), ``{"found": False}`` (clearly absent
+        after a short wait) or ``{"found": None}`` (could not tell).
+        """
+        reading_failed = False
+        for attempt in range(self.VERIFY_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(self.VERIFY_DELAY)
+            if not self.running and self._stop_requested:
+                return {"found": None}
+            try:
+                verdict = await manager.verify_sent_message(user, text, random_id, since)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - verification must never break the campaign
+                verdict = {"found": None}
+            found = verdict.get("found") if isinstance(verdict, dict) else None
+            if found is True:
+                return {"found": True, "message_id": verdict.get("message_id")}
+            if found is None:
+                reading_failed = True
+        return {"found": None} if reading_failed else {"found": False}
 
     async def _finish_not_found(self, account, target, detail):
         await self.db.mark_target(

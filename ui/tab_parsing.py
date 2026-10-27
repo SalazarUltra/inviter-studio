@@ -20,7 +20,8 @@ from core.chat_authors import (
     history_period,
 )
 from core.database import is_flood_blocking, order_audience
-from core.export import write_parsed
+from core.export import txt_lines_with_ids, write_parsed
+from core.parse_compare import describe_difference, only_new, user_id_set
 from core.parser import (
     ACCOUNT_ERRORS,
     ACTIVITY_LABELS,
@@ -35,7 +36,7 @@ from core.parser import (
     unique_members,
 )
 from core.user_feedback import explain_error
-from core.validation import normalize_username
+from core.validation import is_id_recipient, normalize_username
 from ui.campaigns import CampaignBar
 from ui.components import page_intro
 from ui.dispatch import post_ui
@@ -98,8 +99,11 @@ EXPORT_FORMATS = {
     "XLSX · Excel": "xlsx",
     "CSV · таблица": "csv",
     "TXT · никнеймы": "txt",
+    "TXT · никнеймы и ID": "txt_ids",
     "JSON · данные": "json",
 }
+EXPORT_EXTENSIONS = {"txt_ids": "txt"}
+NO_COMPARE = "Выберите прошлый запуск"
 FILTER_KEYS = (
     "only_username",
     "exclude_bots",
@@ -142,6 +146,12 @@ class ParsingTab(ctk.CTkFrame):
         self.last_export_path = None
         self.export_buttons = {}
         self._filter_job = None
+        self.multi_vars = {}  # account id -> BooleanVar of the «several accounts» checklist
+        self.multi_checks = []
+        self.compare_runs = {}  # menu label -> saved run offered for «new since previous run»
+        self._compare_ids = None  # Telegram ids of the previous run (None until loaded)
+        self._compare_loading = False
+        self._compare_generation = 0
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(2, weight=1)
         intro = page_intro(
@@ -187,6 +197,35 @@ class ParsingTab(ctk.CTkFrame):
             command=lambda: app.show_help("parsing"),
         )
         self.help_button.grid(row=0, column=3)
+        self.multi_var = ctk.BooleanVar(value=False)
+        self.multi_switch = ctk.CTkSwitch(
+            self.account_bar,
+            text="Несколько аккаунтов",
+            variable=self.multi_var,
+            command=self.toggle_multi_accounts,
+        )
+        self.multi_switch.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        tip(
+            self.multi_switch,
+            "Источники делятся между отмеченными аккаунтами по кругу (1-й — первому, 2-й — второму…). Если у одного "
+            "аккаунта пауза Telegram (FloodWait) или ограничение, его оставшиеся источники передаются другим, а "
+            "этот аккаунт ждёт окончания паузы. Лимиты Telegram не обходятся. Режим «Авторы сообщений» "
+            "использует один аккаунт.",
+        )
+        self.multi_frame = ctk.CTkFrame(self.account_bar, fg_color=COLORS["surface"], border_width=1)
+        self.multi_frame.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        self.multi_frame.grid_remove()
+        self.multi_hint = ctk.CTkLabel(
+            self.account_bar,
+            text="",
+            font=FONTS["small"],
+            text_color=COLORS["muted"],
+            anchor="w",
+            justify="left",
+        )
+        self.multi_hint.grid(row=3, column=0, columnspan=4, sticky="ew")
+        self.multi_hint.grid_remove()
+        wrap_label(self.multi_hint)
         save_bar = ctk.CTkFrame(toolbar, fg_color="transparent")
         self.save_bar = save_bar
         save_bar.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(0, 0))
@@ -310,6 +349,29 @@ class ParsingTab(ctk.CTkFrame):
             self.resume_button,
             "Дополучает группы, которые не были завершены (ошибка, остановка, закрытие программы). Уже сохранённые люди не дублируются.",
         )
+        compare = ctk.CTkFrame(results, fg_color="transparent")
+        self.compare_row = compare
+        compare.pack(fill="x", padx=16, pady=(0, 8))
+        compare.grid_columnconfigure(1, weight=1)
+        self.compare_var = ctk.BooleanVar(value=False)
+        self.compare_check = ctk.CTkCheckBox(
+            compare,
+            text="Новые с прошлого запуска",
+            variable=self.compare_var,
+            command=self.compare_toggled,
+        )
+        self.compare_check.grid(row=0, column=0, sticky="w", padx=(0, 10))
+        self.compare_menu = ctk.CTkOptionMenu(
+            compare, values=[NO_COMPARE], command=lambda _: self.compare_toggled(), state="disabled"
+        )
+        self.compare_menu.grid(row=0, column=1, sticky="ew")
+        tip(
+            self.compare_check,
+            "Показывает, сохраняет и передаёт в аудиторию только тех людей, чьего Telegram ID не было в выбранном "
+            "прошлом запуске. Сравнение идёт по ID, а не по никнейму; фильтры применяются дополнительно.",
+        )
+        self.compare_label = hint(results, "", padx=16)
+        self.compare_label.pack_forget()
         self.result_hint = hint(
             results, "Выберите сохранённый результат. Участники и авторы сообщений — разные режимы."
         )
@@ -448,25 +510,43 @@ class ParsingTab(ctk.CTkFrame):
         CampaignBar(export).pack(fill="x", padx=16, pady=(0, 8))
         exports = ctk.CTkFrame(export, fg_color="transparent")
         exports.pack(fill="x", padx=16, pady=(0, 8))
-        for format_name in ("xlsx", "csv", "json", "txt"):
+        for format_name in ("xlsx", "csv", "json", "txt", "txt_ids"):
             button = ctk.CTkButton(
                 exports,
-                text=f"Экспорт {format_name.upper()}",
+                text="Экспорт TXT+ID" if format_name == "txt_ids" else f"Экспорт {format_name.upper()}",
                 width=120,
                 command=lambda value=format_name: self.export(value),
             )
             button.pack(side="left", padx=(0, 8))
             self.export_buttons[format_name] = button
+        tip(
+            self.export_buttons["txt_ids"],
+            "TXT, где у людей без никнейма вместо @имени записан Telegram ID (id:123456789). "
+            "Такой файл можно импортировать в «Аудиторию».",
+        )
         self.import_button = ctk.CTkButton(exports, text="В аудиторию…", width=150, command=self.to_audience)
         self.import_button.pack(side="left")
+        options_row = ctk.CTkFrame(export, fg_color="transparent")
+        options_row.pack(fill="x", padx=16, pady=(0, 8))
         self.include_admins_var = ctk.BooleanVar(value=False)
         self.include_admins_check = ctk.CTkCheckBox(
-            exports, text="Включая админов", variable=self.include_admins_var, width=140
+            options_row, text="Включая админов", variable=self.include_admins_var, width=140
         )
-        self.include_admins_check.pack(side="left", padx=(12, 0))
+        self.include_admins_check.pack(side="left")
         tip(
             self.include_admins_check,
-            "По умолчанию создатели и администраторы групп в аудиторию не попадают. Боты, удалённые и люди без никнейма пропускаются всегда.",
+            "По умолчанию создатели и администраторы групп в аудиторию не попадают. Боты и удалённые пропускаются всегда.",
+        )
+        self.include_id_only_var = ctk.BooleanVar(value=False)
+        self.include_id_only_check = ctk.CTkCheckBox(
+            options_row, text="Включая людей без никнейма (по ID)", variable=self.include_id_only_var
+        )
+        self.include_id_only_check.pack(side="left", padx=(16, 0))
+        tip(
+            self.include_id_only_check,
+            "Добавляет людей, у которых есть Telegram ID, но нет @никнейма (снимите фильтр «С никнеймом»). "
+            "Пригласить такого человека получится, только если аккаунт «знает» его (общая группа или контакт); "
+            "иначе Telegram не отдаст пользователя по ID, и он будет пропущен. Для личных сообщений нужен @никнейм.",
         )
         audience = ctk.CTkFrame(export, fg_color="transparent")
         audience.pack(fill="x", padx=16, pady=(0, 8))
@@ -635,6 +715,8 @@ class ParsingTab(ctk.CTkFrame):
             self.clear_button,
             self.mode_menu,
             self.period_menu,
+            self.multi_switch,
+            *self.multi_checks,
         ):
             button.configure(state="disabled" if busy else "normal")
         self.stop_button.configure(state="normal" if busy else "disabled")
@@ -667,8 +749,9 @@ class ParsingTab(ctk.CTkFrame):
         if run is None or not self._resume_pending:
             return
         run_id = run["id"]
+        multi = self.multi_mode()
         original = next((key for key, row in self.accounts.items() if row["id"] == run.get("account_id")), None)
-        if original and original != self.account_menu.get():
+        if original and original != self.account_menu.get() and not multi:
             answer = messagebox.askyesnocancel(
                 "Продолжить получение",
                 f"Исходный запуск шёл с аккаунтом {original}.\nПродолжить с ним? «Нет» — взять выбранный сейчас аккаунт.",
@@ -680,13 +763,13 @@ class ParsingTab(ctk.CTkFrame):
                 self.account_changed(original)
 
         async def collect():
-            account = await self.selected_account()
+            account = await self.selected_accounts() if multi else await self.selected_account()
             self.engine = ParserEngine(
                 self.db, progress=lambda text: self._safe_after(lambda: self.status.configure(text=text))
             )
             return await self.engine.resume(account, run_id)
 
-        self.operate(collect(), self._run_finished, activity="Продолжаем получение...")
+        self.operate(collect(), self._run_finished, activity="Продолжаем получение...", multi=multi)
 
     def refresh_accounts(self):
         future = self.app.run_coro(self.db.get_enabled_accounts())
@@ -706,10 +789,76 @@ class ParsingTab(ctk.CTkFrame):
                 self.account_menu.set(value)
                 if value != previous:
                     self.account_changed(value)
+                self.rebuild_multi_accounts()
 
             self._safe_after(render)
 
         future.add_done_callback(done)
+
+    def multi_mode(self) -> bool:
+        """True while «Несколько аккаунтов» is on and at least one account is ticked."""
+        return bool(self.multi_var.get()) and any(var.get() for var in self.multi_vars.values())
+
+    def toggle_multi_accounts(self):
+        if self.multi_var.get():
+            self.multi_frame.grid()
+            self.multi_hint.grid()
+            self.rebuild_multi_accounts()
+        else:
+            self.multi_frame.grid_remove()
+            self.multi_hint.grid_remove()
+
+    def rebuild_multi_accounts(self):
+        """Checklist of enabled accounts; ticks survive a refresh, the first account is ticked by default."""
+        previous = {account_id: var.get() for account_id, var in self.multi_vars.items()}
+        for widget in self.multi_frame.winfo_children():
+            widget.destroy()
+        self.multi_vars, self.multi_checks = {}, []
+        for index, row in enumerate(self.accounts.values()):
+            var = ctk.BooleanVar(value=previous.get(row["id"], not previous and index == 0))
+            check = ctk.CTkCheckBox(
+                self.multi_frame, text=row["phone"], variable=var, width=150, command=self.multi_selection_changed
+            )
+            check.grid(row=index // 3, column=index % 3, sticky="w", padx=10, pady=4)
+            self.multi_vars[row["id"]] = var
+            self.multi_checks.append(check)
+        self.multi_selection_changed()
+
+    def multi_selection_changed(self):
+        count = sum(1 for var in self.multi_vars.values() if var.get())
+        self.multi_hint.configure(
+            text=(
+                f"Отмечено аккаунтов: {count}. Источники делятся между ними по кругу; при паузе Telegram у одного "
+                "аккаунта его источники берут остальные."
+                if count
+                else "Отметьте хотя бы один аккаунт или выключите режим."
+            )
+        )
+
+    async def selected_accounts(self):
+        """Fresh, usable accounts ticked in the multi-account list (blocked ones are skipped with a note)."""
+        chosen = [account_id for account_id, var in self.multi_vars.items() if var.get()]
+        if not chosen:
+            raise ValueError("Отметьте хотя бы один аккаунт")
+        usable, skipped = [], []
+        for account_id in chosen:
+            account = await self.db.get_account(account_id)
+            if not account or not account.get("is_enabled"):
+                skipped.append(f"{account['phone'] if account else account_id}: выключен или удалён")
+                continue
+            account = await self.db.clear_expired_flood(account)
+            if is_flood_blocking(account):
+                skipped.append(f"{account['phone']}: пауза Telegram")
+                continue
+            usable.append(account)
+        if not usable:
+            raise ValueError("Все отмеченные аккаунты недоступны: " + "; ".join(skipped))
+        if skipped:
+            self.progress_note("Пропущены аккаунты — " + "; ".join(skipped))
+        return usable
+
+    def progress_note(self, text):
+        self._safe_after(lambda: self.status.configure(text=text, text_color=COLORS["muted"]))
 
     def account_changed(self, _value):
         self._selected_account_id = self.accounts.get(_value, {}).get("id")
@@ -736,7 +885,22 @@ class ParsingTab(ctk.CTkFrame):
         """
         if self.busy():
             return "Дождитесь завершения текущей проверки или остановите парсинг"
-        account_id = self._selected_account_id
+        return self._account_busy_reason(self._selected_account_id)
+
+    def accounts_conflict(self):
+        """Same check for every ticked account of the multi-account list (first problem wins)."""
+        if self.busy():
+            return "Дождитесь завершения текущей проверки или остановите парсинг"
+        for account_id, var in self.multi_vars.items():
+            if not var.get():
+                continue
+            reason = self._account_busy_reason(account_id)
+            if reason:
+                phone = next((row["phone"] for row in self.accounts.values() if row["id"] == account_id), account_id)
+                return f"{phone}: {reason}"
+        return None
+
+    def _account_busy_reason(self, account_id):
         task_tab = self.app.task_tab
         if self.app.scheduler.is_running() or task_tab._starting:
             selected = {key for key, var in task_tab.account_vars.items() if var.get()}
@@ -750,8 +914,8 @@ class ParsingTab(ctk.CTkFrame):
             return "Этот аккаунт уже используется другой операцией. Дождитесь её завершения или выберите другой"
         return None
 
-    def operate(self, coroutine, callback, activity="Проверяем доступ..."):
-        conflict = self.account_conflict()
+    def operate(self, coroutine, callback, activity="Проверяем доступ...", multi=False):
+        conflict = self.accounts_conflict() if multi else self.account_conflict()
         if conflict:
             coroutine.close()
             messagebox.showwarning("Аккаунт занят", conflict)
@@ -889,8 +1053,10 @@ class ParsingTab(ctk.CTkFrame):
             self.status.configure(text="Проверьте адреса и числовой лимит: " + str(exc), text_color=COLORS["error"])
             return
 
+        multi = self.multi_mode() and not authors  # authors mode always reads with the single selected account
+
         async def collect():
-            account = await self.selected_account()
+            account = await self.selected_accounts() if multi else await self.selected_account()
             engine_class = ChatAuthorsEngine if authors else ParserEngine
             self.engine = engine_class(
                 self.db, progress=lambda text: self._safe_after(lambda: self.status.configure(text=text))
@@ -900,7 +1066,10 @@ class ParsingTab(ctk.CTkFrame):
             return await self.engine.start(account, sources, limit)
 
         self.operate(
-            collect(), self._run_finished, activity="Получаем сообщения..." if authors else "Получаем участников..."
+            collect(),
+            self._run_finished,
+            activity="Получаем сообщения..." if authors else "Получаем участников...",
+            multi=multi,
         )
 
     def _run_finished(self, result):
@@ -968,7 +1137,62 @@ class ParsingTab(ctk.CTkFrame):
                     self.source_report.configure(state="normal")
                     self.source_report.delete("1.0", "end")
                     self.source_report.configure(state="disabled")
+                    self.update_compare_options()
                     self.apply_filters()
+
+            self._safe_after(render)
+
+        future.add_done_callback(done)
+
+    def update_compare_options(self):
+        """Offer the other saved runs for «Новые с прошлого запуска»; default = the nearest older run."""
+        options = {
+            label: row
+            for label, row in self.runs.items()
+            if row["id"] != self.selected_run and row["status"] != "running"
+        }
+        self.compare_runs = options
+        enabled = bool(options) and self.selected_run is not None
+        self.compare_menu.configure(values=list(options) or [NO_COMPARE], state="normal" if enabled else "disabled")
+        self.compare_check.configure(state="normal" if enabled else "disabled")
+        if self.compare_menu.get() not in options:
+            older = [label for label, row in options.items() if self.selected_run and row["id"] < self.selected_run]
+            self.compare_menu.set(older[0] if older else next(iter(options), NO_COMPARE))
+        if not enabled:
+            self.compare_var.set(False)
+        self.compare_toggled()
+
+    def compare_toggled(self):
+        """(Re)load the previous run's Telegram ids; every view then shows only people absent from it."""
+        self._compare_generation += 1
+        generation = self._compare_generation
+        previous = self.compare_runs.get(self.compare_menu.get())
+        self._compare_ids = None
+        if not self.compare_var.get() or previous is None:
+            self._compare_loading = False
+            if previous is None:
+                self.compare_var.set(False)
+            self.compare_label.pack_forget()
+            self.apply_filters()
+            return
+        self._compare_loading = True
+        self.compare_label.configure(text="Загрузка прошлого запуска для сравнения…")
+        self.compare_label.pack(fill="x", padx=16, pady=(0, 10), after=self.compare_row)
+        self.apply_filters()
+        future = self.app.run_coro(self.db.get_parse_user_ids(previous["id"]))
+
+        def done(result):
+            def render():
+                if generation != self._compare_generation:
+                    return
+                self._compare_loading = False
+                if result.cancelled() or result.exception():
+                    self.compare_var.set(False)
+                    self.compare_label.pack_forget()
+                    self.status.configure(text="Не удалось загрузить прошлый запуск для сравнения.")
+                else:
+                    self._compare_ids = result.result()
+                self.apply_filters()
 
             self._safe_after(render)
 
@@ -983,6 +1207,7 @@ class ParsingTab(ctk.CTkFrame):
         self.rows = []
         self._resume_pending = []
         self.update_resume_button()
+        self.update_compare_options()
         self.apply_filters()
         self._query_generation += 1
         generation = self._query_generation
@@ -1107,6 +1332,11 @@ class ParsingTab(ctk.CTkFrame):
             source_id=getattr(self, "source_choices", {}).get(self.source_filter.get()),
         )
         matched = filter_members(self.rows, **options)
+        comparing = bool(getattr(self, "compare_var", None) and self.compare_var.get())
+        if comparing:
+            # «Новые с прошлого запуска»: only people whose id is absent from the chosen earlier run.
+            # While that run loads nothing is shown, so a partial list can never be exported.
+            matched = only_new(matched, self._compare_ids) if self._compare_ids is not None else []
         self.filtered = unique_members(matched)
         if self._result_mode == "authors":
             self.filtered = filter_author_stats(
@@ -1146,8 +1376,12 @@ class ParsingTab(ctk.CTkFrame):
                 "Загрузка результата…"
                 if self._results_loading
                 else f"Найдено: {total} · После фильтров: {len(self.filtered)} · В файл попадёт весь отфильтрованный список."
+                + (" Показаны только новые с прошлого запуска." if comparing and not self._compare_loading else "")
             )
         )
+        if comparing and self._compare_ids is not None and not self._compare_loading:
+            self.compare_label.configure(text=describe_difference(user_id_set(self.rows), self._compare_ids))
+            self.compare_label.pack(fill="x", padx=16, pady=(0, 10), after=self.compare_row)
 
     def render_page(self):
         pages = max(1, (len(self.filtered) + 99) // 100)
@@ -1176,10 +1410,11 @@ class ParsingTab(ctk.CTkFrame):
         self.render_page()
 
     def update_export_controls(self):
-        ready = bool(self.filtered) and not self._results_loading and not self._exporting
+        ready = bool(self.filtered) and not self._results_loading and not self._exporting and not self._compare_loading
         names_count = len({row["username"] for row in self.filtered if row["username"]})
+        lines_count = len(txt_lines_with_ids(self.filtered))
         format_name = EXPORT_FORMATS[self.export_format.get()]
-        count = names_count if format_name == "txt" else len(self.filtered)
+        count = {"txt": names_count, "txt_ids": lines_count}.get(format_name, len(self.filtered))
         apply_button_role(self.save_file_button, "primary" if ready and count else "secondary")
         self.save_file_button.configure(
             state="normal" if ready and count else "disabled",
@@ -1187,7 +1422,8 @@ class ParsingTab(ctk.CTkFrame):
         )
         self.export_format.configure(state="disabled" if self._exporting else "normal")
         for name, button in self.export_buttons.items():
-            button.configure(state="normal" if ready and (name != "txt" or names_count) else "disabled")
+            needed = {"txt": names_count, "txt_ids": lines_count}.get(name, 1)
+            button.configure(state="normal" if ready and needed else "disabled")
 
     def show_export_path(self, path):
         self.last_export_path = Path(path).resolve()
@@ -1241,25 +1477,29 @@ class ParsingTab(ctk.CTkFrame):
             )
 
     def export(self, format_name):
-        if self._exporting or self._results_loading:
+        if self._exporting or self._results_loading or self._compare_loading:
             return
         if not self.filtered:
             self.status.configure(text="Выберите сохранённый результат. Если фильтры скрыли всех людей, измените их.")
             return
         if format_name == "txt" and not any(row["username"] for row in self.filtered):
             self.status.configure(
-                text="TXT содержит только никнеймы. В этом сегменте их нет; выберите XLSX, CSV или JSON"
+                text="TXT содержит только никнеймы. В этом сегменте их нет; выберите TXT с ID, XLSX, CSV или JSON"
             )
             return
+        if format_name == "txt_ids" and not txt_lines_with_ids(self.filtered):
+            self.status.configure(text="В этом сегменте нет ни никнеймов, ни Telegram ID")
+            return
+        extension = EXPORT_EXTENSIONS.get(format_name, format_name)
         initial_folder = self.last_export_path.parent if self.last_export_path else Path.home() / "Downloads"
         if not initial_folder.is_dir():
             initial_folder = Path.home()
         path = filedialog.asksaveasfilename(
             title="Сохранить результат парсинга на компьютер",
-            defaultextension="." + format_name,
-            filetypes=[(format_name.upper(), "*." + format_name)],
+            defaultextension="." + extension,
+            filetypes=[(extension.upper(), "*." + extension)],
             initialdir=str(initial_folder),
-            initialfile=f"inviter_{self._result_mode}_run-{self.selected_run}_{datetime.now():%Y%m%d_%H%M%S}.{format_name}",
+            initialfile=f"inviter_{self._result_mode}_run-{self.selected_run}_{datetime.now():%Y%m%d_%H%M%S}.{extension}",
             confirmoverwrite=True,
         )
         if not path:
@@ -1309,10 +1549,21 @@ class ParsingTab(ctk.CTkFrame):
         if self.app.scheduler.is_running() or self.app.task_tab._starting:
             messagebox.showwarning("Задача выполняется", "Остановите задачу перед добавлением получателей")
             return
-        members, skipped = audience_members(self.filtered, include_admins=bool(self.include_admins_var.get()))
+        if self._compare_loading or self._results_loading:
+            self.status.configure(text="Дождитесь загрузки результата и сравнения с прошлым запуском")
+            return
+        include_id_only = bool(self.include_id_only_var.get())
+        members, skipped = audience_members(
+            self.filtered, include_admins=bool(self.include_admins_var.get()), include_id_only=include_id_only
+        )
         if not members:
             self.status.configure(
-                text="В сегменте нет подходящих никнеймов людей для аудитории"
+                text="В сегменте нет подходящих получателей для аудитории"
+                + (
+                    " (люди без никнейма не добавлены: включите «Включая людей без никнейма (по ID)»)"
+                    if skipped["no_username"] and not include_id_only
+                    else ""
+                )
                 + (f" (админов пропущено: {skipped['admins']})" if skipped["admins"] else "")
             )
             return
@@ -1328,12 +1579,20 @@ class ParsingTab(ctk.CTkFrame):
                 return
         ordered = order_audience(members, order)
         admins_note = f"\nСоздатели и админы пропущены: {skipped['admins']}." if skipped["admins"] else ""
+        id_count = sum(1 for item in ordered if is_id_recipient(item.get("username")))
+        id_note = (
+            f"\nИз них без никнейма (по Telegram ID): {id_count}. Они подходят только для приглашений в чат, "
+            "и аккаунт сможет пригласить такого человека, только если Telegram уже «знает» его "
+            "(общий чат, контакт или недавняя переписка)."
+            if id_count
+            else ""
+        )
         extras = (
             "\nУчастники чата будут исключены: аккаунту потребуется прочитать список чата." if exclude else ""
         ) + ("\nУже приглашённые в чат кампании будут пропущены." if skip_invited else "")
         if not messagebox.askyesno(
             "В аудиторию",
-            f"Добавить {len(ordered)} никнеймов в кампанию №{db.campaign_id}?{admins_note}{extras}\nЭто не запускает отправку. Используйте список для общения с людьми, которые ожидают ваше сообщение.",
+            f"Добавить {len(ordered)} получателей в кампанию №{db.campaign_id}?{id_note}{admins_note}{extras}\nЭто не запускает отправку. Используйте список для общения с людьми, которые ожидают ваше сообщение.",
         ):
             return
         targets_tab = self.app.targets_tab
@@ -1394,6 +1653,12 @@ class ParsingTab(ctk.CTkFrame):
                         return
                     stats, found, used_order = result.result()
                     text = f"Кампания №{db.campaign_id}: добавлено {stats['inserted']}, повторов в очереди {stats['duplicates']}"
+                    if stats.get("id_only"):
+                        text += f" (из них по ID без никнейма: {stats['id_only']})"
+                    if stats.get("no_username"):
+                        text += (
+                            f", пропущено без никнейма (в кампании сообщений нужен @никнейм): {stats['no_username']}"
+                        )
                     if stats["skipped_invited"]:
                         text += f", уже приглашены ранее: {stats['skipped_invited']}"
                     if found is not None:

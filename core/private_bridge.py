@@ -21,6 +21,8 @@ COPIED_SETTINGS = (
     "schedule_enabled",
     "schedule_from",
     "schedule_to",
+    "schedule_days",
+    "smart_interval_tz",
     "protection_consecutive",
     "protection_break_min",
     "protection_break_max",

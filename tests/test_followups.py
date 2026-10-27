@@ -154,10 +154,11 @@ class FollowupDatabaseTests(FollowupFixtures):
         self.assertEqual(await self.db.delivery_exists("alice"), "sent")
         self.assertEqual(await other.get_followup_stats(), {})
 
-    async def test_restart_cancels_waiting_and_marks_sending_uncertain(self):
+    async def test_restart_keeps_waiting_and_ready_and_marks_sending_uncertain(self):
         account, _ = await self.seed()
         second_account = await self.add_account(2)
         second, _ = await self.seed("bobby", account=second_account, user_id=456)
+        third, _ = await self.seed("carol", account=second_account, user_id=789)
         await self.db.set_setting("task_status", "running")
         self.assertTrue(await self.db.receive_followup_reply(account["id"], 123, 11))
         self.assertTrue(await self.db.receive_followup_reply(second["id"], 456, 11))
@@ -165,9 +166,40 @@ class FollowupDatabaseTests(FollowupFixtures):
         await init_db()
         await init_db()
         states = await self.db.get_followup_stats()
-        self.assertEqual(states["cancelled"], 1)
-        self.assertEqual(states["uncertain"], 1)
-        self.assertFalse(await self.db.receive_followup_reply(account["id"], 123, 12))
+        self.assertEqual(states, {"ready": 1, "uncertain": 1, "waiting": 1})
+        self.assertFalse(any(row["action"] == "FOLLOWUP_CANCELLED" for row in await self.db.get_logs()))
+        # The startup reset marks the campaign stopped, so a reply is accepted only once it runs again.
+        self.assertFalse(await self.db.receive_followup_reply(third["id"], 789, 12))
+        await self.db.set_setting("task_status", "running")
+        self.assertTrue(await self.db.receive_followup_reply(third["id"], 789, 12))
+
+    async def test_first_name_is_stored_on_reserve_and_finish_and_survives_restart(self):
+        self.db = self.db.for_campaign(await self.db.create_campaign("Names", "messages"))
+        account = await self.add_account()
+        await self.db.bulk_insert_targets(["alice", "bobby", "carol"])
+        names = {}
+        for _username, user_id, reserve_name, finish_name in [
+            ("alice", 1, "  Анна\n", None),
+            ("bobby", 2, None, "Борис"),
+            ("carol", 3, None, None),
+        ]:
+            target = await self.db.claim_next_pending_target()
+            await self.db.reserve_delivery(
+                target["id"], account["id"], user_id, followup_text="Hi", access_hash=5, first_name=reserve_name
+            )
+            await self.db.finish_delivery(target["id"], "sent", 10 + user_id, first_name=finish_name)
+        await init_db()
+        names = {row["username"]: row["first_name"] for row in await self.db.get_followups()}
+        self.assertEqual(names, {"alice": "Анна", "bobby": "Борис", "carol": None})
+
+    async def test_legacy_followup_table_gains_first_name_column(self):
+        await self.seed()
+        async with _connect() as connection:
+            await connection.execute("ALTER TABLE message_followups DROP COLUMN first_name")
+            await connection.commit()
+        await init_db()
+        await init_db()
+        self.assertIn("first_name", (await self.db.get_followups())[0])
 
     async def test_cancel_does_not_remove_first_or_other_campaign(self):
         await self.seed()
@@ -363,6 +395,77 @@ class FollowupEngineTests(FollowupFixtures):
         await asyncio.wait_for(task, 5)
         self.manager.send_direct_message.assert_not_awaited()
         self.assertTrue(await self.has_state("cancelled"))
+
+    async def test_waiting_survives_restart_and_engine_continues_waiting(self):
+        account = await self.configure(seed=True)
+        await init_db()  # simulated app restart: nothing waiting is cancelled
+        self.assertEqual(await self.db.get_followup_stats(), {"waiting": 1})
+        task = await self.run_engine(account)
+
+        async def attached():
+            return bool(self.handlers)
+
+        await self.wait_for(attached)
+        self.assertFalse(task.done())
+        self.assertTrue(await self.has_state("waiting"))
+        await self.emit()
+        await asyncio.wait_for(task, 5)
+        self.manager.send_direct_message.assert_awaited_once()
+        self.assertTrue(await self.has_state("sent"))
+
+    async def test_ready_survives_restart_and_is_delivered_after_start(self):
+        account = await self.configure(seed=True)
+        await self.db.set_setting("task_status", "running")
+        await self.db.receive_followup_reply(account["id"], 123, 11)
+        await init_db()
+        self.assertEqual(await self.db.get_followup_stats(), {"ready": 1})
+        task = await self.run_engine(account)
+        await asyncio.wait_for(task, 5)
+        self.manager.send_direct_message.assert_awaited_once()
+        self.assertTrue(await self.has_state("sent"))
+
+    async def test_app_shutdown_keeps_waiting_but_user_stop_cancels(self):
+        account = await self.configure()
+        task = await self.run_engine(account)
+        await self.wait_first()
+        self.engine.shutdown()
+        await asyncio.wait_for(task, 5)
+        self.assertEqual(await self.db.get_followup_stats(), {"waiting": 1})
+        self.assertEqual((await self.db.get_setting("task_status", "")), "stopped")
+        # Next launch: the same row is still there and an explicit stop then cancels it.
+        self.manager.send_direct_message.reset_mock()
+        self.engine = MessageEngine(self.db, lambda *args: None)
+        task = await self.run_engine(account)
+
+        async def attached():
+            return bool(self.handlers)
+
+        await self.wait_for(attached)
+        self.engine.stop()
+        await asyncio.wait_for(task, 5)
+        self.assertEqual(await self.db.get_followup_stats(), {"cancelled": 1})
+
+    async def test_followup_renders_stored_first_name(self):
+        account = await self.configure()
+        self.manager.resolve_recipient.return_value = User(id=123, access_hash=456, first_name="Мария")
+        await self.db.save_campaign_settings({"followup_text": "{Привет|Здравствуйте}, {имя}!"})
+        # peer returned for the second send has no name; the stored one must be used.
+        task = await self.run_engine(account)
+        await self.wait_first()
+        self.assertEqual((await self.db.get_followups())[0]["first_name"], "Мария")
+        await self.emit()
+        await asyncio.wait_for(task, 5)
+        text = self.manager.send_direct_message.await_args.args[1]
+        self.assertIn(text, {"Привет, Мария!", "Здравствуйте, Мария!"})
+
+    async def test_followup_without_stored_name_falls_back(self):
+        account = await self.configure()
+        await self.db.save_campaign_settings({"followup_text": "Привет, {имя}"})
+        task = await self.run_engine(account)
+        await self.wait_first()
+        await self.emit()
+        await asyncio.wait_for(task, 5)
+        self.assertEqual(self.manager.send_direct_message.await_args.args[1], "Привет, друг")
 
     async def test_known_block_prevents_second_rpc(self):
         account = await self.configure()
@@ -655,6 +758,46 @@ class FollowupReliabilityTests(FollowupFixtures):
         await ReplyFollowups(engine).tick()
         self.assertEqual((await self.db.get_account(first["id"]))["status"], "flood")
         ready.send_direct_message.assert_awaited_once()
+        engine.stop.assert_not_called()
+
+    async def test_poll_checks_a_bounded_batch_per_account_and_rotates(self):
+        account, _ = await self.seed("user0", user_id=100)
+        names = [f"user{i}" for i in range(1, 9)]
+        for index, name in enumerate(names, start=1):
+            await self.seed(name, account, user_id=100 + index)
+        engine, manager = await self.tick_engine(account)
+        followups = ReplyFollowups(engine)
+        with patch("core.followups.POLL_ROW_DELAY_SECONDS", 0), patch("core.followups.POLL_PER_ACCOUNT", 5):
+            await followups.tick()
+            self.assertEqual(manager.followup_history.await_count, 5)
+            first = {call.args[0]["username"] for call in manager.followup_history.await_args_list}
+            followups.next_poll = followups.next_tick = 0
+            await followups.tick()
+        # 9 waiting rows: the second batch goes to the rows not yet checked first.
+        self.assertEqual(manager.followup_history.await_count, 10)
+        second = [call.args[0]["username"] for call in manager.followup_history.await_args_list[5:]]
+        self.assertEqual(len(first), 5)
+        self.assertEqual(len(set(second) - first), 4)
+
+    async def test_poll_flood_stops_that_account_batch_only(self):
+        first, _ = await self.seed("alice", user_id=123)
+        await self.seed("bobby", first, user_id=456)
+        second = await self.add_account(2)
+        await self.seed("carol", second, user_id=789)
+        engine, flooded = await self.tick_engine(
+            first, followup_history=AsyncMock(side_effect=FloodWaitError(request=None, capture=90))
+        )
+        other = SimpleNamespace(
+            followup_history=AsyncMock(return_value={"last_id": 10, "reply_id": None}),
+            followup_peer=AsyncMock(),
+            send_direct_message=AsyncMock(),
+        )
+        engine.account_managers[second["id"]] = other
+        with patch("core.followups.POLL_ROW_DELAY_SECONDS", 0):
+            await ReplyFollowups(engine).tick()
+        flooded.followup_history.assert_awaited_once()  # no second request after the flood
+        other.followup_history.assert_awaited_once()
+        self.assertEqual((await self.db.get_account(first["id"]))["status"], "flood")
         engine.stop.assert_not_called()
 
     async def test_waiting_expires_after_ttl_with_reason(self):

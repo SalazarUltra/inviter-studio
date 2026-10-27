@@ -49,15 +49,75 @@ def normalize_username(value: str) -> str:
     return value
 
 
+# Recipients known only by Telegram id are stored under the key «id:<number>» in the username column
+# (a real username can never start with a digit or contain «:», so the forms cannot collide).
+ID_PREFIX = "id:"
+MAX_USER_ID = 2**52
+
+
+def parse_user_id(value) -> int | None:
+    """Telegram user id from «123456», «id:123456» or «ID 123456»; None when the text is not an id."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value if 0 < value <= MAX_USER_ID else None
+    text = str(value or "").strip().lstrip("\ufeff")
+    lowered = text.lower()
+    if lowered.startswith("id:"):
+        text = text[3:].strip()
+    elif lowered.startswith("id "):
+        text = text[3:].strip()
+    if not text.isascii() or not text.isdigit():
+        return None
+    number = int(text)
+    return number if 0 < number <= MAX_USER_ID else None
+
+
+def id_recipient(user_id: int) -> str:
+    return f"{ID_PREFIX}{int(user_id)}"
+
+
+def is_id_recipient(value) -> bool:
+    return str(value or "").startswith(ID_PREFIX)
+
+
+def recipient_user_id(value) -> int | None:
+    """User id carried by a stored «id:<number>» recipient key (None for ordinary usernames)."""
+    return parse_user_id(value) if is_id_recipient(value) else None
+
+
+def recipient_label(value) -> str:
+    """Human label for logs and tables: «@name» or «ID 123456»."""
+    number = recipient_user_id(value)
+    return f"ID {number}" if number is not None else f"@{value}"
+
+
+def recipient_line(value) -> str:
+    """Text form for editors/exports that parses back to the same recipient: «@name» or «id:123»."""
+    return str(value) if is_id_recipient(value) else f"@{value}"
+
+
+def normalize_recipient(value) -> str:
+    """Username, t.me link, bare numeric Telegram id or «id:123» -> stored recipient key."""
+    text = str(value if value is not None else "").strip().lstrip("\ufeff")
+    number = parse_user_id(text)
+    if number is not None:
+        return id_recipient(number)
+    if text.lower().startswith("id:"):
+        raise ValueError("ID пользователя: положительное число, например id:123456789")
+    return normalize_username(text)
+
+
 def parse_usernames(text: str) -> list[str]:
-    """Validate the whole list before mutating a campaign; preserve first occurrence order."""
+    """Validate the whole list before mutating a campaign; preserve first occurrence order.
+
+    Lines may be @usernames, t.me links, bare Telegram ids (123456789) or «id:123456789».
+    """
     usernames = {}
     for line_number, line in enumerate(text.lstrip("\ufeff").splitlines(), 1):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         try:
-            usernames[normalize_username(line)] = None
+            usernames[normalize_recipient(line)] = None
         except ValueError as exc:
             raise ValueError(f"Строка {line_number}: {exc}") from exc
     return list(usernames)

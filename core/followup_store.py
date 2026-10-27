@@ -47,7 +47,14 @@ async def note(db, row, action, text):
 
 class FollowupStore:
     async def get_followups(
-        self, states=("waiting", "ready"), account_ids=None, *, limit=None, per_account=False, due_at=None
+        self,
+        states=("waiting", "ready"),
+        account_ids=None,
+        *,
+        limit=None,
+        per_account=False,
+        due_at=None,
+        per_account_limit=1,
     ):
         if not states or account_ids is not None and not account_ids:
             return []
@@ -67,7 +74,9 @@ class FollowupStore:
             sql += " AND account_id IN (" + ",".join("?" for _ in account_ids) + ")"
             params.extend(account_ids)
         if per_account:
-            sql = "SELECT * FROM (" + sql + ") WHERE queue_rank=1"
+            # The window is evaluated before the LIMIT, so each account contributes its oldest-checked rows.
+            sql = "SELECT * FROM (" + sql + ") WHERE queue_rank<=?"
+            params.append(max(1, int(per_account_limit)))
         sql += " ORDER BY COALESCE(checked_at,''),username"
         if limit is not None:
             sql += " LIMIT ?"

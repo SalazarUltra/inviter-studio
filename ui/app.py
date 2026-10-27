@@ -524,7 +524,9 @@ class App(ctk.CTk):
         ):
             tab.db = self.db
         self.targets_tab.page = 0
-        self.targets_tab.editor_status.configure(text="Никнеймы по одному на строку · Ctrl+V")
+        self.targets_tab.editor_status.configure(
+            text="Никнеймы или Telegram ID (123456789, id:123456789) по одному на строку · Ctrl+V"
+        )
         self.targets_tab.refresh_table()
         self.targets_tab.refresh_stats()
         self.task_tab.load_campaign_settings()
@@ -840,7 +842,8 @@ class App(ctk.CTk):
             await self.task_tab.save_drafts(drafts)
         await self.db.set_setting("last_campaign_id", str(self.db.campaign_id))
         self.ui_dispatcher.closed = True
-        self.scheduler.engine.stop()
+        # Closing the app keeps waiting second messages (MessageEngine.shutdown); other engines just stop.
+        getattr(self.scheduler.engine, "shutdown", self.scheduler.engine.stop)()
         self.parsing_tab.stop()
         if self.warmup_tab.warmup_engine:
             self.warmup_tab.warmup_engine.stop()

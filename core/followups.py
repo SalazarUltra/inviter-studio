@@ -6,6 +6,9 @@ Delivery rules for a second message:
   restart does not shorten it);
 * it keeps at least ``engine.interval_min`` seconds after the last message sent;
 * waiting rows older than ``followup_wait_hours`` expire ("Истекло ожидание ответа");
+* waiting/ready rows survive an app restart (the app must be open to deliver; the
+  database never cancels them on startup) and resume when the campaign is started;
+* the recipient's first name is stored with the row so ``{имя}`` renders in the follow-up;
 * Telegram limits (flood / peer flood / revoked login) pause only the affected
   account. They never stop the whole campaign.
 """
@@ -32,6 +35,12 @@ from core.message_template import render_message
 from core.user_feedback import explain_error
 
 EXPIRE_CHECK_SECONDS = 30
+# Reply polling: a small batch of the longest-unchecked waiting rows per tick, at most
+# POLL_PER_ACCOUNT for each connected account, spaced out to stay flood-safe.
+POLL_INTERVAL_SECONDS = 5
+POLL_MAX_PER_TICK = 10
+POLL_PER_ACCOUNT = 5
+POLL_ROW_DELAY_SECONDS = 0.4
 RESTRICTED_STATUSES = {"restricted", "inactive", "unauthorized"}
 
 
@@ -125,31 +134,53 @@ class ReplyFollowups:
         return True
 
     async def _poll_waiting(self, now, account_ids):
-        waiting = await self.db.get_followups(states=("waiting",), account_ids=account_ids, limit=1)
         # A ready delivery can be deferred by its account's quota. Keep checking
         # other recipients for replies received while the app was closed.
-        if not waiting or now < self.next_poll:
+        if now < self.next_poll:
             return
-        self.next_poll = now + 5
-        row = waiting[0]
-        await self.db.followup_checked(row["username"], row["checked_id"])
-        account = await self.db.get_account(row["account_id"])
-        if not await self._account_usable(account):
+        # Oldest-checked rows first, a few per connected account, so every account's
+        # queue advances without a burst of history requests.
+        waiting = await self.db.get_followups(
+            states=("waiting",),
+            account_ids=account_ids,
+            limit=POLL_MAX_PER_TICK,
+            per_account=True,
+            per_account_limit=POLL_PER_ACCOUNT,
+        )
+        if not waiting:
             return
-        try:
-            result = await self.engine.account_managers[row["account_id"]].followup_history(row)
-            if result["reply_id"]:
-                await self.db.receive_followup_reply(row["account_id"], row["user_id"], result["reply_id"])
+        self.next_poll = now + POLL_INTERVAL_SECONDS
+        accounts, restricted = {}, set()
+        for index, row in enumerate(waiting):
+            if not self.engine.running or self.engine.paused or self.closed:
+                return
+            account_id = row["account_id"]
+            await self.db.followup_checked(row["username"], row["checked_id"])
+            if account_id in restricted:
+                continue
+            if account_id not in accounts:
+                accounts[account_id] = await self.db.get_account(account_id)
+            if not await self._account_usable(accounts[account_id]):
+                restricted.add(account_id)
+                continue
+            if index:
+                await asyncio.sleep(POLL_ROW_DELAY_SECONDS)
+            try:
+                result = await self.engine.account_managers[account_id].followup_history(row)
+                if result["reply_id"]:
+                    await self.db.receive_followup_reply(account_id, row["user_id"], result["reply_id"])
+                    await self.engine._progress()
+                await self.db.followup_checked(row["username"], result["last_id"])
+            except (UserIsBlockedError, UserPrivacyRestrictedError, YouBlockedUserError, ChatWriteForbiddenError):
+                await self.db.block_followup(row["username"])
                 await self.engine._progress()
-            await self.db.followup_checked(row["username"], result["last_id"])
-        except (UserIsBlockedError, UserPrivacyRestrictedError, YouBlockedUserError, ChatWriteForbiddenError):
-            await self.db.block_followup(row["username"])
-            await self.engine._progress()
-        except (FloodWaitError, PeerFloodError, AuthKeyUnregisteredError) as exc:
-            await self.restriction(row["account_id"], exc)
-        except Exception as exc:
-            # Keep waiting on transient history failures; never invent a reply.
-            self.engine.log_callback("WARN", f"Не удалось проверить ответ @{row['username']}: {explain_error(exc)}")
+            except (FloodWaitError, PeerFloodError, AuthKeyUnregisteredError) as exc:
+                # Only this account stops polling for the tick; the others and the campaign continue.
+                restricted.add(account_id)
+                await self.restriction(account_id, exc)
+            except Exception as exc:
+                # Keep waiting on transient history failures; never invent a reply.
+                self.engine.log_callback("WARN", f"Не удалось проверить ответ @{row['username']}: {explain_error(exc)}")
 
     async def _gap_elapsed(self):
         """Keep the campaign's minimum interval since the most recent message sent."""
@@ -209,8 +240,8 @@ class ReplyFollowups:
                 if not self.engine.running or self.engine.paused:
                     await self.db.finish_followup(row["username"], "ready")
                     return
-                # Names are not stored for follow-ups, so {имя} falls back to «друг»; {a|b} still varies.
-                text = render_message(claimed["text"], getattr(peer, "first_name", None))
+                # {имя} uses the first name stored at the first delivery («друг» when unknown).
+                text = render_message(claimed["text"], claimed.get("first_name") or getattr(peer, "first_name", None))
                 if not text.strip() or len(text.encode("utf-16-le")) // 2 > 4096:
                     text = claimed["text"]
                 result = await manager.send_direct_message(peer, text, claimed["random_id"])

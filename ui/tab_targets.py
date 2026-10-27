@@ -7,10 +7,11 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
+from core.audience_import import load_audience_file
 from core.database import Database
 from core.export import write_targets_csv, write_targets_xlsx
 from core.user_feedback import explain_error
-from core.validation import parse_usernames
+from core.validation import parse_usernames, recipient_label
 from ui.campaigns import CampaignBar
 from ui.components import empty_state, page_intro
 from ui.dispatch import post_ui
@@ -151,7 +152,7 @@ class TargetsTab(ctk.CTkFrame):
         )
         self.editor_status = ctk.CTkLabel(
             editor_row,
-            text="Никнеймы по одному на строку · Ctrl+V",
+            text="Никнеймы или Telegram ID (123456789, id:123456789) по одному на строку · Ctrl+V",
             anchor="w",
             font=FONTS["small"],
             text_color=COLORS["muted"],
@@ -172,7 +173,7 @@ class TargetsTab(ctk.CTkFrame):
 
         btn_load = ctk.CTkButton(
             top,
-            text="Импорт TXT",
+            text="Импорт TXT/CSV",
             command=self.load_txt,
             corner_radius=12,
             height=36,
@@ -233,7 +234,10 @@ class TargetsTab(ctk.CTkFrame):
         for button, text in (
             (
                 btn_load,
-                "Добавить получателей из UTF-8 TXT к существующей очереди. По одному никнейму на строку; повторы не добавляются.",
+                "Добавить получателей из UTF-8 TXT или CSV к существующей очереди. Строка: @никнейм, ссылка t.me, "
+                "числовой Telegram ID (123456789) или id:123456789. В CSV читаются столбцы user_id и username "
+                "(как в экспорте парсинга). Повторы не добавляются. Получатель только с ID приглашается лишь если "
+                "аккаунт «знает» этого человека (общая группа или контакт).",
             ),
             (btn_shuffle, "Изменить порядок только ожидающих получателей. Результаты обработанных людей сохраняются."),
             (
@@ -432,7 +436,7 @@ class TargetsTab(ctk.CTkFrame):
             row.pack(fill="x", pady=density["row_pad_y"])
             row.grid_columnconfigure(4, weight=1)
             status_text, status_color = STATUS_LABELS.get(item["status"], (item["status"], COLORS["muted"]))
-            ctk.CTkLabel(row, text=f"@{item['username']}", width=160, wraplength=160, anchor="w").grid(
+            ctk.CTkLabel(row, text=recipient_label(item["username"]), width=160, wraplength=160, anchor="w").grid(
                 row=0, column=0, padx=6, pady=density["row_pad_y"], sticky="w"
             )
             ctk.CTkLabel(
@@ -574,21 +578,23 @@ class TargetsTab(ctk.CTkFrame):
     def load_txt(self) -> None:
         if not self._ensure_task_stopped("импортировать получателей"):
             return
-        path = filedialog.askopenfilename(title="Выберите txt", filetypes=[("Text files", "*.txt")])
+        path = filedialog.askopenfilename(
+            title="Выберите TXT или CSV", filetypes=[("TXT и CSV", "*.txt *.csv"), ("Text files", "*.txt")]
+        )
         if not path:
             return
         try:
-            usernames = parse_txt(path)
+            items = load_audience_file(path)
         except (OSError, UnicodeError, ValueError) as exc:
             messagebox.showerror("Ошибка импорта", explain_error(exc))
             return
-        if not usernames:
-            messagebox.showwarning("Пусто", "В файле не найдено юзернеймов.")
+        if not items:
+            messagebox.showwarning("Пусто", "В файле не найдено юзернеймов или Telegram ID.")
             return
 
         self.begin_audience_import()
         try:
-            fut = self.run_coro(self.db.bulk_insert_targets(usernames))
+            fut = self.run_coro(self.db.import_audience(items))
         except Exception:
             self.finish_audience_import()
             raise
@@ -596,13 +602,18 @@ class TargetsTab(ctk.CTkFrame):
         def done(f):
             def render():
                 try:
-                    inserted = f.result()
+                    stats = f.result()
                 except Exception as exc:  # noqa: BLE001
                     messagebox.showerror("Ошибка", explain_error(exc))
                 else:
                     self.refresh_stats()
                     self.refresh_table()
-                    self.log_callback("INFO", f"Импортировано {inserted} записей из TXT")
+                    text = f"Импортировано {stats['inserted']} записей из файла"
+                    if stats.get("id_only"):
+                        text += f" (по Telegram ID без никнейма: {stats['id_only']})"
+                    if stats.get("no_username"):
+                        text += f"; для личных сообщений нужен @username, пропущено: {stats['no_username']}"
+                    self.log_callback("INFO", text)
                 finally:
                     self.finish_audience_import()
 

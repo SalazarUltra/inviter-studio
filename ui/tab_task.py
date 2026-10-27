@@ -11,7 +11,34 @@ from core.diagnostics import estimate_messages_eta, format_report, message_usage
 from core.inviter import describe_next_available
 from core.message_template import SAMPLE_NAME, has_placeholders, preview_message
 from core.messenger import send_test_message
+from core.pacing import (
+    PACE_KEYS,
+    PACE_LABELS,
+    aggressive_warnings,
+    daily_cap_status,
+    describe_skipped_warmup,
+    detect_preset,
+    format_warning_block,
+    gate_accounts,
+    pace_label,
+    parse_daily_cap,
+    preset_values,
+    split_warmup_ready,
+    warmup_gate_error,
+)
 from core.scheduler import TaskScheduler
+from core.scheduling import (
+    ALL_DAYS,
+    DEFAULT_SCHEDULE_DAYS,
+    SMART_TZ_CHOICES,
+    SMART_TZ_LOCAL,
+    WEEKDAY_SHORT,
+    describe_schedule_days,
+    format_schedule_days,
+    parse_schedule_days,
+    smart_tz_label,
+    validate_smart_tz,
+)
 from core.user_feedback import explain_error
 from core.validation import (
     MESSAGES_DEFAULT_INTERVAL,
@@ -302,7 +329,7 @@ class TaskTab(ctk.CTkFrame):
             f"Интервал: {self.interval_min_entry.get()}–{self.interval_max_entry.get()} секунд",
             "Расписание: "
             + (
-                f"{self.schedule_from_entry.get()}–{self.schedule_to_entry.get()}"
+                f"{self.schedule_from_entry.get()}–{self.schedule_to_entry.get()}, " + self._schedule_days_text()
                 if self.schedule_enabled.get()
                 else "выключено"
             ),
@@ -312,6 +339,26 @@ class TaskTab(ctk.CTkFrame):
             self._account_labels.get(key, str(key)) for key, var in self.account_vars.items() if var.get()
         ]
         lines.insert(3, "Аккаунты: " + (", ".join(selected_names) or "не выбраны"))
+        lines.insert(5, "Темп: " + pace_label(self.current_pace()))
+        try:
+            cap = parse_daily_cap(self.daily_cap_entry.get())
+        except ValueError:
+            cap = 0
+        lines.insert(6, f"Дневной лимит кампании: {cap if cap else 'выключен'}")
+        if self.require_warmup_var.get():
+            chosen = [
+                info
+                for key, info in self._accounts_info.items()
+                if self.account_vars.get(key) and self.account_vars[key].get()
+            ]
+            ready, skipped = split_warmup_ready(chosen)
+            line = f"Только прогретые аккаунты: включено ({len(ready)} из {len(chosen)} подходят)"
+            if skipped:
+                line += "\nБудут пропущены: " + describe_skipped_warmup(skipped)
+            lines.insert(7, line)
+        warning_block = format_warning_block(self._pace_warnings())
+        if warning_block:
+            lines.insert(0, warning_block + "\n")
         if self.operation_mode() == "messages":
             eta = self._eta_line(stats.get("pending", 0))
             if eta:
@@ -588,6 +635,35 @@ class TaskTab(ctk.CTkFrame):
         )
         self.followup_note.pack(anchor="w", padx=16, pady=(0, 10))
         interval_block = self._block("Интервал между действиями")
+        pace_row = ctk.CTkFrame(interval_block, fg_color="transparent")
+        pace_row.pack(fill="x", padx=UI["space_4"], pady=(0, UI["space_2"]))
+        ctk.CTkLabel(pace_row, text="Темп:", font=FONTS["body"]).pack(side="left", padx=(0, 8))
+        self.pace_buttons: dict[str, ctk.CTkButton] = {}
+        for key in PACE_KEYS:
+            button = ctk.CTkButton(
+                pace_row,
+                text=PACE_LABELS[key],
+                width=110,
+                height=30,
+                command=lambda value=key: self.apply_pace_preset(value),
+            )
+            apply_button_role(button, "secondary")
+            button.pack(side="left", padx=(0, 6))
+            self.pace_buttons[key] = button
+        tip(
+            self.pace_buttons["safe"],
+            "Редкие действия и частые перерывы: самый низкий риск ограничений. Заполняет интервал и перерывы.",
+        )
+        tip(self.pace_buttons["normal"], "Рекомендуемый баланс скорости и безопасности. Заполняет интервал и перерывы.")
+        tip(
+            self.pace_buttons["fast"],
+            "Быстрее, но выше риск PeerFlood и ограничений аккаунта. Заполняет интервал и перерывы.",
+        )
+        self.pace_label = ctk.CTkLabel(pace_row, text="Выбрано: Свой", font=FONTS["small"], text_color=COLORS["muted"])
+        self.pace_label.pack(side="left", padx=(6, 0))
+        self.pace_warning = hint(interval_block, "")
+        self.pace_warning.configure(text_color=COLORS["error"])
+        self.pace_warning.pack_forget()
         intervals = ctk.CTkFrame(interval_block, fg_color="transparent")
         intervals.pack(fill="x", padx=UI["space_4"], pady=(0, UI["space_3"]))
         ctk.CTkLabel(intervals, text="Мин. интервал (сек)", font=FONTS["body"]).pack(side="left")
@@ -628,6 +704,25 @@ class TaskTab(ctk.CTkFrame):
             self.interval_max_entry,
             "Верхняя граница паузы. Например, 60 и 60 — примерно одно новое личное сообщение в минуту на всю очередь.",
         )
+        cap_row = ctk.CTkFrame(interval_block, fg_color="transparent")
+        cap_row.pack(fill="x", padx=UI["space_4"], pady=(0, UI["space_2"]))
+        ctk.CTkLabel(cap_row, text="Дневной лимит кампании (0 — выкл.)", font=FONTS["body"]).pack(side="left")
+        self.daily_cap_entry = ctk.CTkEntry(cap_row, width=80, height=36)
+        setup_entry(self.daily_cap_entry)
+        self.daily_cap_entry.insert(0, "0")
+        self.daily_cap_entry.pack(side="left", padx=8)
+        tip(
+            self.daily_cap_entry,
+            "Максимум успешных первых действий за день по всей кампании: добавленных людей или первых сообщений. "
+            "Достигнув лимита, задача ждёт следующего дня. 0 — без лимита.",
+        )
+        hint(
+            interval_block,
+            "Общий лимит кампании на календарный день (по времени ПК) поверх дневных лимитов аккаунтов. "
+            "Вторые сообщения после ответа в него не входят.",
+        )
+        for entry in (self.interval_min_entry, self.interval_max_entry):
+            entry.bind("<KeyRelease>", lambda _event: self._refresh_pace(), add="+")
 
         schedule_block = self._block("Время работы")
         self.schedule_enabled = ctk.BooleanVar(value=False)
@@ -652,7 +747,42 @@ class TaskTab(ctk.CTkFrame):
         setup_entry(self.schedule_to_entry)
         self.schedule_to_entry.insert(0, "21:00")
         self.schedule_to_entry.pack(side="left", padx=(6, 0))
-        hint(schedule_block, "Время этого компьютера. Расписание действует при открытой программе и запущенной задаче.")
+        self.schedule_days_frame = ctk.CTkFrame(schedule_block, fg_color="transparent")
+        self.schedule_day_vars = [ctk.BooleanVar(value=True) for _ in WEEKDAY_SHORT]
+        self.schedule_day_checks = []
+        ctk.CTkLabel(self.schedule_days_frame, text="Дни:", font=FONTS["body"]).pack(side="left", padx=(0, 6))
+        for name, var in zip(WEEKDAY_SHORT, self.schedule_day_vars, strict=True):
+            check = ctk.CTkCheckBox(
+                self.schedule_days_frame,
+                text=name,
+                variable=var,
+                width=52,
+                checkbox_width=20,
+                checkbox_height=20,
+                command=self._schedule_days_changed,
+            )
+            check.pack(side="left", padx=(0, 4))
+            self.schedule_day_checks.append(check)
+        self.schedule_hint = hint(
+            schedule_block,
+            "Время и дни недели — по часам этого компьютера. Вне выбранных дней и часов задача ждёт, как вне "
+            "расписания. Расписание действует при открытой программе и запущенной задаче.",
+        )
+        self.smart_tz_row = ctk.CTkFrame(schedule_block, fg_color="transparent")
+        self.smart_tz_row.pack(fill="x", padx=UI["space_4"], pady=(0, UI["space_2"]))
+        ctk.CTkLabel(self.smart_tz_row, text="Умный интервал считать по:", font=FONTS["body"]).pack(
+            side="left", padx=(0, 8)
+        )
+        self.smart_tz_menu = ctk.CTkOptionMenu(
+            self.smart_tz_row, values=list(SMART_TZ_CHOICES), width=220, command=lambda _: self.update_readiness()
+        )
+        self.smart_tz_menu.set(smart_tz_label(SMART_TZ_LOCAL))
+        self.smart_tz_menu.pack(side="left")
+        self.smart_tz_hint = hint(
+            schedule_block,
+            "Умный интервал (только приглашения) удлиняет паузы ночью и поздним вечером. Час берётся по выбранным "
+            "часам: «Время этого компьютера» (по умолчанию) или Москва. Базовые интервалы выше не меняются.",
+        )
 
     def _build_protection_accounts(self) -> None:
         protection_block = self._block("Перерывы и ротация")
@@ -677,6 +807,8 @@ class TaskTab(ctk.CTkFrame):
         setup_entry(self.break_max_entry)
         self.break_max_entry.insert(0, "15")
         self.break_max_entry.pack(side="left", padx=6)
+        for entry in (self.consecutive_entry, self.break_min_entry, self.break_max_entry):
+            entry.bind("<KeyRelease>", lambda _event: self._refresh_pace(), add="+")
         hint(
             protection_block, "Перерыв для аккаунта после указанного числа успешных действий. Длительность — в минутах."
         )
@@ -712,6 +844,19 @@ class TaskTab(ctk.CTkFrame):
         self.select_none_button.pack(side="left")
         for button in (self.select_all_button, self.select_none_button):
             apply_button_role(button, "secondary")
+        self.require_warmup_var = ctk.BooleanVar(value=False)
+        self.require_warmup_check = ctk.CTkCheckBox(
+            accounts_block,
+            text="Запускать только с прогретыми аккаунтами",
+            variable=self.require_warmup_var,
+            command=self.update_readiness,
+        )
+        self.require_warmup_check.pack(anchor="w", padx=16, pady=(0, 8))
+        tip(
+            self.require_warmup_check,
+            "Аккаунты, у которых прогрев не завершён (статус не «Готов»), при запуске пропускаются. "
+            "Если прогретых нет — запуск остановится с пояснением.",
+        )
         self.accounts_box = ctk.CTkFrame(accounts_block, fg_color=COLORS["surface"])
         self.accounts_box.pack(fill="x", padx=UI["space_4"], pady=(0, UI["space_3"]))
         hint(
@@ -729,13 +874,18 @@ class TaskTab(ctk.CTkFrame):
         db = self.db
 
         async def counters():
-            return await db.get_targets_stats(), await db.get_followup_stats()
+            try:
+                cap = parse_daily_cap(await db.get_setting("campaign_daily_cap", "0"))
+            except ValueError:
+                cap = 0
+            today = await db.get_campaign_daily_count() if cap else 0
+            return await db.get_targets_stats(), await db.get_followup_stats(), (cap, today)
 
         future = self.run_coro(counters())
 
         def done(f):
             try:
-                stats, followups = f.result()
+                stats, followups, (cap, today) = f.result()
 
                 def render():
                     if self.db is not db:
@@ -757,9 +907,10 @@ class TaskTab(ctk.CTkFrame):
                     self.progress_top.configure(
                         text=f"Успешно: {stats['added'] + stats.get('sent', 0)} из {stats['total']}"
                     )
+                    cap_text = f" | Лимит дня: {today}/{cap}" if cap else ""
                     self.progress_bottom.configure(
                         text=f"Пропущено: {stats.get('skipped', 0)} | Ошибок: {stats['errors']} | "
-                        f"Осталось: {stats['pending']}"
+                        f"Осталось: {stats['pending']}{cap_text}"
                     )
 
                 self._safe_after(render)
@@ -822,10 +973,52 @@ class TaskTab(ctk.CTkFrame):
         post_ui(self, callback)
 
     def on_schedule_toggle(self) -> None:
+        # Repack in reading order: time window, weekdays, hint, then the smart-interval zone.
+        for widget in (
+            self.schedule_time_frame,
+            self.schedule_days_frame,
+            self.schedule_hint,
+            self.smart_tz_row,
+            self.smart_tz_hint,
+        ):
+            widget.pack_forget()
         if self.schedule_enabled.get():
-            self.schedule_time_frame.pack(fill="x", pady=(0, 8))
-        else:
-            self.schedule_time_frame.pack_forget()
+            self.schedule_time_frame.pack(fill="x", padx=UI["space_4"], pady=(0, UI["space_2"]))
+            self.schedule_days_frame.pack(fill="x", padx=UI["space_4"], pady=(0, UI["space_3"]))
+        self.schedule_hint.pack(fill="x", padx=16, pady=(0, 10))
+        self.smart_tz_row.pack(fill="x", padx=UI["space_4"], pady=(0, UI["space_2"]))
+        self.smart_tz_hint.pack(fill="x", padx=16, pady=(0, 10))
+
+    def _schedule_days_value(self) -> str:
+        """Weekdays to store; «no day ticked» is an error only while the schedule is switched on."""
+        try:
+            return self.selected_schedule_days()
+        except ValueError:
+            if self.schedule_enabled.get():
+                raise
+            return DEFAULT_SCHEDULE_DAYS
+
+    def _schedule_days_text(self) -> str:
+        try:
+            return describe_schedule_days(self.selected_schedule_days())
+        except ValueError:
+            return "дни не выбраны"
+
+    def _schedule_days_changed(self) -> None:
+        if not self._loading_campaign:
+            self.update_readiness()
+
+    def selected_schedule_days(self) -> str:
+        """Canonical «0,1,4» value of the weekday checkboxes (every day when all are ticked)."""
+        return format_schedule_days({index for index, var in enumerate(self.schedule_day_vars) if var.get()})
+
+    def set_schedule_days(self, value) -> None:
+        try:
+            days = parse_schedule_days(value)
+        except ValueError:
+            days = ALL_DAYS
+        for index, var in enumerate(self.schedule_day_vars):
+            var.set(index in days)
 
     def refresh_chats(self) -> None:
         fut = self.run_coro(self.db.get_chats())
@@ -954,6 +1147,9 @@ class TaskTab(ctk.CTkFrame):
         ]
         if per_account:
             line = (line + "\n" if line else "") + "Добавлено по аккаунтам: " + ", ".join(per_account)
+        cap_line = daily_cap_status(details.get("daily_done", 0), details.get("daily_cap", 0), "invite")
+        if cap_line:
+            line = (line + "\n" if line else "") + cap_line
         if not line:
             self._hide_details()
             return
@@ -986,11 +1182,16 @@ class TaskTab(ctk.CTkFrame):
             self.schedule_switch,
             self.schedule_from_entry,
             self.schedule_to_entry,
+            self.smart_tz_menu,
+            *self.schedule_day_checks,
             self.advanced_switch,
             self.consecutive_entry,
             self.break_min_entry,
             self.break_max_entry,
             self.order_menu,
+            self.daily_cap_entry,
+            self.require_warmup_check,
+            *self.pace_buttons.values(),
             *getattr(self, "_task_action_buttons", []),
             *getattr(self, "account_checkboxes", []),
         ):
@@ -1082,7 +1283,66 @@ class TaskTab(ctk.CTkFrame):
             )
             self.message_frame.pack_forget()
             self.chat_controls.pack(fill="x")
+        self._refresh_pace()
         self.refresh_accounts()
+
+    def _pace_fields(self) -> dict[str, str]:
+        return {
+            "interval_min": self.interval_min_entry.get(),
+            "interval_max": self.interval_max_entry.get(),
+            "protection_consecutive": self.consecutive_entry.get(),
+            "protection_break_min": self.break_min_entry.get(),
+            "protection_break_max": self.break_max_entry.get(),
+        }
+
+    def current_pace(self) -> str:
+        """Preset key matching the entered numbers, or «custom»."""
+        return detect_preset(self.operation_mode(), self._pace_fields())
+
+    def _pace_warnings(self) -> list[str]:
+        try:
+            low = int(self.interval_min_entry.get().strip())
+            consecutive = int(self.consecutive_entry.get().strip())
+        except ValueError:
+            return []
+        return aggressive_warnings(self.operation_mode(), low, consecutive)
+
+    def _refresh_pace(self) -> None:
+        """Highlight the active preset («Свой» when the numbers match none) and flag risky values."""
+        if not hasattr(self, "pace_label"):
+            return
+        active = self.current_pace()
+        for key, button in self.pace_buttons.items():
+            if key == active:
+                button.configure(fg_color=COLORS["accent_soft"], text_color=COLORS["accent"])
+            else:
+                apply_button_role(button, "secondary")
+        self.pace_label.configure(text=f"Выбрано: {pace_label(active)}")
+        warnings = self._pace_warnings()
+        if warnings:
+            self.pace_warning.configure(text="Внимание: " + " ".join(warnings))
+            if not self.pace_warning.winfo_manager():
+                self.pace_warning.pack(fill="x", padx=16, pady=(0, 10), after=self.pace_label.master)
+        elif self.pace_warning.winfo_manager():
+            self.pace_warning.pack_forget()
+        if not self._loading_campaign:
+            self.update_readiness()
+
+    def apply_pace_preset(self, key: str) -> None:
+        if self.scheduler.is_running() or self._starting:
+            return
+        values = preset_values(self.operation_mode(), key)
+        for field, entry in (
+            ("interval_min", self.interval_min_entry),
+            ("interval_max", self.interval_max_entry),
+            ("protection_consecutive", self.consecutive_entry),
+            ("protection_break_min", self.break_min_entry),
+            ("protection_break_max", self.break_max_entry),
+        ):
+            entry.delete(0, "end")
+            entry.insert(0, values[field])
+        self._refresh_pace()
+        self.set_status(f"Темп «{PACE_LABELS[key]}» применён. Нажмите «Сохранить настройки», чтобы запомнить его.")
 
     def _soften_message_interval(self) -> None:
         """Switching to direct messages with an invite-style fast pace: offer the safe default."""
@@ -1103,6 +1363,7 @@ class TaskTab(ctk.CTkFrame):
             f"Для личных сообщений интервал изменён на {MESSAGES_DEFAULT_INTERVAL[0]}–"
             f"{MESSAGES_DEFAULT_INTERVAL[1]} сек (минимум {MESSAGES_MIN_INTERVAL})."
         )
+        self._refresh_pace()
 
     def show_message_preview(self) -> None:
         text = self.message_box.get("1.0", "end-1c")
@@ -1197,10 +1458,14 @@ class TaskTab(ctk.CTkFrame):
             "schedule_enabled": "1" if self.schedule_enabled.get() else "0",
             "schedule_from": self.schedule_from_entry.get().strip() or "13:00",
             "schedule_to": self.schedule_to_entry.get().strip() or "21:00",
+            "schedule_days": self._schedule_days_value(),
+            "smart_interval_tz": validate_smart_tz(SMART_TZ_CHOICES.get(self.smart_tz_menu.get(), SMART_TZ_LOCAL)),
             "protection_consecutive": self.consecutive_entry.get().strip() or "5",
             "protection_break_min": self.break_min_entry.get().strip() or "5",
             "protection_break_max": self.break_max_entry.get().strip() or "15",
             "invite_order": INVITE_ORDER_CHOICES.get(self.order_menu.get(), "shuffle"),
+            "campaign_daily_cap": str(parse_daily_cap(self.daily_cap_entry.get())),
+            "require_warmup_ready": "1" if self.require_warmup_var.get() else "0",
         }
         if settings["schedule_enabled"] == "1":
             time_minutes(settings["schedule_from"])
@@ -1235,10 +1500,14 @@ class TaskTab(ctk.CTkFrame):
             "schedule_enabled": "0",
             "schedule_from": "13:00",
             "schedule_to": "21:00",
+            "schedule_days": DEFAULT_SCHEDULE_DAYS,
+            "smart_interval_tz": SMART_TZ_LOCAL,
             "protection_consecutive": "5",
             "protection_break_min": "5",
             "protection_break_max": "15",
             "invite_order": "shuffle",
+            "campaign_daily_cap": "0",
+            "require_warmup_ready": "0",
         }
 
         async def load():
@@ -1291,9 +1560,12 @@ class TaskTab(ctk.CTkFrame):
                     ("protection_consecutive", self.consecutive_entry),
                     ("protection_break_min", self.break_min_entry),
                     ("protection_break_max", self.break_max_entry),
+                    ("campaign_daily_cap", self.daily_cap_entry),
                 ):
                     entry.delete(0, "end")
                     entry.insert(0, values[key])
+                self.require_warmup_var.set(values["require_warmup_ready"] == "1")
+                self._refresh_pace()
                 self.order_menu.set(
                     next(
                         (title for title, key in INVITE_ORDER_CHOICES.items() if key == values["invite_order"]),
@@ -1305,6 +1577,8 @@ class TaskTab(ctk.CTkFrame):
                 for key, var in self.account_vars.items():
                     var.set(key in selected if selected else True)
                 self.schedule_enabled.set(values["schedule_enabled"] == "1")
+                self.set_schedule_days(values["schedule_days"])
+                self.smart_tz_menu.set(smart_tz_label(values["smart_interval_tz"]))
                 self.on_schedule_toggle()
                 if self.schedule_enabled.get():
                     self.advanced_var.set(True)
@@ -1474,6 +1748,21 @@ class TaskTab(ctk.CTkFrame):
                     if settings["schedule_enabled"] == "1"
                     else "выключено"
                 )
+                text += "\nТемп: " + pace_label(self.current_pace())
+                cap = int(settings["campaign_daily_cap"])
+                text += f"\nДневной лимит кампании: {cap if cap else 'выключен'}"
+                if settings["require_warmup_ready"] == "1":
+                    _, gated = split_warmup_ready(
+                        [self._accounts_info[key] for key in ids if key in self._accounts_info]
+                    )
+                    text += "\nТолько прогретые аккаунты: включено"
+                    if gated:
+                        text += ". Будут пропущены: " + describe_skipped_warmup(gated)
+                warning_block = format_warning_block(
+                    aggressive_warnings(settings["operation_mode"], low, int(settings["protection_consecutive"]))
+                )
+                if warning_block:
+                    text += "\n\n" + warning_block
                 if settings["operation_mode"] == "messages":
                     text += "\n\nТекст сообщения:\n" + settings["message_text"]
                     if settings["followup_enabled"] == "1":
@@ -1506,17 +1795,38 @@ class TaskTab(ctk.CTkFrame):
         except ValueError as exc:
             messagebox.showerror("Ошибка запуска", explain_error(exc))
             return
+        warnings = aggressive_warnings(
+            settings["operation_mode"], interval_min, int(settings["protection_consecutive"])
+        )
+        if warnings and not messagebox.askyesno(
+            "Агрессивные настройки темпа",
+            format_warning_block(warnings)
+            + "\n\nРекомендуем нажать «Безопасный» или «Обычный» в блоке интервала. Всё равно запустить?",
+            icon="warning",
+            parent=self.app,
+        ):
+            return
         self.start_btn.configure(state="disabled")
         self._starting = True
         self._update_buttons_state()
         db = self.db
+        require_warmup = settings["require_warmup_ready"] == "1"
 
         async def prepare():
             marked_running = False
             try:
+                accounts = await db.get_accounts_by_ids(selected_ids)
+                if not accounts:
+                    raise ValueError("Выбранные аккаунты не найдены. Обновите список и выберите доступный аккаунт")
+                accounts, skipped = gate_accounts(accounts, require_warmup)
+                if skipped:
+                    notice = "Пропущены не прогретые аккаунты: " + describe_skipped_warmup(skipped)
+                    self._safe_after(lambda text=notice: self.log_callback("WARN", text))
+                if not accounts:
+                    raise ValueError(warmup_gate_error(skipped))
                 report = await preflight(
                     db,
-                    selected_ids,
+                    [account["id"] for account in accounts],
                     chat,
                     live=True,
                     mode=settings["operation_mode"],
@@ -1525,9 +1835,6 @@ class TaskTab(ctk.CTkFrame):
                 )
                 if not report["ok"]:
                     raise ValueError(format_report(report))
-                accounts = await db.get_accounts_by_ids(selected_ids)
-                if not accounts:
-                    raise ValueError("Выбранные аккаунты не найдены. Обновите список и выберите доступный аккаунт")
                 async with self._draft_lock:
                     await db.save_campaign_settings({**settings, "task_status": "running"})
                 marked_running = True

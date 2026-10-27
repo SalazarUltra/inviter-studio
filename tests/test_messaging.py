@@ -3,7 +3,7 @@ import sqlite3
 from contextlib import closing
 from datetime import date, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from telethon.errors import (
     AuthKeyUnregisteredError,
@@ -35,6 +35,7 @@ class MessagingTests(DatabaseCase):
             self.db, lambda *args: self.events.append(args), complete_callback=self.reports.append
         )
         self.engine._wait = AsyncMock()
+        self.engine.VERIFY_DELAY = 0
         return self.engine
 
     def manager(self, account, mapping=None):
@@ -42,9 +43,10 @@ class MessagingTests(DatabaseCase):
         manager.account = account
         mapping = mapping or {}
         manager.resolve_recipient.side_effect = lambda name: User(
-            id=mapping.get(name, 10000 + sum(ord(c) for c in name))
+            id=mapping.get(name, 10000 + sum(ord(c) for c in name)), access_hash=1
         )
         manager.send_direct_message.return_value = {"success": True, "message_id": 7}
+        manager.verify_sent_message.return_value = {"found": None}
         return manager
 
     async def test_preflight_ignores_unavailable_account_when_another_can_send(self):
@@ -368,21 +370,175 @@ class MessagingTests(DatabaseCase):
         self.assertFalse(result["success"])
         self.assertEqual(result["error"], "uncertain")
 
-    async def test_timeout_is_not_retried_and_stops_queue(self):
+    async def test_unverifiable_timeout_is_not_retried_but_campaign_continues(self):
         engine = await self.setup_campaign(["alice", "bobby"])
         account = await self.add_account()
         manager = self.manager(account)
-        manager.send_direct_message.return_value = {"success": False, "error": "uncertain"}
+        manager.send_direct_message.side_effect = [
+            {"success": False, "error": "uncertain", "reason": "timeout"},
+            {"success": True, "message_id": 8},
+        ]
         with patch("core.messenger.AccountManager", return_value=manager):
-            await engine.start([account], "Hello", 10, 10)
-        manager.send_direct_message.assert_awaited_once()
+            await asyncio.wait_for(engine.start([account], "Hello", 10, 10), 3)
+        self.assertEqual(manager.send_direct_message.await_count, 2)
         self.assertEqual(await self.db.delivery_exists("alice"), "uncertain")
         rows = {row["username"]: row["status"] for row in await self.db.get_targets()}
-        self.assertEqual(rows, {"alice": "uncertain", "bobby": "pending"})
+        self.assertEqual(rows, {"alice": "uncertain", "bobby": "sent"})
         await self.db.reset_failed_targets(["error"])
         self.assertEqual((await self.db.get_targets(status="uncertain"))[0]["username"], "alice")
-        self.assertEqual(self.reports[0]["outcome"], "failed")
+        self.assertEqual(self.reports[0]["outcome"], "completed")
+        self.assertEqual(self.reports[0]["errors"], 1)
         self.assertTrue(any(row["action"] == "MESSAGE_UNCERTAIN" for row in await self.db.get_logs()))
+
+    async def test_uncertain_send_found_in_history_is_treated_as_sent(self):
+        engine = await self.setup_campaign(["alice"])
+        account = await self.add_account()
+        manager = self.manager(account)
+        manager.send_direct_message.return_value = {"success": False, "error": "uncertain", "reason": "timeout"}
+        manager.verify_sent_message.return_value = {"found": True, "message_id": 55}
+        with patch("core.messenger.AccountManager", return_value=manager):
+            await asyncio.wait_for(engine.start([account], "Hello", 10, 10), 3)
+        manager.send_direct_message.assert_awaited_once()
+        manager.verify_sent_message.assert_awaited_once()
+        self.assertEqual((await self.db.get_targets())[0]["status"], "sent")
+        self.assertEqual(await self.db.delivery_exists("alice"), "sent")
+        self.assertEqual(self.reports[0]["sent"], 1)
+        self.assertEqual(self.reports[0]["errors"], 0)
+        self.assertEqual(self.reports[0]["outcome"], "completed")
+        with closing(sqlite3.connect(self.root / "inviter.db")) as conn:
+            self.assertEqual(conn.execute("SELECT message_id FROM message_deliveries").fetchone()[0], 55)
+
+    async def test_uncertain_send_missing_from_history_requeues_once_then_errors(self):
+        engine = await self.setup_campaign(["alice", "bobby"])
+        account = await self.add_account()
+        manager = self.manager(account)
+        manager.send_direct_message.side_effect = [
+            {"success": False, "error": "uncertain", "reason": "timeout"},
+            {"success": False, "error": "uncertain", "reason": "timeout"},
+            {"success": True, "message_id": 8},
+        ]
+        manager.verify_sent_message.return_value = {"found": False}
+        with patch("core.messenger.AccountManager", return_value=manager):
+            await asyncio.wait_for(engine.start([account], "Hello", 10, 10), 3)
+        # alice: attempt 1 (absent -> requeued), attempt 2 (absent -> error); bobby still gets sent.
+        self.assertEqual(manager.send_direct_message.await_count, 3)
+        rows = {row["username"]: row["status"] for row in await self.db.get_targets()}
+        self.assertEqual(rows, {"alice": "error", "bobby": "sent"})
+        self.assertIsNone(await self.db.delivery_exists("alice"))
+        self.assertEqual(self.reports[0]["outcome"], "completed")
+        self.assertEqual(self.reports[0]["errors"], 1)
+        actions = [row["action"] for row in await self.db.get_logs()]
+        self.assertIn("MESSAGE_RETRY", actions)
+        self.assertNotIn("MESSAGE_UNCERTAIN", actions)
+
+    async def test_uncertain_send_missing_then_found_on_retry_is_sent(self):
+        engine = await self.setup_campaign(["alice"])
+        account = await self.add_account()
+        manager = self.manager(account)
+        manager.send_direct_message.side_effect = [
+            {"success": False, "error": "uncertain", "reason": "timeout"},
+            {"success": True, "message_id": 9},
+        ]
+        manager.verify_sent_message.return_value = {"found": False}
+        with patch("core.messenger.AccountManager", return_value=manager):
+            await asyncio.wait_for(engine.start([account], "Hello", 10, 10), 3)
+        self.assertEqual((await self.db.get_targets())[0]["status"], "sent")
+        self.assertEqual(manager.send_direct_message.await_count, 2)
+
+    async def test_uncertain_send_keeps_followups_alive(self):
+        engine = await self.setup_campaign(["alice", "bobby"])
+        await self.db.set_setting("followup_enabled", "1")
+        await self.db.set_setting("followup_text", "Second")
+        account = await self.add_account()
+        manager = self.manager(account)
+        manager.client = MagicMock()
+        manager.resolve_recipient.side_effect = lambda name: User(id=10000 + sum(ord(c) for c in name), access_hash=456)
+        manager.send_direct_message.side_effect = [
+            {"success": False, "error": "uncertain", "reason": "timeout"},
+            {"success": True, "message_id": 8},
+        ]
+        manager.verify_sent_message.return_value = {"found": None}
+        with patch("core.messenger.AccountManager", return_value=manager):
+            task = asyncio.create_task(engine.start([account], "Hello", 10, 10))
+            for _ in range(100):
+                await asyncio.sleep(0.05)
+                if manager.send_direct_message.await_count == 2:
+                    break
+            self.assertTrue(engine.running)
+            self.assertEqual(manager.send_direct_message.await_count, 2)
+            engine.stop()
+            await asyncio.wait_for(task, 3)
+        rows = {row["username"]: row["status"] for row in await self.db.get_targets()}
+        self.assertEqual(rows, {"alice": "uncertain", "bobby": "sent"})
+
+    async def test_verify_sent_message_matches_recent_outgoing_text_since_start(self):
+        from datetime import timedelta, timezone
+
+        manager = AccountManager(account_payload())
+        since = datetime.now(timezone.utc)
+
+        def history(*messages):
+            async def iterate(*args, **kwargs):
+                self.assertEqual(kwargs.get("limit"), 5)
+                for message in messages:
+                    yield message
+
+            return iterate
+
+        old = SimpleNamespace(id=1, out=True, message="Hello", date=since - timedelta(hours=1))
+        incoming = SimpleNamespace(id=2, out=False, message="Hello", date=since)
+        other = SimpleNamespace(id=3, out=True, message="Another", date=since)
+        mine = SimpleNamespace(id=4, out=True, message="Hello ", date=since + timedelta(seconds=1))
+
+        manager.client = SimpleNamespace(iter_messages=history(mine, other, incoming, old))
+        self.assertEqual(
+            await manager.verify_sent_message(User(id=123), "Hello", 321, since), {"found": True, "message_id": 4}
+        )
+
+        manager.client = SimpleNamespace(iter_messages=history(other, incoming, old))
+        self.assertEqual(await manager.verify_sent_message(User(id=123), "Hello", 321, since), {"found": False})
+
+        manager.client = SimpleNamespace(
+            iter_messages=history(SimpleNamespace(id=5, out=True, message="x", random_id=321, date=since))
+        )
+        self.assertEqual(
+            await manager.verify_sent_message(User(id=123), "Hello", 321, since), {"found": True, "message_id": 5}
+        )
+
+        async def broken(*args, **kwargs):
+            raise OSError("down")
+            yield
+
+        manager.client = SimpleNamespace(iter_messages=broken)
+        self.assertEqual(await manager.verify_sent_message(User(id=123), "Hello", 321, since), {"found": None})
+
+    async def test_timeout_and_empty_response_from_account_manager_are_uncertain_with_reason(self):
+        manager = AccountManager(account_payload())
+        manager.client = AsyncMock(side_effect=asyncio.TimeoutError())
+        result = await manager.send_direct_message(User(id=123), "Hello", 321)
+        self.assertEqual((result["error"], result["reason"]), ("uncertain", "timeout"))
+        manager.client = AsyncMock(return_value=None)
+        result = await manager.send_direct_message(User(id=123), "Hello", 321)
+        self.assertEqual((result["error"], result["reason"]), ("uncertain", "empty"))
+
+    async def test_server_5xx_rpc_errors_are_uncertain_but_client_errors_stay_definite(self):
+        manager = AccountManager(account_payload())
+        for exception, expected in (
+            (RPCError(None, "INTERNAL", 500), "uncertain"),
+            (RPCError(None, "RPC_CALL_FAIL", 500), "uncertain"),
+            (RPCError(None, "RPC_MCGET_FAIL", 503), "uncertain"),
+            (RPCError(None, "TIMEOUT", 500), "uncertain"),
+            (RPCError(None, "MSG_WAIT_FAILED", 500), "uncertain"),
+            (RPCError(None, "SOMETHING_UNKNOWN", 400), "error"),
+            (RPCError(None, "MESSAGE_TOO_LONG", 400), "error"),
+            (RPCError(None, "PEER_ID_INVALID", 400), "skip"),
+            (RPCError(None, "USER_IS_BLOCKED", 403), "private"),
+        ):
+            manager.client = AsyncMock(side_effect=exception)
+            result = await manager.send_direct_message(User(id=123), "Hello", 321)
+            self.assertEqual(result["error"], expected, exception)
+        manager.client = AsyncMock(side_effect=RPCError(None, "INTERNAL", 500))
+        self.assertEqual((await manager.send_direct_message(User(id=123), "Hello", 321))["reason"], "server")
 
     async def test_cancellation_during_send_requires_manual_review(self):
         engine = await self.setup_campaign(["alice"])
@@ -658,7 +814,7 @@ class MessagingTests(DatabaseCase):
             (RPCError(None, "PEER_ID_INVALID", 400), "skip"),
             (RPCError(None, "INPUT_USER_DEACTIVATED", 400), "skip"),
             (RPCError(None, "SOMETHING_UNKNOWN", 400), "error"),
-            (RPCError(None, "INTERNAL", 500), "error"),
+            (RPCError(None, "INTERNAL", 500), "uncertain"),
             (OSError("network"), "uncertain"),
             (asyncio.TimeoutError(), "uncertain"),
         ):

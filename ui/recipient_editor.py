@@ -5,7 +5,7 @@ from tkinter import messagebox
 import customtkinter as ctk
 
 from core.user_feedback import explain_error
-from core.validation import parse_usernames
+from core.validation import parse_usernames, recipient_line
 from ui.dispatch import post_ui
 from ui.entry_utils import paste_text
 from ui.theme import COLORS, FONTS, apply_button_role, style_tree
@@ -33,7 +33,7 @@ class RecipientEditor(ctk.CTkToplevel):
         self.help_label = ctk.CTkLabel(
             self,
             text=f"Кампания №{self.db.campaign_id} · Только ожидающие получатели.\n"
-            "Один @username или ссылка t.me на строку.\nПосле редактирования нажмите «Сохранить список».",
+            "Один @username, ссылка t.me или Telegram ID (id:123456789) на строку.\nПосле редактирования нажмите «Сохранить список».",
             font=FONTS["small"],
             text_color=COLORS["muted"],
             justify="left",
@@ -96,7 +96,7 @@ class RecipientEditor(ctk.CTkToplevel):
                     )
                     return
                 self.expected = result.result()
-                self.original = "\n".join(f"@{row['username']}" for row in self.expected)
+                self.original = "\n".join(recipient_line(row["username"]) for row in self.expected)
                 self.textbox.configure(state="normal")
                 self.textbox.insert("1.0", self.original)
                 self.set_enabled(True)

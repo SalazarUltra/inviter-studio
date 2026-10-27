@@ -1,6 +1,7 @@
 import asyncio
 import json
 import random
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import socks
@@ -39,7 +40,13 @@ from telethon.tl.types import Channel, Chat, InputPeerUser, InputUser, PeerUser,
 from core.paths import SESSIONS_DIR, session_path
 from core.paths import session_name as normalize_session_name
 from core.user_feedback import explain_error
-from core.validation import normalize_username, validate_message, validate_proxy
+from core.validation import (
+    is_id_recipient,
+    normalize_username,
+    recipient_user_id,
+    validate_message,
+    validate_proxy,
+)
 
 DEVICE_PROFILES = [
     {"device_model": "Samsung Galaxy S21", "system_version": "Android 12", "app_version": "9.3.3"},
@@ -53,6 +60,10 @@ DEVICE_PROFILES = [
     {"device_model": "iPhone 14 Pro", "system_version": "16.2", "app_version": "9.5.0"},
     {"device_model": "iPhone 12", "system_version": "15.4", "app_version": "9.1.5"},
 ]
+
+
+# Allowance for local-vs-Telegram clock difference when matching history by send time.
+VERIFY_CLOCK_SKEW_SECONDS = 120
 
 
 def get_random_device() -> dict[str, str]:
@@ -94,6 +105,31 @@ def classify_recipient_rpc(exc: BaseException) -> str | None:
     if any(marker in haystack for marker in _SKIP_RPC_MARKERS):
         return "skip"
     return None
+
+
+_SERVER_RPC_MARKERS = (
+    "INTERNAL",
+    "RPCCALLFAIL",
+    "RPCMCGETFAIL",
+    "INTERDC",
+    "SERVERERROR",
+    "TIMEOUT",
+)
+
+
+def is_server_rpc_error(exc: BaseException) -> bool:
+    """True for a 5xx / server-side RPC failure, where the message may or may not have been stored.
+
+    Client errors (4xx) are definite rejections and are NOT matched here.
+    """
+    code = getattr(exc, "code", None)
+    if isinstance(code, int):
+        if 500 <= code < 600:
+            return True
+        if 400 <= code < 500:
+            return False
+    haystack = f"{getattr(exc, 'message', None) or ''} {exc} {type(exc).__name__}".upper().replace("_", "")
+    return any(marker in haystack for marker in _SERVER_RPC_MARKERS)
 
 
 def is_followup_reply(message, user_id, first_id):
@@ -263,7 +299,9 @@ class AccountManager:
 
         resolving_user = True
         try:
-            clean_username = normalize_username(username)
+            # «id:<number>» recipients have no username: they are resolved by Telegram id only.
+            user_id = user_id or recipient_user_id(username)
+            clean_username = None if is_id_recipient(username) else normalize_username(username)
             user_entity = None
             if user_id:
                 # A parsed Telegram id is exact; it only resolves when this account has seen the user,
@@ -272,6 +310,11 @@ class AccountManager:
                     user_entity = await asyncio.wait_for(self.client.get_entity(PeerUser(int(user_id))), timeout=30)
                 except (ValueError, TypeError):
                     user_entity = None
+            if user_entity is None and clean_username is None:
+                raise ValueError(
+                    "Telegram не знает этот ID для аккаунта (нужна общая группа или контакт); "
+                    "получатель без никнейма пропущен"
+                )
             if user_entity is None:
                 user_entity = await asyncio.wait_for(self.client.get_entity(clean_username), timeout=30)
             if not isinstance(user_entity, User):
@@ -417,7 +460,7 @@ class AccountManager:
                 timeout=30,
             )
             if response is None:
-                return {"success": False, "error": "uncertain"}
+                return {"success": False, "error": "uncertain", "reason": "empty"}
             message_id = getattr(response, "id", None)
             if not isinstance(message_id, int):
                 message_id = next(
@@ -447,9 +490,51 @@ class AccountManager:
                 return {"success": False, "error": "private", "message": detail}
             if kind == "skip":
                 return {"success": False, "error": "skip", "message": detail}
+            if is_server_rpc_error(exc):
+                # 5xx / server timeout: Telegram may have stored the message anyway, so a blind
+                # retry could duplicate it. Report an unknown outcome instead of a rejection.
+                return {"success": False, "error": "uncertain", "reason": "server", "message": detail}
             return {"success": False, "error": "error", "message": detail}
-        except (asyncio.TimeoutError, OSError):
-            return {"success": False, "error": "uncertain"}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "uncertain", "reason": "timeout"}
+        except OSError:
+            return {"success": False, "error": "uncertain", "reason": "network"}
+
+    async def verify_sent_message(self, user, text: str, random_id: int | None, since) -> dict:
+        """Look at the last few messages of the chat for our outgoing ``text`` sent after ``since``.
+
+        Returns ``{"found": True, "message_id": id}``, ``{"found": False}`` when the history was
+        read and the message is clearly absent, or ``{"found": None}`` when it could not be read.
+        ``since`` is an aware datetime (send start); a small clock-skew allowance is applied.
+        """
+        if not self.client:
+            return {"found": None}
+        wanted = (text or "").strip()
+        threshold = since - timedelta(seconds=VERIFY_CLOCK_SKEW_SECONDS)
+
+        async def scan():
+            async for message in self.client.iter_messages(user, limit=5):
+                if not getattr(message, "out", False) or not isinstance(getattr(message, "id", None), int):
+                    continue
+                date = getattr(message, "date", None)
+                if isinstance(date, datetime):
+                    if date.tzinfo is None:
+                        date = date.replace(tzinfo=timezone.utc)
+                    if date < threshold:
+                        continue
+                known_random = getattr(message, "random_id", None)
+                if random_id is not None and isinstance(known_random, int) and known_random == random_id:
+                    return {"found": True, "message_id": message.id}
+                if (getattr(message, "message", None) or "").strip() == wanted:
+                    return {"found": True, "message_id": message.id}
+            return {"found": False}
+
+        try:
+            return await asyncio.wait_for(scan(), timeout=15)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - verification is best effort; failure means "unknown"
+            return {"found": None}
 
     async def followup_history(self, row):
         peer = InputPeerUser(row["user_id"], row["access_hash"])

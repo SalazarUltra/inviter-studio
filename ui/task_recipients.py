@@ -5,7 +5,7 @@ from tkinter import messagebox
 import customtkinter as ctk
 
 from core.user_feedback import explain_error
-from core.validation import parse_usernames
+from core.validation import parse_usernames, recipient_line
 from ui.dispatch import post_ui
 from ui.entry_utils import paste_text
 from ui.hints import hint, wrap_label
@@ -155,7 +155,7 @@ class TaskRecipients(ctk.CTkFrame):
 
     def show_rows(self, rows):
         self.expected = rows
-        self.original = "\n".join(f"@{row['username']}" for row in rows)
+        self.original = "\n".join(recipient_line(row["username"]) for row in rows)
         self.textbox.configure(state="normal")
         self.textbox.delete("1.0", "end")
         self.textbox.insert("1.0", self.original)

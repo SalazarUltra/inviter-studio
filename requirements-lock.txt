@@ -19,3 +19,4 @@ pyasn1==0.6.4
 rsa==4.9.1
 typing_extensions==4.15.0
 yarl==1.25.1
+tzdata==2026.5; sys_platform == "win32"

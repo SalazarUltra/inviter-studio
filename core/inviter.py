@@ -7,8 +7,19 @@ from typing import Callable
 
 from core.account_manager import AccountManager
 from core.database import Database, effective_account_age_days, is_flood_blocking
+from core.pacing import daily_cap_reached, daily_cap_status, parse_daily_cap
+from core.scheduling import (
+    SCHEDULE_DAYS_SETTING,
+    SMART_TZ_LOCAL,
+    SMART_TZ_SETTING,
+    describe_schedule_days,
+    normalize_smart_tz,
+    parse_schedule_days,
+    smart_hour,
+    smart_tz_label,
+)
 from core.user_feedback import explain_error
-from core.validation import time_minutes
+from core.validation import recipient_label, recipient_user_id, time_minutes
 
 # Recipient-level results that end the target for good (result code -> stored target status).
 FINAL_SKIP_STATUS = {
@@ -48,6 +59,8 @@ def describe_next_available(details: dict) -> str:
 
 
 class InviterEngine:
+    PACE_MODE = "invite"
+
     def __init__(
         self,
         db: Database,
@@ -77,6 +90,10 @@ class InviterEngine:
         self.break_min = 5
         self.break_max = 15
         self.session_adds = 0
+        self.daily_cap = 0
+        self.smart_tz = SMART_TZ_LOCAL  # time zone of the smart-interval hour (setting smart_interval_tz)
+        self._daily_done = 0
+        self._cap_logged = False
         self._session_counts = {"added": 0, "skipped": 0, "errors": 0}
         self._fail_streaks: dict[int, int] = {}
         self._transient_retries: dict[int, int] = {}
@@ -124,6 +141,9 @@ class InviterEngine:
             run_id = await self.db.begin_run(chat)
             await self.db.reset_daily_counters_if_needed()
             await self.db.reset_processing_to_pending()
+            await self._load_daily_cap()
+            self.smart_tz = normalize_smart_tz(await self.db.get_setting(SMART_TZ_SETTING, SMART_TZ_LOCAL))
+            self._smart_clock_logged = False
             self.max_consecutive = int(await self.db.get_setting("protection_consecutive", "5") or 5)
             self.break_min = int(await self.db.get_setting("protection_break_min", "5") or 5)
             self.break_max = int(await self.db.get_setting("protection_break_max", "15") or 15)
@@ -197,6 +217,8 @@ class InviterEngine:
                 if not stats["pending"]:
                     self.log_callback("INFO", "Список исчерпан. Задача завершена.")
                     break
+                if await self._daily_cap_hold():
+                    continue
                 account = await self._pick_available_account(accounts)
                 if not account:
                     if await self._wait_for_account_interval():
@@ -239,26 +261,29 @@ class InviterEngine:
                     continue
 
                 username = target["username"]
+                label = recipient_label(username)
                 if self.status_callback:
-                    self.status_callback(f"Добавление @{username} через {account['phone']}")
+                    self.status_callback(f"Добавление {label} через {account['phone']}")
 
                 mgr = self.account_managers[account["id"]]
                 counts_before = dict(self._session_counts)
                 self._last_action_ts = time.monotonic()
-                if target.get("user_id"):
-                    result = await mgr.add_user_to_chat(chat, username, user_id=target["user_id"])
+                known_user_id = target.get("user_id") or recipient_user_id(username)
+                if known_user_id:
+                    result = await mgr.add_user_to_chat(chat, username, user_id=known_user_id)
                 else:
                     result = await mgr.add_user_to_chat(chat, username)
 
                 if result["success"]:
                     await self.db.record_success(target["id"], account["id"], chat=chat)
                     claimed_target = None
+                    self._daily_done = await self.db.add_campaign_daily_success()
                     self._fail_streaks[account["id"]] = 0
                     self._transient_retries.pop(target["id"], None)
                     self.session_adds += 1
                     self._session_counts["added"] += 1
                     await self.db.add_log(account["phone"], username, "ADD_SUCCESS", "Добавлен в чат")
-                    self.log_callback("SUCCESS", f"@{username} добавлен через {account['phone']}")
+                    self.log_callback("SUCCESS", f"{label} добавлен через {account['phone']}")
                     fresh = await self.db.get_account(account["id"])
                     if fresh and int(fresh.get("consecutive_adds") or 0) >= self.max_consecutive:
                         break_minutes = random.randint(self.break_min, self.break_max)
@@ -281,7 +306,7 @@ class InviterEngine:
                         "not_found": "никнейм не найден",
                         "already_in": "уже в чате",
                     }.get(error) or (message if result.get("message") else "запрет получателя")
-                    self.log_callback("INFO", f"@{target['username']} пропущен: {reason}")
+                    self.log_callback("INFO", f"{label} пропущен: {reason}")
                 elif result.get("flood_seconds"):
                     await self.db.mark_target(target["id"], "pending")
                     claimed_target = None
@@ -327,7 +352,7 @@ class InviterEngine:
                     message = str(result.get("message") or "Telegram отклонил действие; проверьте аккаунт и получателя")
                     await self.db.mark_target(target["id"], "error", None, message)
                     await self.db.add_log(account["phone"], username, "ADD_ERROR", message)
-                    self.log_callback("ERROR", f"@{username}: действие не выполнено; подробности в журнале")
+                    self.log_callback("ERROR", f"{label}: действие не выполнено; подробности в журнале")
                     await self._record_account_failure(account)
 
                 claimed_target = None
@@ -379,6 +404,32 @@ class InviterEngine:
             if self.complete_callback:
                 self.complete_callback(summary)
 
+    async def _load_daily_cap(self) -> None:
+        """Read the campaign daily cap (0 = off); a corrupt value is treated as off."""
+        try:
+            self.daily_cap = parse_daily_cap(await self.db.get_setting("campaign_daily_cap", "0"))
+        except ValueError:
+            self.daily_cap = 0
+        self._cap_logged = False
+        self._daily_done = await self.db.get_campaign_daily_count() if self.daily_cap else 0
+
+    async def _daily_cap_hold(self) -> bool:
+        """True (after waiting) while today's campaign cap of first actions is used up."""
+        if self.daily_cap <= 0:
+            return False
+        self._daily_done = await self.db.get_campaign_daily_count()
+        if not daily_cap_reached(self._daily_done, self.daily_cap):
+            self._cap_logged = False
+            return False
+        text = daily_cap_status(self._daily_done, self.daily_cap, self.PACE_MODE)
+        if not self._cap_logged:
+            self._cap_logged = True
+            self.log_callback("INFO", text + ". Задача ждёт следующего дня")
+        if self.status_callback:
+            self.status_callback(text)
+        await self._wait(30)
+        return True
+
     async def _record_account_failure(self, account: dict) -> None:
         """Circuit breaker: several non-success results in a row send the account on a short break."""
         account_id = account["id"]
@@ -411,7 +462,7 @@ class InviterEngine:
             )
             self.log_callback(
                 "WARN",
-                f"@{username}: временный сбой, повтор {attempts}/{MAX_TRANSIENT_RETRIES}",
+                f"{recipient_label(username)}: временный сбой, повтор {attempts}/{MAX_TRANSIENT_RETRIES}",
             )
             return
         self._transient_retries.pop(target_id, None)
@@ -419,7 +470,7 @@ class InviterEngine:
         final = f"{detail}. Попытки исчерпаны ({MAX_TRANSIENT_RETRIES}); проверьте вручную и повторите"
         await self.db.mark_target(target_id, "error", None, final)
         await self.db.add_log(account["phone"], username, "ADD_ERROR", final)
-        self.log_callback("ERROR", f"@{username}: попытки исчерпаны; подробности в журнале")
+        self.log_callback("ERROR", f"{recipient_label(username)}: попытки исчерпаны; подробности в журнале")
 
     async def _drop_account_without_rights(self, account: dict, accounts: list[dict], result: dict) -> list[dict]:
         """Remove one account that cannot invite into the chat; the other accounts keep working."""
@@ -551,6 +602,8 @@ class InviterEngine:
             "next_account": nearest["phone"] if nearest else None,
             "next_in": nearest["next_in"] if nearest else 0,
             "next_available_at": next_at,
+            "daily_cap": self.daily_cap,
+            "daily_done": self._daily_done,
         }
 
     def _emit_details(self, stats: dict | None = None) -> None:
@@ -617,12 +670,31 @@ class InviterEngine:
         return None
 
     async def _is_within_schedule(self) -> bool:
-        settings = await self.db.get_settings_map(["schedule_enabled", "schedule_from", "schedule_to"])
+        settings = await self.db.get_settings_map(
+            ["schedule_enabled", "schedule_from", "schedule_to", SCHEDULE_DAYS_SETTING]
+        )
         if settings["schedule_enabled"] != "1":
             return True
         from_str = settings["schedule_from"] or "00:00"
         to_str = settings["schedule_to"] or "23:59"
         now = datetime.now()
+        try:
+            days = parse_schedule_days(settings.get(SCHEDULE_DAYS_SETTING))  # empty/missing: every day
+        except ValueError:
+            self.log_callback(
+                "WARN",
+                f"Некорректные дни недели «{settings.get(SCHEDULE_DAYS_SETTING)}». "
+                "Задача на паузе до исправления настроек.",
+            )
+            return False
+        if now.weekday() not in days:
+            if not getattr(self, "_weekday_logged", False):
+                self._weekday_logged = True
+                self.log_callback(
+                    "INFO", f"Сегодня не рабочий день расписания ({describe_schedule_days(days)}). Ожидание..."
+                )
+            return False
+        self._weekday_logged = False
 
         try:
             start = time_minutes(str(from_str))
@@ -654,8 +726,12 @@ class InviterEngine:
             return min(limit, 20)
         return limit
 
+    def _smart_hour(self) -> int:
+        """Hour of day for the smart interval, in the zone chosen by `smart_interval_tz`."""
+        return smart_hour(self.smart_tz, datetime.now())
+
     def _get_smart_interval(self, base_min: int, base_max: int) -> int:
-        hour = datetime.now().hour
+        hour = self._smart_hour()
         if 0 <= hour < 8:
             multiplier = 2.5
             period = "ночь"
@@ -674,10 +750,7 @@ class InviterEngine:
         if multiplier > 1.0:
             if not getattr(self, "_smart_clock_logged", False):
                 self._smart_clock_logged = True
-                self.log_callback(
-                    "INFO",
-                    "Умный интервал считается по системным часам компьютера (не по московскому времени)",
-                )
+                self.log_callback("INFO", f"Умный интервал считается по часам: {smart_tz_label(self.smart_tz)}")
             self.log_callback(
                 "INFO",
                 f"Умный интервал ({period}): {interval} сек (x{multiplier} от базового)",

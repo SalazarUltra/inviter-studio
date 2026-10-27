@@ -10,7 +10,7 @@ import zipfile
 from pathlib import Path
 from typing import Callable
 
-from core.validation import csv_cell
+from core.validation import csv_cell, id_recipient, recipient_line
 
 _XML_ILLEGAL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
 
@@ -24,6 +24,8 @@ def write_targets_csv(path: str, rows: list[dict]) -> None:
         ) as handle:
             temporary = Path(handle.name)
             fields = ("username", "status", "added_by_account_id", "processed_at", "error_message")
+            if any(row.get("user_id") for row in rows):
+                fields += ("user_id",)  # Telegram ids are exported whenever the list has any
             writer = csv.writer(handle)
             writer.writerow(fields)
             for row in rows:
@@ -99,6 +101,7 @@ TARGET_STATUS_LABELS = {
 def write_targets_xlsx(path: str, rows: list[dict], phone_by_id: dict | None = None) -> None:
     """Per-recipient campaign outcome: status, reason and the account that acted."""
     phones = phone_by_id or {}
+    with_ids = any(row.get("user_id") for row in rows)  # Telegram ids are exported whenever the list has any
     book_rows = [
         (
             "Получатель",
@@ -107,19 +110,21 @@ def write_targets_xlsx(path: str, rows: list[dict], phone_by_id: dict | None = N
             "Аккаунт",
             "Дата обработки",
         )
+        + (("Telegram ID",) if with_ids else ())
     ]
     for row in rows:
         username = str(row.get("username") or "")
         book_rows.append(
             (
-                "@" + username if username else "",
+                recipient_line(username) if username else "",
                 TARGET_STATUS_LABELS.get(str(row.get("status")), str(row.get("status") or "")),
                 str(row.get("error_message") or ""),
                 str(phones.get(row.get("added_by_account_id")) or ""),
                 str(row.get("processed_at") or ""),
             )
+            + ((str(row.get("user_id") or ""),) if with_ids else ())
         )
-    write_xlsx_book(path, "Аудитория", book_rows, (25, 16, 48, 20, 21))
+    write_xlsx_book(path, "Аудитория", book_rows, (25, 16, 48, 20, 21) + ((16,) if with_ids else ()))
 
 
 def write_xlsx_book(path: str, sheet_name: str, rows: list[tuple], widths: tuple[int, ...]) -> None:
@@ -272,6 +277,17 @@ def write_parsed_xlsx(path, rows):
     write_xlsx_book(path, "Участники", book_rows, (14, 22, 18, 18, 40, 22, 18, 22, 11, 22, 22, 10, 11, 8, 9, 8, 8, 11))
 
 
+def txt_lines_with_ids(rows) -> list[str]:
+    """One line per person that can be re-imported: «@username», or «id:123» when there is no username."""
+    lines = []
+    for row in rows:
+        if row.get("username"):
+            lines.append("@" + row["username"])
+        elif row.get("user_id"):
+            lines.append(id_recipient(int(row["user_id"])))
+    return list(dict.fromkeys(lines))
+
+
 def write_parsed(path, rows, format_name):
     if format_name == "xlsx":
         write_parsed_xlsx(path, rows)
@@ -291,6 +307,8 @@ def write_parsed(path, rows, format_name):
                 handle.write(
                     "".join(f"@{name}\n" for name in dict.fromkeys(row["username"] for row in rows if row["username"]))
                 )
+            elif format_name == "txt_ids":
+                handle.write("".join(f"{line}\n" for line in txt_lines_with_ids(rows)))
             elif format_name == "json":
                 json.dump(rows, handle, ensure_ascii=False, indent=2)
             elif format_name == "csv":
