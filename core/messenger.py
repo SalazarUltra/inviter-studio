@@ -13,15 +13,19 @@ from telethon.errors import (
     UsernameNotOccupiedError,
 )
 
-from core.account_manager import AccountManager
+from core.account_manager import AccountManager, classify_recipient_rpc, rpc_error_text
 from core.followups import ReplyFollowups
-from core.inviter import InviterEngine
+from core.inviter import PEER_FLOOD_COOLDOWN_SECONDS, InviterEngine
 from core.user_feedback import explain_error
 from core.validation import validate_message
 
 
 class MessageEngine(InviterEngine):
-    MAX_TRANSIENT_FAILURES = 5  # consecutive transient resolve errors before stopping
+    # Consecutive transient resolve failures across *different* recipients (network outage)
+    # before the whole run stops.
+    MAX_TRANSIENT_FAILURES = 5
+    # Transient resolve failures for the SAME recipient before that recipient is marked "error".
+    MAX_RESOLVE_RETRIES = 3
 
     async def start(self, accounts, text, interval_min, interval_max):
         validate_message(text)
@@ -37,7 +41,9 @@ class MessageEngine(InviterEngine):
         self._started_at = self.start_time = datetime.now()
         self._session_counts = {"added": 0, "sent": 0, "followup_sent": 0, "skipped": 0, "errors": 0}
         self._rr_index = 0
+        self.interval_min = interval_min  # follow-ups keep the same minimum gap since the last send
         self._streaks = {}
+        self._resolve_retries = {}
         self.followup_text = None
         self.followups = None
         self._followup_failed = False
@@ -106,6 +112,7 @@ class MessageEngine(InviterEngine):
                     await self._wait(remaining)
             wait_reason = None
             transient_failures = 0
+            last_transient_target = None
             while self.running:
                 if self.paused:
                     await asyncio.sleep(0.25)
@@ -145,6 +152,13 @@ class MessageEngine(InviterEngine):
                     ]
                     if not usable_accounts:
                         raise RuntimeError("Нет доступных аккаунтов: проверьте ограничения и дневные лимиты")
+                    long_until = self._long_cooldown_until(usable_accounts)
+                    if long_until:
+                        raise RuntimeError(
+                            "Все доступные аккаунты на длительной паузе Telegram до "
+                            + long_until.strftime("%d.%m %H:%M")
+                            + ". Запустите задачу позже; получатели остались в очереди"
+                        )
                     quota_available = any(
                         a.get("is_enabled")
                         and a.get("status") not in {"restricted", "unauthorized", "inactive"}
@@ -181,67 +195,98 @@ class MessageEngine(InviterEngine):
                 try:
                     user = await manager.resolve_recipient(target["username"])
                 except (ValueError, UsernameInvalidError, UsernameNotOccupiedError):
-                    transient_failures = 0
-                    await self.db.mark_target(
-                        claimed, "not_found", error_message="Получатель не найден или не является пользователем"
-                    )
-                    self._session_counts["skipped"] += 1
-                    await self.db.add_log(
-                        account["phone"],
-                        target["username"],
-                        "MESSAGE_NOT_FOUND",
+                    transient_failures, last_transient_target = 0, None
+                    self._resolve_retries.pop(target["id"], None)
+                    claimed = None
+                    await self._finish_not_found(
+                        account,
+                        target,
                         "Никнейм не найден или не принадлежит действующему пользователю; очередь продолжается",
                     )
-                    self.log_callback("SKIP", f"@{target['username']} не найден; переходим к следующему получателю")
-                    claimed = None
-                    await self._progress()
                     continue
                 except FloodWaitError as exc:
                     await self.db.mark_target(claimed, "pending")
                     claimed = None
-                    await self.db.set_flood_wait(account["id"], max(1, exc.seconds))
-                    self.log_callback("FLOOD", f"Telegram требует ожидание {exc.seconds} сек. Кампания остановлена.")
-                    self.stop()
+                    await self._pause_account(account, target, "flood", max(1, exc.seconds))
                     continue
                 except (PeerFloodError, AuthKeyUnregisteredError) as exc:
                     await self.db.mark_target(claimed, "pending")
                     claimed = None
-                    await self.db.update_account_status(
-                        account["id"], "restricted" if isinstance(exc, PeerFloodError) else "unauthorized"
+                    await self._pause_account(
+                        account, target, "peer_flood" if isinstance(exc, PeerFloodError) else "unauthorized"
                     )
-                    reason = (
-                        "Telegram отклонил отправку с этого аккаунта"
-                        if isinstance(exc, PeerFloodError)
-                        else "Telegram отозвал сохранённый вход"
-                    )
-                    await self.db.add_log(account["phone"], target["username"], "MESSAGE_STOPPED", reason)
-                    raise RuntimeError(f"{reason}. Кампания остановлена.") from None
+                    continue
                 except (asyncio.TimeoutError, ConnectionError, OSError, RPCError) as exc:
-                    # Transient network/RPC failure: the recipient stays queued and the
-                    # next account (round-robin) retries; one timeout must not end the run
-                    # or cancel waiting follow-ups. A persistent outage still stops safely.
-                    await self.db.mark_target(claimed, "pending")
-                    claimed = None
-                    transient_failures += 1
+                    if isinstance(exc, RPCError) and (
+                        classify_recipient_rpc(exc) is not None or getattr(exc, "code", None) == 400
+                    ):
+                        # Permanent recipient-level rejection (invalid peer, deactivated, ...).
+                        transient_failures, last_transient_target = 0, None
+                        self._resolve_retries.pop(target["id"], None)
+                        claimed = None
+                        await self._finish_not_found(
+                            account,
+                            target,
+                            f"Telegram отклонил получателя ({rpc_error_text(exc)}); очередь продолжается",
+                        )
+                        continue
+                    # Transient network/RPC failure: retried per recipient. One recipient that keeps
+                    # failing is marked "error" without burning the whole campaign; only repeated
+                    # failures across different recipients (an outage) stop the run safely.
+                    target_id = target["id"]
+                    retries = self._resolve_retries.get(target_id, 0) + 1
                     detail = explain_error(exc)
-                    await self.db.add_log(
-                        account["phone"],
-                        target["username"],
-                        "RESOLVE_RETRY",
-                        f"Временная ошибка сети или Telegram ({detail}); получатель остался в очереди",
-                    )
-                    self.log_callback(
-                        "WARN",
-                        f"@{target['username']}: временная ошибка ({detail}). Повтор позже "
-                        f"({transient_failures}/{self.MAX_TRANSIENT_FAILURES})",
-                    )
-                    if transient_failures >= self.MAX_TRANSIENT_FAILURES:
+                    if target_id != last_transient_target:
+                        transient_failures += 1
+                        last_transient_target = target_id
+                    outage = transient_failures >= self.MAX_TRANSIENT_FAILURES
+                    if retries >= self.MAX_RESOLVE_RETRIES:
+                        self._resolve_retries.pop(target_id, None)
+                        await self.db.mark_target(
+                            claimed,
+                            "error",
+                            error_message=f"Не удалось проверить получателя после {retries} попыток: {detail}",
+                        )
+                        claimed = None
+                        self._session_counts["errors"] += 1
+                        await self.db.add_log(
+                            account["phone"],
+                            target["username"],
+                            "RESOLVE_FAILED",
+                            f"Не удалось проверить получателя за {retries} попыток ({detail}); получатель пропущен",
+                        )
+                        self.log_callback(
+                            "ERROR",
+                            f"@{target['username']}: {retries} попытки не удались ({detail}); "
+                            "получатель пропущен, очередь продолжается",
+                        )
+                        await self._progress()
+                        if not outage:
+                            await self._wait(random.uniform(2, 5))
+                    else:
+                        self._resolve_retries[target_id] = retries
+                        await self.db.mark_target(claimed, "pending")
+                        claimed = None
+                        await self.db.add_log(
+                            account["phone"],
+                            target["username"],
+                            "RESOLVE_RETRY",
+                            f"Временная ошибка сети или Telegram ({detail}); получатель остался в очереди",
+                        )
+                        self.log_callback(
+                            "WARN",
+                            f"@{target['username']}: временная ошибка ({detail}). Повтор позже "
+                            f"({retries}/{self.MAX_RESOLVE_RETRIES})",
+                        )
+                        if not outage:
+                            await self._wait(min(30, 5 * retries))
+                    if outage:
                         raise RuntimeError(
                             "Несколько ошибок сети подряд. Проверьте интернет и прокси; получатели остались в очереди."
                         ) from None
-                    await self._wait(min(30, 5 * transient_failures))
                     continue
-                transient_failures = 0
+                transient_failures, last_transient_target = 0, None
+                self._resolve_retries.pop(target["id"], None)
                 if not self.running or self.paused:
                     await self.db.mark_target(claimed, "pending")
                     claimed = None
@@ -283,30 +328,47 @@ class MessageEngine(InviterEngine):
                         "MESSAGE_PRIVATE",
                         "Получатель не принимает сообщения; повтор другим аккаунтом отключён",
                     )
+                elif result.get("error") in {"skip", "error"}:
+                    # Definite Telegram rejection: the message was not sent. Only this recipient
+                    # is affected; the campaign continues.
+                    detail = str(result.get("message") or "")
+                    await self.db.release_delivery(reserved)
+                    reserved = None
+                    if result["error"] == "skip":
+                        await self.db.mark_target(
+                            claimed,
+                            "not_found",
+                            error_message=detail or "Аккаунт получателя удалён или недоступен",
+                        )
+                        self._session_counts["skipped"] += 1
+                        await self.db.add_log(
+                            account["phone"],
+                            target["username"],
+                            "MESSAGE_SKIP",
+                            f"Получатель недоступен ({detail}); очередь продолжается",
+                        )
+                        self.log_callback("SKIP", f"@{target['username']} недоступен ({detail}); идём дальше")
+                    else:
+                        await self.db.mark_target(
+                            claimed,
+                            "error",
+                            error_message=f"Telegram отклонил отправку: {detail}" if detail else "Отправка отклонена",
+                        )
+                        self._session_counts["errors"] += 1
+                        await self.db.add_log(
+                            account["phone"],
+                            target["username"],
+                            "MESSAGE_ERROR",
+                            f"Telegram отклонил отправку ({detail}); сообщение не отправлено, очередь продолжается",
+                        )
+                        self.log_callback(
+                            "ERROR", f"@{target['username']}: Telegram отклонил отправку ({detail}); идём дальше"
+                        )
                 elif result.get("error") in {"flood", "peer_flood", "unauthorized"}:
                     await self.db.release_delivery(reserved)
                     reserved = None
                     await self.db.mark_target(claimed, "pending")
-                    if result["error"] == "flood":
-                        await self.db.set_flood_wait(account["id"], result["flood_seconds"])
-                    else:
-                        await self.db.update_account_status(
-                            account["id"], "restricted" if result["error"] == "peer_flood" else "unauthorized"
-                        )
-                    if result["error"] == "flood":
-                        reason = f"Telegram просит подождать {result['flood_seconds']} сек"
-                    elif result["error"] == "peer_flood":
-                        reason = "Telegram отклонил отправку с этого аккаунта"
-                    else:
-                        reason = "Telegram отозвал сохранённый вход"
-                    self.log_callback("WARN", f"{reason}. Кампания остановлена.")
-                    await self.db.add_log(
-                        account["phone"],
-                        target["username"],
-                        "MESSAGE_STOPPED",
-                        f"{reason}. Получатель остался в очереди; кампания остановлена",
-                    )
-                    self.stop()
+                    await self._pause_account(account, target, result["error"], result.get("flood_seconds"))
                 else:
                     await self.db.finish_delivery(reserved, "uncertain")
                     claimed = reserved = None
@@ -376,6 +438,46 @@ class MessageEngine(InviterEngine):
                 self._task = None
             if self.complete_callback:
                 self.complete_callback(summary)
+
+    async def _finish_not_found(self, account, target, detail):
+        await self.db.mark_target(
+            target["id"], "not_found", error_message="Получатель не найден или не является пользователем"
+        )
+        self._session_counts["skipped"] += 1
+        await self.db.add_log(account["phone"], target["username"], "MESSAGE_NOT_FOUND", detail)
+        self.log_callback("SKIP", f"@{target['username']} не найден; переходим к следующему получателю")
+        await self._progress()
+        await self._wait(random.uniform(2, 5))
+
+    async def _pause_account(self, account, target, kind, flood_seconds=None):
+        """Take ONE account out of rotation; the other accounts keep working.
+
+        The recipient must already be back in the queue. The run only stops later, when no
+        usable account is left (see the account-selection branch of the main loop).
+        """
+        if kind == "flood":
+            seconds = max(1, int(flood_seconds or 1))
+            await self.db.set_flood_wait(account["id"], seconds)
+            reason = f"Telegram просит подождать {seconds} сек"
+            outcome = f"Пауза {seconds} сек"
+        elif kind == "peer_flood":
+            await self.db.set_flood_wait(account["id"], PEER_FLOOD_COOLDOWN_SECONDS)
+            reason = "Telegram ограничил отправку с этого аккаунта"
+            outcome = f"Пауза {PEER_FLOOD_COOLDOWN_SECONDS // 3600} ч"
+        else:
+            await self.db.update_account_status(account["id"], "unauthorized")
+            reason = "Telegram отозвал сохранённый вход"
+            outcome = "Аккаунт исключён из ротации"
+        self._streaks.pop(account["id"], None)
+        self.log_callback(
+            "WARN", f"Аккаунт {account['phone']}: {reason}. {outcome}; остальные аккаунты продолжают работу"
+        )
+        await self.db.add_log(
+            account["phone"],
+            target["username"],
+            "MESSAGE_ACCOUNT_PAUSED",
+            f"{reason}. {outcome}; получатель остался в очереди",
+        )
 
     async def _record_streak(self, account_id):
         self._streaks[account_id] = self._streaks.get(account_id, 0) + 1

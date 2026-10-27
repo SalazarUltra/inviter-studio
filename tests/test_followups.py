@@ -1,12 +1,15 @@
 import asyncio
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+from telethon.errors import AuthKeyUnregisteredError, FloodWaitError, PeerFloodError
 from telethon.tl.types import InputPeerUser, PeerChannel, PeerUser, UpdateMessageID, User
 
 from core.account_manager import AccountManager, is_followup_reply
-from core.database import init_db
+from core.database import _connect, init_db
 from core.diagnostics import preflight
+from core.followup_store import clamp_wait_hours
 from core.followups import ReplyFollowups
 from core.messenger import MessageEngine
 from tests.support import DatabaseCase, account_payload
@@ -22,6 +25,16 @@ def incoming(user_id=123, message_id=11, **values):
 
 
 class FollowupFixtures(DatabaseCase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        # Most tests exercise delivery, not the human-like post-reply delay.
+        self.set_reply_delay(0, 0)
+
+    def set_reply_delay(self, low, high):
+        delay = patch("core.followup_store.FOLLOWUP_DELAY_RANGE", (low, high))
+        delay.start()
+        self.addCleanup(delay.stop)
+
     async def seed(self, name="alice", account=None, user_id=123, state="sent", message_id=10):
         if await self.db.get_campaign_kind() != "messages":
             self.db = self.db.for_campaign(await self.db.create_campaign("Replies", "messages"))
@@ -375,7 +388,7 @@ class FollowupEngineTests(FollowupFixtures):
         self.assertTrue(await self.has_state("blocked"))
         self.assertIsNone(await self.db.claim_followup("alice"))
 
-    async def test_flood_stops_and_cancels_queued_second(self):
+    async def test_flood_pauses_account_but_does_not_stop_campaign(self):
         account = await self.configure()
         self.manager.send_direct_message.side_effect = [
             {"success": True, "message_id": 10},
@@ -384,9 +397,32 @@ class FollowupEngineTests(FollowupFixtures):
         task = await self.run_engine(account)
         await self.wait_first()
         await self.emit()
+
+        async def flooded():
+            return (await self.db.get_account(account["id"]))["status"] == "flood"
+
+        await self.wait_for(flooded)
+        await asyncio.sleep(0.1)
+        self.assertFalse(task.done())
+        self.assertTrue(self.engine.running)
+        self.assertTrue(await self.has_state("ready"))
+        self.assertEqual(self.manager.send_direct_message.await_count, 2)
+        self.engine.stop()
         await asyncio.wait_for(task, 5)
         self.assertTrue(await self.has_state("cancelled"))
-        self.assertEqual((await self.db.get_account(account["id"]))["status"], "flood")
+
+    async def test_run_finishes_normally_when_all_waiting_expired(self):
+        account = await self.configure(seed=True)
+        async with _connect() as connection:
+            old = (datetime.now() - timedelta(hours=30)).isoformat(timespec="seconds")
+            await connection.execute("UPDATE message_followups SET created_at=?", (old,))
+            await connection.commit()
+        summaries = []
+        self.engine.complete_callback = summaries.append
+        task = await self.run_engine(account)
+        await asyncio.wait_for(task, 5)
+        self.assertEqual(summaries[0]["outcome"], "completed")
+        self.assertEqual(await self.db.get_followup_stats(), {"cancelled": 1})
 
     async def test_uncertain_second_is_not_automatically_retried(self):
         account = await self.configure()
@@ -465,6 +501,174 @@ class FollowupEngineTests(FollowupFixtures):
         self.assertEqual(fresh["followups_today"], 1)
         self.assertTrue(await self.has_state("sent"))
 
+
+class FollowupReliabilityTests(FollowupFixtures):
+    async def tick_engine(self, account, **manager_values):
+        engine = MessageEngine(self.db, lambda *args: None)
+        engine.running = True
+        engine._streaks = {}
+        engine._session_counts = {"followup_sent": 0, "errors": 0}
+        engine._followup_failed = False
+        engine.stop = Mock()
+        manager = SimpleNamespace(
+            followup_history=AsyncMock(return_value={"last_id": 10, "reply_id": None}),
+            followup_peer=AsyncMock(return_value=InputPeerUser(123, 456)),
+            send_direct_message=AsyncMock(return_value={"success": True, "message_id": 30}),
+        )
+        for key, value in manager_values.items():
+            setattr(manager, key, value)
+        engine.account_managers = {account["id"]: manager}
+        return engine, manager
+
+    async def ready_followup(self):
+        account, _ = await self.seed()
+        await self.db.set_setting("task_status", "running")
+        self.assertTrue(await self.db.receive_followup_reply(account["id"], 123, 11))
+        return account
+
+    async def test_ready_at_delays_second_message_30_to_180_seconds(self):
+        self.set_reply_delay(30, 180)
+        account = await self.ready_followup()
+        row = (await self.db.get_followups(states=("ready",)))[0]
+        ready_at = datetime.fromisoformat(row["ready_at"])
+        elapsed = (ready_at - datetime.now()).total_seconds()
+        self.assertTrue(29 <= elapsed <= 180, elapsed)
+        now = datetime.now().isoformat(timespec="microseconds")
+        self.assertEqual(await self.db.get_followups(states=("ready",), due_at=now), [])
+        later = (datetime.now() + timedelta(seconds=181)).isoformat(timespec="microseconds")
+        self.assertEqual(len(await self.db.get_followups(states=("ready",), due_at=later)), 1)
+        engine, manager = await self.tick_engine(account)
+        await ReplyFollowups(engine).tick()
+        manager.send_direct_message.assert_not_awaited()
+        self.assertEqual((await self.db.get_followup_stats())["ready"], 1)
+        # Once the delay has elapsed (and only then) the same row is delivered.
+        async with _connect() as connection:
+            past = (datetime.now() - timedelta(seconds=1)).isoformat(timespec="microseconds")
+            await connection.execute("UPDATE message_followups SET ready_at=?", (past,))
+            await connection.commit()
+        await ReplyFollowups(engine).tick()
+        manager.send_direct_message.assert_awaited_once()
+
+    async def test_delayed_row_does_not_block_due_row_of_same_account(self):
+        account, _ = await self.seed()
+        await self.seed("bobby", account, user_id=456)
+        await self.db.set_setting("task_status", "running")
+        await self.db.receive_followup_reply(account["id"], 123, 11)
+        await self.db.receive_followup_reply(account["id"], 456, 11)
+        async with _connect() as connection:
+            future = (datetime.now() + timedelta(hours=1)).isoformat(timespec="microseconds")
+            await connection.execute("UPDATE message_followups SET ready_at=? WHERE username='alice'", (future,))
+            await connection.commit()
+        engine, manager = await self.tick_engine(account)
+        await ReplyFollowups(engine).tick()
+        manager.send_direct_message.assert_awaited_once()
+        self.assertEqual((await self.db.get_followup_stats())["sent"], 1)
+
+    async def test_minimum_gap_since_last_send_is_enforced(self):
+        account = await self.ready_followup()
+        engine, manager = await self.tick_engine(account)
+        engine.interval_min = 60
+        recent = datetime.now().isoformat()
+        with patch.object(self.db, "last_message_time", new=AsyncMock(return_value=recent)):
+            await ReplyFollowups(engine).tick()
+        manager.send_direct_message.assert_not_awaited()
+        old = (datetime.now() - timedelta(seconds=61)).isoformat()
+        with patch.object(self.db, "last_message_time", new=AsyncMock(return_value=old)):
+            await ReplyFollowups(engine).tick()
+        manager.send_direct_message.assert_awaited_once()
+
+    async def test_restriction_pauses_account_without_stopping_engine(self):
+        account, _ = await self.seed()
+        engine, _ = await self.tick_engine(account)
+        followups = ReplyFollowups(engine)
+        await followups.restriction(account["id"], FloodWaitError(request=None, capture=120))
+        stored = await self.db.get_account(account["id"])
+        self.assertEqual(stored["status"], "flood")
+        remaining = (datetime.fromisoformat(stored["flood_until"]) - datetime.now()).total_seconds()
+        self.assertTrue(60 < remaining <= 120, remaining)
+        await followups.restriction(account["id"], PeerFloodError(request=None))
+        stored = await self.db.get_account(account["id"])
+        remaining = (datetime.fromisoformat(stored["flood_until"]) - datetime.now()).total_seconds()
+        self.assertTrue(23 * 3600 < remaining <= 24 * 3600, remaining)
+        self.assertEqual(stored["status"], "flood")
+        await followups.restriction(account["id"], AuthKeyUnregisteredError(request=None))
+        self.assertEqual((await self.db.get_account(account["id"]))["status"], "unauthorized")
+        engine.stop.assert_not_called()
+
+    async def test_peer_flood_and_uncertain_send_do_not_stop_engine(self):
+        account = await self.ready_followup()
+        engine, manager = await self.tick_engine(
+            account, send_direct_message=AsyncMock(return_value={"success": False, "error": "peer_flood"})
+        )
+        await ReplyFollowups(engine).tick()
+        stored = await self.db.get_account(account["id"])
+        self.assertEqual(stored["status"], "flood")
+        remaining = (datetime.fromisoformat(stored["flood_until"]) - datetime.now()).total_seconds()
+        self.assertTrue(23 * 3600 < remaining <= 24 * 3600, remaining)
+        self.assertEqual((await self.db.get_followup_stats())["ready"], 1)
+        engine.stop.assert_not_called()
+        # An unknown outcome is terminal for this row only.
+        await self.db.update_account(account["id"], {"status": "active", "flood_until": None})
+        manager.send_direct_message.return_value = {"success": False, "error": "uncertain"}
+        logs = []
+        engine.log_callback = lambda level, text: logs.append((level, text))
+        await ReplyFollowups(engine).tick()
+        self.assertEqual((await self.db.get_followup_stats())["uncertain"], 1)
+        self.assertTrue(any(level == "ERROR" for level, _ in logs))
+        engine.stop.assert_not_called()
+
+    async def test_flood_during_history_poll_does_not_stop_engine_or_other_accounts(self):
+        first, _ = await self.seed()
+        second = await self.add_account(2)
+        await self.seed("bobby", second, user_id=456)
+        await self.db.set_setting("task_status", "running")
+        await self.db.receive_followup_reply(second["id"], 456, 11)
+        engine, flooded = await self.tick_engine(
+            first, followup_history=AsyncMock(side_effect=FloodWaitError(request=None, capture=90))
+        )
+        ready = SimpleNamespace(
+            followup_peer=AsyncMock(return_value=InputPeerUser(456, 456)),
+            send_direct_message=AsyncMock(return_value={"success": True, "message_id": 31}),
+        )
+        engine.account_managers[second["id"]] = ready
+        # Make the flooded account's waiting row the one polled.
+        async with _connect() as connection:
+            await connection.execute("UPDATE message_followups SET checked_at='' WHERE username='alice'")
+            await connection.commit()
+        await ReplyFollowups(engine).tick()
+        self.assertEqual((await self.db.get_account(first["id"]))["status"], "flood")
+        ready.send_direct_message.assert_awaited_once()
+        engine.stop.assert_not_called()
+
+    async def test_waiting_expires_after_ttl_with_reason(self):
+        account, _ = await self.seed()
+        await self.seed("bobby", account, user_id=456)
+        async with _connect() as connection:
+            old = (datetime.now() - timedelta(hours=25)).isoformat(timespec="seconds")
+            await connection.execute("UPDATE message_followups SET created_at=? WHERE username='alice'", (old,))
+            await connection.commit()
+        engine, manager = await self.tick_engine(account)
+        await ReplyFollowups(engine).tick()
+        states = {row["username"]: row["state"] for row in await self.db.get_followups(states=("waiting", "cancelled"))}
+        self.assertEqual(states, {"alice": "cancelled", "bobby": "waiting"})
+        self.assertTrue(any("Истекло ожидание ответа" in (row["message"] or "") for row in await self.db.get_logs()))
+        engine.stop.assert_not_called()
+
+    async def test_ttl_setting_is_clamped_and_respected(self):
+        account, _ = await self.seed()
+        async with _connect() as connection:
+            old = (datetime.now() - timedelta(hours=2)).isoformat(timespec="seconds")
+            await connection.execute("UPDATE message_followups SET created_at=?", (old,))
+            await connection.commit()
+        await self.db.save_campaign_settings({"followup_wait_hours": "3"})
+        engine, _ = await self.tick_engine(account)
+        self.assertEqual(await ReplyFollowups(engine).expire(), 0)
+        await self.db.save_campaign_settings({"followup_wait_hours": "1"})
+        self.assertEqual(await ReplyFollowups(engine).expire(), 1)
+        # Out-of-range and invalid values fall back to the allowed range.
+        self.assertEqual(clamp_wait_hours("0"), 1)
+        self.assertEqual(clamp_wait_hours("9999"), 168)
+        self.assertEqual(clamp_wait_hours("bad"), 24)
 
 class FollowupProtocolTests(DatabaseCase):
     async def test_peer_check_prevents_known_block_or_privacy_restriction(self):

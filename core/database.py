@@ -108,6 +108,7 @@ CAMPAIGN_SETTINGS = {
     "message_text",
     "followup_enabled",
     "followup_text",
+    "followup_wait_hours",
     "invite_order",
 }
 
@@ -2368,6 +2369,10 @@ async def init_db() -> None:
             "first_message_id INTEGER,reply_id INTEGER,random_id INTEGER,message_id INTEGER,checked_id INTEGER NOT NULL DEFAULT 0,"
             "checked_at TEXT,created_at TEXT,completed_at TEXT,UNIQUE(account_id,user_id))"
         )
+        cursor = await db.execute("PRAGMA table_info(message_followups)")
+        if "ready_at" not in {row[1] for row in await cursor.fetchall()}:
+            # Earliest time a reply-triggered second message may be sent (human-like delay).
+            await db.execute("ALTER TABLE message_followups ADD COLUMN ready_at TEXT")
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_followups_campaign_state ON message_followups(campaign_id,state)"
         )

@@ -59,6 +59,43 @@ def get_random_device() -> dict[str, str]:
     return random.choice(DEVICE_PROFILES)
 
 
+# Markers are matched against "<RPC message> <class name>" with underscores removed and upper-cased.
+_PRIVATE_RPC_MARKERS = (
+    "PRIVACY",  # USER_PRIVACY_RESTRICTED, PRIVACY_PREMIUM_REQUIRED
+    "PREMIUMREQUIRED",
+    "USERISBLOCKED",
+    "YOUBLOCKEDUSER",
+    "CHATWRITEFORBIDDEN",
+)
+_SKIP_RPC_MARKERS = (
+    "DEACTIVATED",  # USER_DEACTIVATED, INPUT_USER_DEACTIVATED
+    "USERDELETED",
+    "PEERIDINVALID",
+    "INVALIDPEER",
+    "USERIDINVALID",
+    "USERNAMENOTOCCUPIED",
+    "USERNAMEINVALID",
+    "USERISBOT",
+    "USERBOT",
+)
+
+
+def rpc_error_text(exc: BaseException) -> str:
+    """Raw Telegram RPC text (e.g. PEER_ID_INVALID) for logs; falls back to the class name."""
+    text = str(getattr(exc, "message", None) or exc).strip()
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
+def classify_recipient_rpc(exc: BaseException) -> str | None:
+    """'private' / 'skip' for a recipient-level RPC rejection, None when it is not one."""
+    haystack = f"{getattr(exc, 'message', None) or ''} {exc} {type(exc).__name__}".upper().replace("_", "")
+    if any(marker in haystack for marker in _PRIVATE_RPC_MARKERS):
+        return "private"
+    if any(marker in haystack for marker in _SKIP_RPC_MARKERS):
+        return "skip"
+    return None
+
+
 def is_followup_reply(message, user_id, first_id):
     """Only a new incoming private user message counts; edits/reactions/services do not."""
     return (
@@ -391,9 +428,17 @@ class AccountManager:
             return {"success": False, "error": "unauthorized"}
         except (UserPrivacyRestrictedError, UserIsBlockedError, YouBlockedUserError, ChatWriteForbiddenError):
             return {"success": False, "error": "private"}
-        except RPCError:
-            # Other RPC failures are conservatively treated as an unknown outcome.
-            return {"success": False, "error": "uncertain"}
+        except RPCError as exc:
+            # Telegram answered with a definite rejection: the message was not sent.
+            # Recipient-level rejections are final; anything else is a failed attempt
+            # for this recipient only. Neither must stop the whole campaign.
+            detail = rpc_error_text(exc)
+            kind = classify_recipient_rpc(exc)
+            if kind == "private":
+                return {"success": False, "error": "private", "message": detail}
+            if kind == "skip":
+                return {"success": False, "error": "skip", "message": detail}
+            return {"success": False, "error": "error", "message": detail}
         except (asyncio.TimeoutError, OSError):
             return {"success": False, "error": "uncertain"}
 

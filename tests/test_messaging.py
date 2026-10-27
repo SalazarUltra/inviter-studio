@@ -1,11 +1,12 @@
 import asyncio
 import sqlite3
 from contextlib import closing
-from datetime import date
+from datetime import date, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from telethon.errors import (
+    AuthKeyUnregisteredError,
     FloodWaitError,
     PeerFloodError,
     RPCError,
@@ -187,7 +188,9 @@ class MessagingTests(DatabaseCase):
             self.assertEqual((await self.db.get_targets_stats())["skipped"], 1)
             self.assertEqual((await self.db.get_account(account["id"]))["status"], "active")
             self.assertEqual(manager.send_direct_message.await_count, 1)
-            self.assertEqual(engine._wait.await_count, 0)
+            # not_found paces the queue before the next claim
+            self.assertEqual(engine._wait.await_count, 1)
+            self.assertTrue(2 <= engine._wait.await_args_list[0].args[0] <= 5)
             logs = await self.db.get_logs()
             self.assertTrue(any(row["action"] == "MESSAGE_NOT_FOUND" for row in logs))
             await self.db.bulk_insert_targets(["bobby"])
@@ -199,16 +202,19 @@ class MessagingTests(DatabaseCase):
         engine = await self.setup_campaign(["alice", "bobby"])
         account = await self.add_account()
         manager = self.manager(account)
-        failures = [asyncio.TimeoutError(), ConnectionError("reset"), OSError("net"), RPCError(None, "x", 500)]
+        failures = {
+            "alice": [asyncio.TimeoutError(), ConnectionError("reset")],
+            "bobby": [OSError("net"), RPCError(None, "x", 500)],
+        }
 
         async def resolve(username):
-            if failures:
-                raise failures.pop(0)
+            if failures[username]:
+                raise failures[username].pop(0)
             return User(id=123 if username == "alice" else 456)
 
         manager.resolve_recipient.side_effect = resolve
         with patch("core.messenger.AccountManager", return_value=manager):
-            await asyncio.wait_for(engine.start([account], "Hello", 10, 10), 3)
+            await asyncio.wait_for(engine.start([account], "Hello", 10, 10), 15)
         stats = await self.db.get_targets_stats()
         self.assertEqual((stats["sent"], stats["pending"]), (2, 0))
         self.assertEqual(self.reports[0]["outcome"], "completed")
@@ -217,18 +223,72 @@ class MessagingTests(DatabaseCase):
         self.assertEqual(sum(row["action"] == "RESOLVE_RETRY" for row in logs), 4)
         self.assertEqual((await self.db.get_account(account["id"]))["status"], "active")
 
-    async def test_persistent_transient_errors_stop_safely_and_keep_target_pending(self):
-        engine = await self.setup_campaign(["alice"])
+    async def test_network_outage_across_targets_stops_safely_and_keeps_rest_pending(self):
+        names = [f"person_{i}" for i in range(7)]
+        engine = await self.setup_campaign(names)
         account = await self.add_account()
         manager = self.manager(account)
         manager.resolve_recipient.side_effect = asyncio.TimeoutError()
         with patch("core.messenger.AccountManager", return_value=manager):
-            await asyncio.wait_for(engine.start([account], "Hello", 10, 10), 3)
-        self.assertEqual(manager.resolve_recipient.await_count, engine.MAX_TRANSIENT_FAILURES)
+            await asyncio.wait_for(engine.start([account], "Hello", 10, 10), 15)
+        # Earlier targets exhaust their own retries (marked error); the global streak counts
+        # distinct failing targets and stops the run at the MAX_TRANSIENT_FAILURES-th one.
+        given_up = engine.MAX_TRANSIENT_FAILURES - 1
+        self.assertEqual(
+            manager.resolve_recipient.await_count, given_up * engine.MAX_RESOLVE_RETRIES + 1
+        )
         manager.send_direct_message.assert_not_awaited()
-        self.assertEqual((await self.db.get_targets_stats())["pending"], 1)
+        stats = await self.db.get_targets_stats()
+        self.assertEqual(stats["pending"], 7 - given_up)
         self.assertEqual(self.reports[0]["outcome"], "failed")
         self.assertEqual((await self.db.get_account(account["id"]))["status"], "active")
+
+    async def test_target_exhausting_resolve_retries_is_marked_error_and_queue_continues(self):
+        engine = await self.setup_campaign(["alice", "bobby"])
+        account = await self.add_account()
+        manager = self.manager(account)
+
+        async def resolve(username):
+            if username == "alice":
+                raise asyncio.TimeoutError()
+            return User(id=456)
+
+        manager.resolve_recipient.side_effect = resolve
+        with patch("core.messenger.AccountManager", return_value=manager):
+            await asyncio.wait_for(engine.start([account], "Hello", 10, 10), 15)
+        rows = {row["username"]: row["status"] for row in await self.db.get_targets()}
+        self.assertEqual(rows, {"alice": "error", "bobby": "sent"})
+        alice_attempts = [
+            call for call in manager.resolve_recipient.await_args_list if call.args[0] == "alice"
+        ]
+        self.assertEqual(len(alice_attempts), engine.MAX_RESOLVE_RETRIES)
+        self.assertEqual(self.reports[0]["outcome"], "completed")
+        self.assertEqual(self.reports[0]["errors"], 1)
+        self.assertEqual(engine._resolve_retries, {})
+        logs = await self.db.get_logs()
+        self.assertEqual(sum(row["action"] == "RESOLVE_RETRY" for row in logs), engine.MAX_RESOLVE_RETRIES - 1)
+        self.assertTrue(any(row["action"] == "RESOLVE_FAILED" for row in logs))
+        # last wait before bobby is the 2-5 s pause after the give-up
+        self.assertTrue(any(2 <= call.args[0] <= 5 for call in engine._wait.await_args_list))
+
+    async def test_permanent_resolve_rpc_is_not_found_and_continues(self):
+        engine = await self.setup_campaign(["ghost", "alice"])
+        account = await self.add_account()
+        manager = self.manager(account)
+
+        async def resolve(username):
+            if username == "ghost":
+                raise RPCError(None, "PEER_ID_INVALID", 400)
+            return User(id=123)
+
+        manager.resolve_recipient.side_effect = resolve
+        with patch("core.messenger.AccountManager", return_value=manager):
+            await asyncio.wait_for(engine.start([account], "Hello", 10, 10), 3)
+        rows = {row["username"]: row["status"] for row in await self.db.get_targets()}
+        self.assertEqual(rows, {"ghost": "not_found", "alice": "sent"})
+        self.assertEqual(manager.resolve_recipient.await_count, 2)
+        self.assertTrue(2 <= engine._wait.await_args_list[0].args[0] <= 5)
+        self.assertEqual(self.reports[0]["outcome"], "completed")
 
     async def test_global_journal_survives_clear_and_other_campaign(self):
         engine = await self.setup_campaign(["alice"])
@@ -358,39 +418,161 @@ class MessagingTests(DatabaseCase):
         self.assertEqual((await self.db.get_targets())[0]["status"], "uncertain")
         self.assertEqual(await self.db.delivery_exists("alice"), "uncertain")
 
-    async def test_peer_flood_stops_all_accounts(self):
+    def per_account_managers(self, accounts, **overrides):
+        managers = {account["id"]: self.manager(account) for account in accounts}
+        for account_id, configure in overrides.items():
+            configure(managers[account_id])
+        return managers, (lambda account, db: managers[account["id"]])
+
+    async def test_peer_flood_pauses_only_that_account_and_rotates(self):
         engine = await self.setup_campaign(["alice", "bobby"])
         accounts = [await self.add_account(i + 1) for i in range(2)]
-        manager = self.manager(accounts[0])
+        managers, factory = self.per_account_managers(accounts)
+        managers[accounts[0]["id"]].send_direct_message.return_value = {"success": False, "error": "peer_flood"}
+        with patch("core.messenger.AccountManager", side_effect=factory):
+            await asyncio.wait_for(engine.start(accounts, "Hello", 10, 10), 5)
+        managers[accounts[0]["id"]].send_direct_message.assert_awaited_once()
+        self.assertEqual(managers[accounts[1]["id"]].send_direct_message.await_count, 2)
+        flooded = await self.db.get_account(accounts[0]["id"])
+        # Timed 24h cooldown like the inviter, not a permanent "restricted" status.
+        self.assertEqual(flooded["status"], "flood")
+        remaining = (datetime.fromisoformat(flooded["flood_until"]) - datetime.now()).total_seconds()
+        self.assertGreater(remaining, 23 * 3600)
+        self.assertEqual((await self.db.get_targets_stats())["sent"], 2)
+        self.assertEqual(self.reports[0]["outcome"], "completed")
+        self.assertTrue(
+            any(row[0] == "WARN" and accounts[0]["phone"] in row[1] and "остальные" in row[1] for row in self.events)
+        )
+        self.assertTrue(any(row["action"] == "MESSAGE_ACCOUNT_PAUSED" for row in await self.db.get_logs()))
+
+    async def test_peer_flood_on_last_usable_account_stops_and_keeps_targets_pending(self):
+        engine = await self.setup_campaign(["alice", "bobby"])
+        account = await self.add_account()
+        manager = self.manager(account)
         manager.send_direct_message.return_value = {"success": False, "error": "peer_flood"}
         with patch("core.messenger.AccountManager", return_value=manager):
-            await engine.start(accounts, "Hello", 10, 10)
+            await asyncio.wait_for(engine.start([account], "Hello", 10, 10), 5)
         manager.send_direct_message.assert_awaited_once()
-        self.assertEqual((await self.db.get_account(accounts[0]["id"]))["status"], "restricted")
+        self.assertEqual((await self.db.get_account(account["id"]))["status"], "flood")
         self.assertEqual((await self.db.get_targets_stats())["pending"], 2)
         self.assertIsNone(await self.db.delivery_exists("alice"))
-        report = await preflight(self.db, [accounts[0]["id"]], "", mode="messages", message="Hello")
-        self.assertFalse(report["ok"])
-        account_check = next(row for row in report["checks"] if row["label"] == accounts[0]["phone"])
-        self.assertIn("Telegram отклонил", account_check["detail"])
-        self.assertTrue(
-            any(
-                row["action"] == "MESSAGE_STOPPED" and "Telegram отклонил" in row["message"]
-                for row in await self.db.get_logs()
-            )
-        )
+        self.assertEqual(self.reports[0]["outcome"], "failed")
+        self.assertTrue(any(row[0] == "ERROR" and "длительной паузе" in row[1] for row in self.events))
 
-    async def test_flood_wait_stops_queue_without_retrying_other_account(self):
+    async def test_flood_wait_on_send_rotates_to_second_account(self):
         engine = await self.setup_campaign(["alice", "bobby"])
         accounts = [await self.add_account(i + 1) for i in range(2)]
-        manager = self.manager(accounts[0])
-        manager.send_direct_message.return_value = {"success": False, "error": "flood", "flood_seconds": 42}
-        with patch("core.messenger.AccountManager", return_value=manager):
-            await engine.start(accounts, "Hello", 10, 10)
-        manager.send_direct_message.assert_awaited_once()
+        managers, factory = self.per_account_managers(accounts)
+        managers[accounts[0]["id"]].send_direct_message.return_value = {
+            "success": False,
+            "error": "flood",
+            "flood_seconds": 3600 * 3,
+        }
+        with patch("core.messenger.AccountManager", side_effect=factory):
+            await asyncio.wait_for(engine.start(accounts, "Hello", 10, 10), 5)
+        managers[accounts[0]["id"]].send_direct_message.assert_awaited_once()
+        self.assertEqual(managers[accounts[1]["id"]].send_direct_message.await_count, 2)
         self.assertEqual((await self.db.get_account(accounts[0]["id"]))["status"], "flood")
+        self.assertEqual((await self.db.get_targets_stats())["sent"], 2)
+        self.assertEqual(self.reports[0]["outcome"], "completed")
+
+    async def test_flood_wait_on_resolve_rotates_to_second_account(self):
+        engine = await self.setup_campaign(["alice", "bobby"])
+        accounts = [await self.add_account(i + 1) for i in range(2)]
+        managers, factory = self.per_account_managers(accounts)
+        managers[accounts[0]["id"]].resolve_recipient.side_effect = FloodWaitError(None, capture=3 * 3600)
+        with patch("core.messenger.AccountManager", side_effect=factory):
+            await asyncio.wait_for(engine.start(accounts, "Hello", 10, 10), 5)
+        managers[accounts[0]["id"]].send_direct_message.assert_not_awaited()
+        self.assertEqual(managers[accounts[1]["id"]].send_direct_message.await_count, 2)
+        self.assertEqual((await self.db.get_account(accounts[0]["id"]))["status"], "flood")
+        self.assertEqual((await self.db.get_targets_stats())["sent"], 2)
+        self.assertEqual(self.reports[0]["outcome"], "completed")
+
+    async def test_unauthorized_account_is_dropped_and_other_account_continues(self):
+        engine = await self.setup_campaign(["alice", "bobby"])
+        accounts = [await self.add_account(i + 1) for i in range(2)]
+        managers, factory = self.per_account_managers(accounts)
+        managers[accounts[0]["id"]].resolve_recipient.side_effect = AuthKeyUnregisteredError(None)
+        with patch("core.messenger.AccountManager", side_effect=factory):
+            await asyncio.wait_for(engine.start(accounts, "Hello", 10, 10), 5)
+        self.assertEqual((await self.db.get_account(accounts[0]["id"]))["status"], "unauthorized")
+        self.assertEqual(managers[accounts[1]["id"]].send_direct_message.await_count, 2)
+        self.assertEqual((await self.db.get_targets_stats())["sent"], 2)
+        self.assertEqual(self.reports[0]["outcome"], "completed")
+
+    async def test_unauthorized_on_send_rotates_and_last_account_stops(self):
+        engine = await self.setup_campaign(["alice", "bobby"])
+        accounts = [await self.add_account(i + 1) for i in range(2)]
+        managers, factory = self.per_account_managers(accounts)
+        for manager in managers.values():
+            manager.send_direct_message.return_value = {"success": False, "error": "unauthorized"}
+        with patch("core.messenger.AccountManager", side_effect=factory):
+            await asyncio.wait_for(engine.start(accounts, "Hello", 10, 10), 5)
+        for account in accounts:
+            self.assertEqual((await self.db.get_account(account["id"]))["status"], "unauthorized")
         self.assertEqual((await self.db.get_targets_stats())["pending"], 2)
         self.assertIsNone(await self.db.delivery_exists("alice"))
+        self.assertEqual(self.reports[0]["outcome"], "failed")
+
+    async def test_rpc_rejection_on_send_is_error_and_campaign_continues(self):
+        engine = await self.setup_campaign(["alice", "bobby"])
+        account = await self.add_account()
+        manager = self.manager(account)
+        manager.send_direct_message.side_effect = [
+            {"success": False, "error": "error", "message": "RPCError: SOME_REJECTION"},
+            {"success": True, "message_id": 8},
+        ]
+        with patch("core.messenger.AccountManager", return_value=manager):
+            await asyncio.wait_for(engine.start([account], "Hello", 10, 10), 3)
+        self.assertEqual(manager.send_direct_message.await_count, 2)
+        rows = {row["username"]: row["status"] for row in await self.db.get_targets()}
+        self.assertEqual(rows, {"alice": "error", "bobby": "sent"})
+        # Definite rejection: no delivery stays reserved/uncertain, so the target can be retried later.
+        self.assertIsNone(await self.db.delivery_exists("alice"))
+        self.assertEqual(self.reports[0]["outcome"], "completed")
+        self.assertEqual(self.reports[0]["errors"], 1)
+        self.assertTrue(
+            any(row["action"] == "MESSAGE_ERROR" and "SOME_REJECTION" in row["message"] for row in await self.db.get_logs())
+        )
+        self.assertEqual(await self.db.reset_failed_targets(["error"]), 1)
+
+    async def test_deactivated_recipient_on_send_is_skipped_and_campaign_continues(self):
+        engine = await self.setup_campaign(["alice", "bobby"])
+        account = await self.add_account()
+        manager = self.manager(account)
+        manager.send_direct_message.side_effect = [
+            {"success": False, "error": "skip", "message": "RPCError: USER_DEACTIVATED"},
+            {"success": True, "message_id": 8},
+        ]
+        with patch("core.messenger.AccountManager", return_value=manager):
+            await asyncio.wait_for(engine.start([account], "Hello", 10, 10), 3)
+        rows = {row["username"]: row["status"] for row in await self.db.get_targets()}
+        self.assertEqual(rows, {"alice": "not_found", "bobby": "sent"})
+        self.assertIsNone(await self.db.delivery_exists("alice"))
+        self.assertTrue(any(row["action"] == "MESSAGE_SKIP" for row in await self.db.get_logs()))
+        self.assertEqual(self.reports[0]["outcome"], "completed")
+
+    async def test_real_rpc_rejection_from_account_manager_does_not_stop_campaign(self):
+        engine = await self.setup_campaign(["alice", "bobby"])
+        account = await self.add_account()
+        real = AccountManager(account_payload())
+        calls = []
+
+        async def request(req, *args, **kwargs):
+            calls.append(req)
+            if len(calls) == 1:
+                raise RPCError(None, "MESSAGE_EMPTY_OR_WHATEVER", 400)
+            return SimpleNamespace(id=9)
+
+        real.client = AsyncMock(side_effect=request)
+        manager = self.manager(account)
+        manager.send_direct_message.side_effect = real.send_direct_message
+        with patch("core.messenger.AccountManager", return_value=manager):
+            await asyncio.wait_for(engine.start([account], "Hello", 10, 10), 3)
+        rows = {row["username"]: row["status"] for row in await self.db.get_targets()}
+        self.assertEqual(rows, {"alice": "error", "bobby": "sent"})
+        self.assertEqual(self.reports[0]["outcome"], "completed")
 
     async def test_expired_flood_status_is_cleared(self):
         engine = await self.setup_campaign([])
@@ -472,7 +654,14 @@ class MessagingTests(DatabaseCase):
             (FloodWaitError(None, capture=42), "flood"),
             (PeerFloodError(None), "peer_flood"),
             (UserPrivacyRestrictedError(None), "private"),
+            (RPCError(None, "PRIVACY_PREMIUM_REQUIRED", 403), "private"),
+            (RPCError(None, "USER_IS_BLOCKED", 403), "private"),
+            (RPCError(None, "PEER_ID_INVALID", 400), "skip"),
+            (RPCError(None, "INPUT_USER_DEACTIVATED", 400), "skip"),
+            (RPCError(None, "SOMETHING_UNKNOWN", 400), "error"),
+            (RPCError(None, "INTERNAL", 500), "error"),
             (OSError("network"), "uncertain"),
+            (asyncio.TimeoutError(), "uncertain"),
         ):
             manager.client = AsyncMock(side_effect=exception)
             self.assertEqual((await manager.send_direct_message(User(id=123), "Hello", 321))["error"], expected)

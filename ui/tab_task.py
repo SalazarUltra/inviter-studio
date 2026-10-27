@@ -477,6 +477,16 @@ class TaskTab(ctk.CTkFrame):
             "Держите задачу запущенной, пока ждёте ответы. После выхода запустите её вручную. "
             "Изменение текста применяется к новым первым сообщениям; уже ожидающие сохраняют прежний второй текст.",
         )
+        wait_row = ctk.CTkFrame(self.followup_frame, fg_color="transparent")
+        wait_row.pack(fill="x", padx=16, pady=(0, 8))
+        ctk.CTkLabel(wait_row, text="Ждать ответ, часов", font=FONTS["body"]).pack(side="left")
+        self.followup_wait_entry = ctk.CTkEntry(wait_row, width=70, height=32)
+        setup_entry(self.followup_wait_entry)
+        self.followup_wait_entry.insert(0, "24")
+        self.followup_wait_entry.pack(side="left", padx=(8, 8))
+        ctk.CTkLabel(wait_row, text="1–168. Без ответа второе сообщение отменяется", font=FONTS["small"]).pack(
+            side="left"
+        )
         self.followup_status = hint(self.message_frame, "Вторые сообщения: ожиданий нет")
         self.cancel_followups_btn = ctk.CTkButton(
             self.message_frame, text="Отменить ожидающие вторые сообщения", height=30, command=self.cancel_followups
@@ -897,7 +907,13 @@ class TaskTab(ctk.CTkFrame):
             if isinstance(widget, ctk.CTkButton):
                 widget.configure(state=input_state)
         followup_state = "disabled" if running or self._starting else "normal"
-        for widget in (self.followup_switch, self.followup_box, self.paste_followup_btn, self.cancel_followups_btn):
+        for widget in (
+            self.followup_switch,
+            self.followup_box,
+            self.paste_followup_btn,
+            self.cancel_followups_btn,
+            self.followup_wait_entry,
+        ):
             widget.configure(state=followup_state)
         for name in ("select_all_button", "select_none_button"):
             button = getattr(self, name, None)
@@ -990,6 +1006,11 @@ class TaskTab(ctk.CTkFrame):
                     validate_message(self.followup_box.get("1.0", "end-1c"))
                 except ValueError as exc:
                     raise ValueError("Второе сообщение: " + str(exc)) from None
+        followup_wait_hours = self.followup_wait_entry.get().strip() or "24"
+        if self.followup_enabled.get() and not (
+            followup_wait_hours.isdigit() and 1 <= int(followup_wait_hours) <= 168
+        ):
+            raise ValueError("«Ждать ответ, часов»: целое число от 1 до 168")
         try:
             interval_min = int(self.interval_min_entry.get().strip())
             interval_max = int(self.interval_max_entry.get().strip())
@@ -1007,6 +1028,7 @@ class TaskTab(ctk.CTkFrame):
             "message_text": message,
             "followup_enabled": "1" if self.followup_enabled.get() else "0",
             "followup_text": self.followup_box.get("1.0", "end-1c"),
+            "followup_wait_hours": followup_wait_hours if followup_wait_hours.isdigit() else "24",
             "interval_min": str(interval_min),
             "interval_max": str(interval_max),
             "schedule_enabled": "1" if self.schedule_enabled.get() else "0",
@@ -1046,6 +1068,7 @@ class TaskTab(ctk.CTkFrame):
             "message_text": "",
             "followup_text": "",
             "followup_enabled": "0",
+            "followup_wait_hours": "24",
             "schedule_enabled": "0",
             "schedule_from": "13:00",
             "schedule_to": "21:00",
@@ -1095,6 +1118,7 @@ class TaskTab(ctk.CTkFrame):
                     ("target_chat", self.chat_entry),
                     ("interval_min", self.interval_min_entry),
                     ("interval_max", self.interval_max_entry),
+                    ("followup_wait_hours", self.followup_wait_entry),
                     ("schedule_from", self.schedule_from_entry),
                     ("schedule_to", self.schedule_to_entry),
                     ("protection_consecutive", self.consecutive_entry),
@@ -1382,6 +1406,36 @@ class TaskTab(ctk.CTkFrame):
             self.pause_btn.configure(text="Продолжить")
 
     def stop_task(self) -> None:
+        if not self.scheduler.is_running() or getattr(self, "_stop_confirming", False):
+            return
+        if self.operation_mode() != "messages" or not self.followup_enabled.get():
+            self._stop_task_now()
+            return
+        # Stopping cancels every waiting second message: ask first, but never block the UI thread.
+        self._stop_confirming = True
+        db = self.db
+        future = self.run_coro(db.get_followup_stats())
+
+        def done(result):
+            def render():
+                self._stop_confirming = False
+                pending = 0
+                if not result.cancelled() and not result.exception():
+                    stats = result.result()
+                    pending = stats.get("waiting", 0) + stats.get("ready", 0)
+                if pending > 0 and not messagebox.askyesno(
+                    "Остановить задачу?",
+                    f"Остановить задачу? Ожидание вторых сообщений ({pending}) будет отменено.",
+                    parent=self.app,
+                ):
+                    return
+                self._stop_task_now()
+
+            self._safe_after(render)
+
+        future.add_done_callback(done)
+
+    def _stop_task_now(self) -> None:
         if not self.scheduler.is_running():
             return
         self.scheduler.stop()

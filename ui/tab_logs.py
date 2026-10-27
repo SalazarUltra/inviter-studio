@@ -52,6 +52,11 @@ ACTION_LABELS = {
     "MESSAGE_NOT_FOUND": "Получатель не найден",
     "MESSAGE_UNCERTAIN": "Результат отправки требует проверки",
     "MESSAGE_STOPPED": "Отправка остановлена Telegram",
+    "MESSAGE_SKIP": "Получатель недоступен",
+    "MESSAGE_ERROR": "Telegram отклонил отправку",
+    "MESSAGE_ACCOUNT_PAUSED": "Аккаунт приостановлен",
+    "RESOLVE_RETRY": "Повторная проверка получателя",
+    "RESOLVE_FAILED": "Получатель не удалось проверить",
 }
 MESSAGE_LABELS = {
     "Account connected": "Рабочее соединение открыто; аккаунт сохранён",
@@ -68,12 +73,23 @@ LOG_FILTERS = {
         "FLOOD_WAIT",
         "MESSAGE_UNCERTAIN",
         "MESSAGE_STOPPED",
+        "MESSAGE_ERROR",
+        "MESSAGE_ACCOUNT_PAUSED",
+        "RESOLVE_RETRY",
+        "RESOLVE_FAILED",
         "CONNECT_FAILED",
         "FOLLOWUP_UNCERTAIN",
     },
     "Ожидание ответа": {"FOLLOWUP_WAIT", "FOLLOWUP_REPLY"},
     "Успешные действия": {"ADD_SUCCESS", "MESSAGE_SENT", "FOLLOWUP_SENT"},
-    "Пропуски": {"SKIP", "MESSAGE_PRIVATE", "MESSAGE_NOT_FOUND", "FOLLOWUP_BLOCKED", "FOLLOWUP_CANCELLED"},
+    "Пропуски": {
+        "SKIP",
+        "MESSAGE_PRIVATE",
+        "MESSAGE_NOT_FOUND",
+        "MESSAGE_SKIP",
+        "FOLLOWUP_BLOCKED",
+        "FOLLOWUP_CANCELLED",
+    },
 }
 
 
@@ -266,6 +282,10 @@ class LogsTab(ctk.CTkFrame):
                         "MESSAGE_NOT_FOUND": "SKIP",
                         "MESSAGE_UNCERTAIN": "ERROR",
                         "MESSAGE_STOPPED": "FLOOD",
+                        "MESSAGE_SKIP": "SKIP",
+                        "MESSAGE_ERROR": "ERROR",
+                        "MESSAGE_ACCOUNT_PAUSED": "FLOOD",
+                        "RESOLVE_FAILED": "ERROR",
                         "CONNECT_FAILED": "ERROR",
                     }.get(action, "INFO")
                     self.log_box.insert(

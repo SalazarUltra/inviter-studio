@@ -1,10 +1,27 @@
 """Durable, one-time second messages bound to a confirmed first delivery."""
 
+import random
 import secrets
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import aiosqlite
+
+
+# A reply must never trigger an instant answer: wait a human-like random time first.
+FOLLOWUP_DELAY_RANGE = (30, 180)
+FOLLOWUP_WAIT_HOURS_DEFAULT = 24
+FOLLOWUP_WAIT_HOURS_RANGE = (1, 168)
+EXPIRED_REASON = "Истекло ожидание ответа"
+
+
+def clamp_wait_hours(value):
+    try:
+        hours = int(float(value))
+    except (TypeError, ValueError):
+        hours = FOLLOWUP_WAIT_HOURS_DEFAULT
+    low, high = FOLLOWUP_WAIT_HOURS_RANGE
+    return max(low, min(high, hours))
 
 
 @asynccontextmanager
@@ -30,7 +47,9 @@ async def note(db, row, action, text):
 
 
 class FollowupStore:
-    async def get_followups(self, states=("waiting", "ready"), account_ids=None, *, limit=None, per_account=False):
+    async def get_followups(
+        self, states=("waiting", "ready"), account_ids=None, *, limit=None, per_account=False, due_at=None
+    ):
         if not states or account_ids is not None and not account_ids:
             return []
         sql = "SELECT * FROM message_followups WHERE campaign_id=? AND state IN (" + ",".join("?" for _ in states) + ")"
@@ -41,6 +60,10 @@ class FollowupStore:
                 1,
             )
         params = [self.campaign_id, *states]
+        if due_at is not None:
+            # Ready rows are only deliverable once their reply delay has elapsed.
+            sql += " AND (state!='ready' OR ready_at IS NULL OR ready_at<=?)"
+            params.append(due_at)
         if account_ids is not None:
             sql += " AND account_id IN (" + ",".join("?" for _ in account_ids) + ")"
             params.extend(account_ids)
@@ -90,10 +113,11 @@ class FollowupStore:
             if not row:
                 await db.commit()
                 return False
+            ready_at = datetime.now() + timedelta(seconds=random.uniform(*FOLLOWUP_DELAY_RANGE))
             await db.execute(
-                "UPDATE message_followups SET state='ready',reply_id=? "
+                "UPDATE message_followups SET state='ready',reply_id=?,ready_at=? "
                 "WHERE campaign_id=? AND username=? AND state='waiting'",
-                (message_id, self.campaign_id, row["username"]),
+                (message_id, ready_at.isoformat(timespec="microseconds"), self.campaign_id, row["username"]),
             )
             await note(db, row, "FOLLOWUP_REPLY", "Получен ответ. Второе сообщение ожидает отправки")
             await db.commit()
@@ -107,6 +131,29 @@ class FollowupStore:
                 (datetime.now().isoformat(timespec="microseconds"), last_id, self.campaign_id, username),
             )
             await db.commit()
+
+    async def expire_followups(self, wait_hours):
+        """Cancel still-waiting second messages whose first message is older than the reply TTL."""
+        cutoff = (datetime.now() - timedelta(hours=clamp_wait_hours(wait_hours))).isoformat(timespec="seconds")
+        async with connection() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            rows = await (
+                await db.execute(
+                    "SELECT * FROM message_followups WHERE campaign_id=? AND state='waiting' "
+                    "AND created_at IS NOT NULL AND created_at<?",
+                    (self.campaign_id, cutoff),
+                )
+            ).fetchall()
+            now = datetime.now().isoformat()
+            for row in rows:
+                await db.execute(
+                    "UPDATE message_followups SET state='cancelled',completed_at=? "
+                    "WHERE campaign_id=? AND username=? AND state='waiting'",
+                    (now, self.campaign_id, row["username"]),
+                )
+                await note(db, row, "FOLLOWUP_CANCELLED", EXPIRED_REASON)
+            await db.commit()
+            return len(rows)
 
     async def claim_followup(self, username):
         async with connection() as db:
