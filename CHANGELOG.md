@@ -8,6 +8,52 @@ Releases are portable-only (ZIP + SHA-256), unsigned.
 
 ## [Unreleased]
 
+## [1.2.31] — 2026-10-27
+
+### Добавлено
+- Прогрев нескольких аккаунтов параллельно: переключите аккаунт и снова «Запустить»; список активных и «Остановить все». / Parallel warm-up for several accounts; active list and Stop all.
+
+### Изменено
+- Промпт прогрева: универсальный для любых чатов; тон без «крипто»-уклона; тематика — мягкий ориентир, приоритет у живой переписки. / Warm-up AI prompt is chat-agnostic; topic is a soft hint.
+
+## [1.2.30] — 2026-10-27
+
+### Добавлено
+- Прогрев: блок «Активный текстовый сценарий» с уровнем, тематикой, тоном и лимитами. / Warm-up shows the active text scenario and parameters.
+- AI-студия и прогрев: оценка стоимости запроса и суммы в USD по токенам (публичные тарифы). / Estimated request and total USD cost from tokens.
+
+### Изменено
+- Прогрев: в списке аккаунтов имя и @username; тон (нейтральный/дружелюбный/экспертный) влияет на стиль AI-писем. / Warm-up account menu shows name/@; tone steers writing style.
+- Прогрев: оставшиеся подписи UI на EN/RU. / Remaining Warm-up chrome bilingual.
+
+## [1.2.29] — 2026-10-27
+
+### Изменено
+- Парсинг: в «Несколько аккаунтов» показываются имя и @username; в «Мои группы» — чей это чат. / Multi-account checklist shows name/@; My groups labels show owning account.
+- Полный EN для экрана парсинга (источники, фильтры, периоды, экспорт) при смене языка. / Full Parsing tab EN coverage on language switch.
+
+## [1.2.28] — 2026-10-27
+
+### Изменено
+- Обзор полностью на EN/RU при смене языка; профили Custom/Normal тоже. / Overview fully bilingual; profile/density menus translated.
+- В списке аккаунтов на Обзоре показывается имя Telegram. / Dashboard account list shows Telegram name.
+- Реже обновляется Обзор (только на открытой вкладке). / Overview refreshes only while open.
+
+## [1.2.27] — 2026-10-27
+
+### Добавлено
+- В карточке аккаунта показывается имя и @username из Telegram (после входа или «Проверить»). / Account cards show Telegram name and @username.
+
+### Изменено
+- EN: заголовки основных вкладок и ключевые кнопки парсинга/аккаунтов переводятся при смене языка. / More EN coverage for main tab chrome.
+- Светлая тема: контрастнее палитра, корректный текст на accent-кнопках, Treeview и перекраска после переключения. / Light theme contrast and restyle fixes.
+- Меньше подтормаживаний: debounce фильтра аккаунтов, опрос статистики только при активной задаче. / Less UI stutter.
+
+## [1.2.26] — 2026-10-27
+
+### Добавлено
+- Парсинг: кнопка «В бот (TXT)» — по желанию отправить отфильтрованный сегмент TXT-файлом в своего Telegram-бота (sendDocument). / Optional “To bot (TXT)” for parsed results via the user's own bot.
+
 ## [1.2.25] — 2026-10-27
 
 ### Добавлено
@@ -75,7 +121,13 @@ Releases are portable-only (ZIP + SHA-256), unsigned.
 - `start.bat` сам снимает блокировку «скачано из интернета» (`Unblock-File`). / Auto-unblock on launch.
 - Пользовательские данные (`profile`, `data`, `sessions`, `*.db`, `.env`) не попадают ни в git, ни в ZIP; сборка проверяет это. / User data never ships.
 
-[Unreleased]: https://github.com/SalazarUltra/inviter-studio/compare/v1.2.25...HEAD
+[Unreleased]: https://github.com/SalazarUltra/inviter-studio/compare/v1.2.31...HEAD
+[1.2.31]: https://github.com/SalazarUltra/inviter-studio/releases/tag/v1.2.31
+[1.2.30]: https://github.com/SalazarUltra/inviter-studio/releases/tag/v1.2.30
+[1.2.29]: https://github.com/SalazarUltra/inviter-studio/releases/tag/v1.2.29
+[1.2.28]: https://github.com/SalazarUltra/inviter-studio/releases/tag/v1.2.28
+[1.2.27]: https://github.com/SalazarUltra/inviter-studio/releases/tag/v1.2.27
+[1.2.26]: https://github.com/SalazarUltra/inviter-studio/releases/tag/v1.2.26
 [1.2.25]: https://github.com/SalazarUltra/inviter-studio/releases/tag/v1.2.25
 [1.2.24]: https://github.com/SalazarUltra/inviter-studio/releases/tag/v1.2.24
 [1.2.23]: https://github.com/SalazarUltra/inviter-studio/releases/tag/v1.2.23

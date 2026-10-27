@@ -9,10 +9,15 @@ from ui.theme import COLORS, FONTS, apply_button_role
 def page_intro(parent, title, description, kicker=None):
     header = ctk.CTkFrame(parent, fg_color="transparent")
     header.pack(fill="x", padx=20, pady=(18, 18))
+    header._intro_kicker = None
     if kicker:
-        ctk.CTkLabel(header, text=kicker, font=FONTS["label"], text_color=COLORS["accent"], height=20).pack(anchor="w")
-    ctk.CTkLabel(header, text=title, font=FONTS["heading"], text_color=COLORS["text"]).pack(anchor="w")
-    ctk.CTkLabel(
+        header._intro_kicker = ctk.CTkLabel(
+            header, text=kicker, font=FONTS["label"], text_color=COLORS["accent"], height=20
+        )
+        header._intro_kicker.pack(anchor="w")
+    header._intro_title = ctk.CTkLabel(header, text=title, font=FONTS["heading"], text_color=COLORS["text"])
+    header._intro_title.pack(anchor="w")
+    header._intro_description = ctk.CTkLabel(
         header,
         text=description,
         font=FONTS["small"],
@@ -20,8 +25,19 @@ def page_intro(parent, title, description, kicker=None):
         anchor="w",
         justify="left",
         wraplength=640,
-    ).pack(anchor="w", pady=(4, 0))
+    )
+    header._intro_description.pack(anchor="w", pady=(4, 0))
     return header
+
+
+def set_page_intro(header, *, title=None, description=None, kicker=None) -> None:
+    """Update a header created by ``page_intro`` after a language switch."""
+    if title is not None and getattr(header, "_intro_title", None) is not None:
+        header._intro_title.configure(text=title)
+    if description is not None and getattr(header, "_intro_description", None) is not None:
+        header._intro_description.configure(text=description)
+    if kicker is not None and getattr(header, "_intro_kicker", None) is not None:
+        header._intro_kicker.configure(text=kicker)
 
 
 def empty_state(parent, title, description, icon_name="layers", action=None):

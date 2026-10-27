@@ -12,7 +12,8 @@ from core.database import Database
 from core.export import write_logs, write_logs_xlsx
 from core.user_feedback import explain_error
 from ui.campaigns import CampaignBar
-from ui.components import page_intro
+from ui.components import page_intro, set_page_intro
+from ui.i18n import t
 from ui.dispatch import post_ui
 from ui.theme import COLORS, FONTS, bind_text_tags, init_fonts, style_card
 
@@ -94,7 +95,18 @@ LOG_FILTERS = {
 
 
 def display_log_message(message):
+    from ui.i18n import t
+
     value = str(message or "")
+    known = {
+        "Account connected": t("log.msg.opened"),
+        "Account disconnected": t("log.msg.closed"),
+        "Рабочее соединение открыто; аккаунт сохранён": t("log.msg.opened"),
+        "Рабочее соединение закрыто; аккаунт сохранён": t("log.msg.closed"),
+        "Приложение закрывалось; фоновые соединения останавливаются": t("log.msg.closing"),
+    }
+    if value in known:
+        return known[value]
     if value.startswith("PeerFlood:"):
         return value.replace("PeerFlood:", "Telegram отклонил отправку:", 1)
     if value.startswith("FloodWait:"):
@@ -103,6 +115,16 @@ def display_log_message(message):
     if match:
         return f"Telegram просит подождать {match.group(1)} сек"
     return MESSAGE_LABELS.get(value, value)
+
+
+def action_label(action: str) -> str:
+    from ui.i18n import t
+
+    key = f"log.action.{action}"
+    text = t(key)
+    if text != key:
+        return text
+    return ACTION_LABELS.get(action, action)
 
 
 def format_log(item):
@@ -138,12 +160,7 @@ class LogsTab(ctk.CTkFrame):
         self.filter_var = ctk.StringVar(value="Все события")
         self._filter_job = None
 
-        page_intro(
-            self,
-            "Журнал действий",
-            "События выбранной кампании. Результат каждого человека — в «Аудитории».",
-            "ЖУРНАЛ СОБЫТИЙ",
-        )
+        self.intro = page_intro(self, t("logs.title"), t("logs.desc"), t("logs.kicker"))
         CampaignBar(self).pack(fill="x", padx=20, pady=(0, 4))
         self.progress = ctk.CTkProgressBar(
             self,
@@ -231,6 +248,14 @@ class LogsTab(ctk.CTkFrame):
         if self._filter_job is not None:
             self.after_cancel(self._filter_job)
         self._filter_job = self.after(180, self.refresh_saved_logs)
+
+    def retranslate(self) -> None:
+        set_page_intro(
+            self.intro,
+            title=t("logs.title"),
+            description=t("logs.desc"),
+            kicker=t("logs.kicker"),
+        )
 
     def refresh_saved_logs(self) -> None:
         if self._filter_job is not None:

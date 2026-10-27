@@ -12,7 +12,7 @@ from telethon.errors import FloodWaitError
 from telethon.tl.types import User
 
 from core.audience_import import load_audience_file, parse_audience_csv, parse_audience_text
-from core.export import txt_lines_with_ids, write_parsed, write_targets_csv
+from core.export import parsed_txt_content, txt_lines_with_ids, write_parsed, write_targets_csv
 from core.inviter import InviterEngine
 from core.parse_compare import describe_difference, only_new, user_id_set
 from core.parser import ParserEngine, audience_members, split_sources_round_robin, unique_members
@@ -252,6 +252,11 @@ class IdAudienceLineTests(DatabaseCase):
             lines = Path(folder, "people.txt")
             write_parsed(lines, [row(1), {**row(2), "username": ""}], "txt_ids")
             self.assertEqual(lines.read_text(encoding="utf-8").split(), ["@person_1", "id:2"])
+            self.assertEqual(
+                parsed_txt_content([row(1), {**row(2), "username": ""}], "txt_ids").split(),
+                ["@person_1", "id:2"],
+            )
+            self.assertEqual(parsed_txt_content([row(1), {**row(2), "username": ""}], "txt").strip(), "@person_1")
 
     async def test_inviter_passes_the_id_of_an_id_only_target(self):
         account = await self.add_account()

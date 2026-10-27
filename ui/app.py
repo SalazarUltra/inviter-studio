@@ -43,7 +43,9 @@ from ui.theme import (
     apply_button_role,
     current_theme,
     init_fonts,
+    normalize_profile,
     normalize_theme,
+    restyle_after_theme_change,
     set_theme,
     style_tree,
 )
@@ -252,10 +254,10 @@ class App(ctk.CTk):
         self.breadcrumb_label.pack(anchor="w")
         settings = ctk.CTkFrame(header, fg_color="transparent")
         settings.grid(row=0, column=1, sticky="e", padx=20, pady=16)
-        self.ui_profile_var = ctk.StringVar(value="Кастом")
-        self.ui_density_var = ctk.StringVar(value="Обычный")
-        self._active_profile_name = "Кастом"
+        self._active_profile_name = "custom"
         self._active_density_mode = "normal"
+        self.ui_profile_var = ctk.StringVar(value=t("profile.custom"))
+        self.ui_density_var = ctk.StringVar(value=t("density.normal"))
         self.lang_var = ctk.StringVar(value=LANG_LABELS[DEFAULT_LANG])
         self.lang_menu = ctk.CTkOptionMenu(
             settings,
@@ -283,7 +285,7 @@ class App(ctk.CTk):
         self.theme_tip = tip(self.theme_menu, t("nav.theme_tip"))
         self.profile_menu = ctk.CTkOptionMenu(
             settings,
-            values=list(APP_PROFILES),
+            values=self._profile_labels(),
             variable=self.ui_profile_var,
             width=112,
             height=32,
@@ -291,14 +293,10 @@ class App(ctk.CTk):
             command=self._on_profile_change,
         )
         self.profile_menu.pack(side="left", padx=(0, 8))
-        NavTooltip(
-            self.profile_menu,
-            "Профиль меняет настройки AI-студии: тон ответов и ограничения диалогов. "
-            "«Кастом» оставляет ваши текущие настройки без изменений.",
-        )
+        self.profile_tip = NavTooltip(self.profile_menu, t("profile.tip"))
         self.density_menu = ctk.CTkOptionMenu(
             settings,
-            values=["Обычный", "Компактный"],
+            values=self._density_labels(),
             variable=self.ui_density_var,
             width=116,
             height=32,
@@ -306,11 +304,7 @@ class App(ctk.CTk):
             command=self._on_density_change,
         )
         self.density_menu.pack(side="left", padx=(0, 12))
-        NavTooltip(
-            self.density_menu,
-            "Плотность меняет отступы и высоту строк в таблицах разделов «Обзор», "
-            "«Аккаунты» и «Аудитория». Настройка сохраняется для следующего запуска.",
-        )
+        self.density_tip = NavTooltip(self.density_menu, t("density.tip"))
         self.help_button = ctk.CTkButton(settings, text="?", width=32, height=32, command=self.show_help)
         apply_button_role(self.help_button, "secondary")
         self.help_button.pack(side="left", padx=(0, 10))
@@ -403,6 +397,12 @@ class App(ctk.CTk):
         self.theme_menu.configure(values=[self._theme_label(code) for code in THEMES])
         self.theme_var.set(self._theme_label(current_theme()))
         self.theme_tip.text = t("nav.theme_tip")
+        self.profile_menu.configure(values=self._profile_labels())
+        self.ui_profile_var.set(self._profile_label(self._active_profile_name))
+        self.profile_tip.title = t("profile.tip")
+        self.density_menu.configure(values=self._density_labels())
+        self.ui_density_var.set(self._density_label(self._active_density_mode))
+        self.density_tip.title = t("density.tip")
         tip(self.help_button, t("nav.help_tip"))
         tip(self.new_task_button, t("nav.new_task_tip"))
         self._update_breadcrumb()
@@ -410,15 +410,48 @@ class App(ctk.CTk):
         if self.status_text.cget("text") == previous_ready:
             self.status_text.configure(text=self._last_ready_text)
         self.title(f"Inviter Studio {VERSION}")
-        for tab in (self.task_tab, self.accounts_tab, self.dashboard_tab):
+        for tab in (
+            self.task_tab,
+            self.accounts_tab,
+            self.dashboard_tab,
+            self.targets_tab,
+            self.parsing_tab,
+            self.warmup_tab,
+            self.logs_tab,
+            self.ai_tab,
+        ):
             try:
-                tab.retranslate()
+                if hasattr(tab, "retranslate"):
+                    tab.retranslate()
             except Exception:
                 logging.getLogger(__name__).exception("Не удалось перевести раздел")
 
     @staticmethod
     def _theme_label(code: str) -> str:
         return t(f"theme.{normalize_theme(code)}")
+
+    @staticmethod
+    def _profile_label(code: str) -> str:
+        return t(f"profile.{normalize_profile(code)}")
+
+    @staticmethod
+    def _density_label(mode: str) -> str:
+        return t("density.compact" if mode == "compact" else "density.normal")
+
+    def _profile_labels(self) -> list[str]:
+        return [self._profile_label(code) for code in APP_PROFILES]
+
+    def _density_labels(self) -> list[str]:
+        return [self._density_label("normal"), self._density_label("compact")]
+
+    def _profile_code_from_label(self, label: str) -> str:
+        for code in APP_PROFILES:
+            if self._profile_label(code) == label:
+                return code
+        return "custom"
+
+    def _density_mode_from_label(self, label: str) -> str:
+        return "compact" if label == self._density_label("compact") else "normal"
 
     def _on_theme_change(self, label: str) -> None:
         code = next((code for code in THEMES if self._theme_label(code) == label), current_theme())
@@ -428,6 +461,10 @@ class App(ctk.CTk):
         """Switch light/dark without a restart (density and profile are untouched); optionally store `ui_theme`."""
         code = set_theme(normalize_theme(theme))
         self.theme_var.set(self._theme_label(code))
+        try:
+            restyle_after_theme_change(self)
+        except Exception:
+            logging.getLogger(__name__).exception("Не удалось перекрасить интерфейс после смены темы")
         if persist:
             future = self.run_coro(self.db.set_setting(THEME_SETTING_KEY, code))
 
@@ -782,51 +819,47 @@ class App(ctk.CTk):
             self._switch_tab(key)
 
     def _on_density_change(self, value: str) -> None:
-        mode = "compact" if value == "Компактный" else "normal"
+        mode = self._density_mode_from_label(value)
         previous_mode = self._active_density_mode
 
         async def save_density():
             await self.db.set_setting("ui_density", mode)
-            await self.db.set_setting("ui_profile_preset", "Кастом")
+            await self.db.set_setting("ui_profile_preset", "custom")
 
         future = self.run_coro(save_density())
 
         def done(result):
             def apply():
                 if result.cancelled() or result.exception():
-                    self.ui_density_var.set("Компактный" if previous_mode == "compact" else "Обычный")
-                    self.set_status("Не удалось сохранить плотность интерфейса. Попробуйте ещё раз.", COLORS["error"])
+                    self.ui_density_var.set(self._density_label(previous_mode))
+                    self.set_status(t("density.save_failed"), COLORS["error"])
                     return
                 self._active_density_mode = mode
-                self._active_profile_name = "Кастом"
-                self.ui_profile_var.set("Кастом")
+                self._active_profile_name = "custom"
+                self.ui_profile_var.set(self._profile_label("custom"))
                 if not self._apply_density(mode):
                     return
-                label = "Компактный" if mode == "compact" else "Обычный"
-                self.set_status(f"Плотность интерфейса: {label}. Настройка сохранена.", COLORS["accent"])
+                self.set_status(t("density.saved", label=self._density_label(mode)), COLORS["accent"])
 
             self._safe_after(apply)
 
         future.add_done_callback(done)
 
     def _on_profile_change(self, value: str) -> None:
-        profile_name = value if value in APP_PROFILES else "Кастом"
+        profile_name = self._profile_code_from_label(value)
         profile = APP_PROFILES.get(profile_name)
         if not profile:
             previous_profile = self._active_profile_name
-            future = self.run_coro(self.db.set_setting("ui_profile_preset", "Кастом"))
+            future = self.run_coro(self.db.set_setting("ui_profile_preset", "custom"))
 
             def custom_done(result):
                 def apply():
                     if result.cancelled() or result.exception():
-                        self.ui_profile_var.set(previous_profile)
-                        self.set_status("Не удалось сохранить выбор профиля. Попробуйте ещё раз.", COLORS["error"])
+                        self.ui_profile_var.set(self._profile_label(previous_profile))
+                        self.set_status(t("profile.save_failed"), COLORS["error"])
                         return
-                    self._active_profile_name = "Кастом"
-                    self.set_status(
-                        "Выбран «Кастом»: текущие настройки AI-студии оставлены без изменений.",
-                        COLORS["accent"],
-                    )
+                    self._active_profile_name = "custom"
+                    self.set_status(t("profile.custom_kept"), COLORS["accent"])
 
                 self._safe_after(apply)
 
@@ -847,11 +880,9 @@ class App(ctk.CTk):
             if result.cancelled() or result.exception():
 
                 def show_save_error():
-                    self.ui_profile_var.set(previous_profile)
-                    self.ui_density_var.set("Компактный" if previous_mode == "compact" else "Обычный")
-                    self.set_status(
-                        "Не удалось сохранить профиль полностью. Проверьте настройки AI-студии.", COLORS["error"]
-                    )
+                    self.ui_profile_var.set(self._profile_label(previous_profile))
+                    self.ui_density_var.set(self._density_label(previous_mode))
+                    self.set_status(t("profile.save_failed"), COLORS["error"])
 
                 self._safe_after(show_save_error)
                 return
@@ -860,39 +891,37 @@ class App(ctk.CTk):
             def apply_profile():
                 self._active_profile_name = profile_name
                 self._active_density_mode = mode
-                self.ui_profile_var.set(profile_name)
-                self.ui_density_var.set("Компактный" if mode == "compact" else "Обычный")
+                self.ui_profile_var.set(self._profile_label(profile_name))
+                self.ui_density_var.set(self._density_label(mode))
                 density_applied = self._apply_density(mode)
                 if hasattr(self, "warmup_tab"):
                     if hasattr(self.warmup_tab, "_load_ai_memory_setting"):
                         self.warmup_tab._load_ai_memory_setting()
                     if hasattr(self.warmup_tab, "_load_ai_behavior_settings"):
                         self.warmup_tab._load_ai_behavior_settings()
-                effects = {
-                    "Оператор": "тон общения, память, лимит диалогов и паузу между чатами",
-                    "Аналитик": "экспертный тон, память, более строгий лимит и паузу между чатами",
-                    "Compact Ops": "нейтральный тон, лимиты AI-диалогов и компактные таблицы",
-                }.get(profile_name, "настройки AI-студии")
+                effects = t(f"profile.effects.{profile_name}")
                 if density_applied:
-                    self.set_status(f"Профиль «{profile_name}» применён: {effects}.", COLORS["accent"])
+                    self.set_status(
+                        t("profile.applied", name=self._profile_label(profile_name), effects=effects),
+                        COLORS["accent"],
+                    )
 
             self._safe_after(apply_profile)
 
         fut.add_done_callback(done)
 
     def _load_profile_setting(self) -> None:
-        fut = self.run_coro(self.db.get_setting("ui_profile_preset", "Кастом"))
+        fut = self.run_coro(self.db.get_setting("ui_profile_preset", "custom"))
 
         def done(f):
             try:
-                profile_name = str(f.result() or "Кастом")
+                profile_name = normalize_profile(f.result() or "custom")
             except Exception:
-                profile_name = "Кастом"
+                profile_name = "custom"
 
             def apply():
-                loaded_name = profile_name if profile_name in APP_PROFILES else "Кастом"
-                self._active_profile_name = loaded_name
-                self.ui_profile_var.set(loaded_name)
+                self._active_profile_name = profile_name
+                self.ui_profile_var.set(self._profile_label(profile_name))
 
             self._safe_after(apply)
 
@@ -910,7 +939,7 @@ class App(ctk.CTk):
             def apply():
                 loaded_mode = "compact" if mode == "compact" else "normal"
                 self._active_density_mode = loaded_mode
-                self.ui_density_var.set("Компактный" if loaded_mode == "compact" else "Обычный")
+                self.ui_density_var.set(self._density_label(loaded_mode))
                 self._apply_density(loaded_mode)
 
             self._safe_after(apply)
@@ -1000,7 +1029,8 @@ class App(ctk.CTk):
     def _poll_ui(self) -> None:
         if self._closing:
             return
-        if self.current_tab_key in {"targets", "dashboard"}:
+        # Only poll while a task is active — idle 5s refreshes caused UI stutter.
+        if self.current_tab_key in {"targets", "dashboard"} and self.scheduler.is_running():
             self.targets_tab.refresh_stats()
         self.after(5000, self._poll_ui)
 
@@ -1030,13 +1060,20 @@ class App(ctk.CTk):
         # Closing the app keeps waiting second messages (MessageEngine.shutdown); other engines just stop.
         getattr(self.scheduler.engine, "shutdown", self.scheduler.engine.stop)()
         self.parsing_tab.stop()
-        if self.warmup_tab.warmup_engine:
-            self.warmup_tab.warmup_engine.stop()
+        warmup_tab = self.warmup_tab
+        if getattr(warmup_tab, "stop_all", None):
+            warmup_tab.stop_all()
+        elif warmup_tab.warmup_engine:
+            warmup_tab.warmup_engine.stop()
         workers = [
             (self.scheduler.engine, self.scheduler.future),
-            (self.warmup_tab.warmup_engine, getattr(self.warmup_tab, "warmup_future", None)),
             (self.parsing_tab.engine, self.parsing_tab.future),
         ]
+        if getattr(warmup_tab, "_runs", None):
+            for _account_id, run in warmup_tab._runs.items():
+                workers.append((run.get("engine"), run.get("future")))
+        else:
+            workers.append((warmup_tab.warmup_engine, getattr(warmup_tab, "warmup_future", None)))
         pending = [
             getattr(engine, "_task", None) or asyncio.wrap_future(future)
             for engine, future in workers
@@ -1069,10 +1106,13 @@ class App(ctk.CTk):
                 dialog.close()
                 if dialog.winfo_exists():
                     return
-        active = self.scheduler.is_running() or bool(
-            getattr(self.warmup_tab, "warmup_future", None) and not self.warmup_tab.warmup_future.done()
+        warmup = self.warmup_tab
+        warming = (
+            warmup.any_warming()
+            if getattr(warmup, "any_warming", None)
+            else bool(getattr(warmup, "warmup_future", None) and not warmup.warmup_future.done())
         )
-        active = active or self.parsing_tab.busy()
+        active = self.scheduler.is_running() or warming or self.parsing_tab.busy()
         if active and not messagebox.askyesno(t("dlg.exit_title"), t("dlg.exit_text")):
             return
         self._closing = True

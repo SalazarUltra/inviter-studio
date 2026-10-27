@@ -14,29 +14,29 @@ DEFAULT_THEME = "dark"
 # Plain Tk/ttk widgets, PIL images and Text tags need one string: use `resolve()` and `on_theme_change()` for them.
 _PALETTE = {
     #                 light      dark
-    "bg": ("#F4F5F7", "#101113"),
+    "bg": ("#F1F3F6", "#101113"),
     "surface": ("#FFFFFF", "#191B1F"),
-    "elevated": ("#ECEEF1", "#23262B"),
-    "border": ("#D5D8DE", "#2D3036"),
-    "accent": ("#526F00", "#D4FF00"),
-    "accent_hover": ("#445C00", "#BEDF12"),
-    "accent_soft": ("#E3EEC2", "#2B3417"),
-    "success": ("#1E8E4E", "#6FCF97"),
-    "warning": ("#9A6B00", "#E8C76B"),
-    "error": ("#C62F4B", "#FF7D92"),
-    "danger_bg": ("#FBE4E8", "#352129"),
-    "text": ("#16181C", "#F5F6F7"),
-    "muted": ("#5B616C", "#9A9EA8"),
-    "subtle": ("#8A909B", "#676D78"),
+    "elevated": ("#E8EBEF", "#23262B"),
+    "border": ("#C8CDD6", "#2D3036"),
+    "accent": ("#3F5A00", "#D4FF00"),
+    "accent_hover": ("#334900", "#BEDF12"),
+    "accent_soft": ("#DCE8B0", "#2B3417"),
+    "success": ("#187A42", "#6FCF97"),
+    "warning": ("#8A5F00", "#E8C76B"),
+    "error": ("#B5253F", "#FF7D92"),
+    "danger_bg": ("#F8DCE2", "#352129"),
+    "text": ("#12141A", "#F5F6F7"),
+    "muted": ("#4E5560", "#9A9EA8"),
+    "subtle": ("#6F7683", "#676D78"),
     "input": ("#FFFFFF", "#131519"),
-    "sidebar": ("#E9EBEF", "#141619"),
-    "hover": ("#DDE0E6", "#30343B"),
-    "hover_strong": ("#D2D6DD", "#333840"),
-    "danger_hover": ("#F6D0D7", "#492B36"),
-    "danger_border": ("#EDB7C2", "#50303D"),
-    "hero_bg": ("#F0F4E3", "#191F19"),
-    "hero_border": ("#D3DDB0", "#343C26"),
-    "hero_text": ("#5E6652", "#BAC1B1"),
+    "sidebar": ("#E4E7EC", "#141619"),
+    "hover": ("#D5DAE2", "#30343B"),
+    "hover_strong": ("#C9CFD8", "#333840"),
+    "danger_hover": ("#F0C8D1", "#492B36"),
+    "danger_border": ("#E3A8B5", "#50303D"),
+    "hero_bg": ("#EAF0D4", "#191F19"),
+    "hero_border": ("#C5D28E", "#343C26"),
+    "hero_text": ("#3F4A2E", "#BAC1B1"),
 }
 COLORS: dict[str, tuple[str, str]] = dict(_PALETTE)
 _theme = DEFAULT_THEME
@@ -131,22 +131,22 @@ DENSITY_PRESETS = {
     "compact": {"row_pad_y": 3, "card_pad_y": 8, "list_item_h": 30},
 }
 APP_PROFILES = {
-    "Кастом": None,
-    "Оператор": {
+    "custom": None,
+    "operator": {
         "ui_density": "normal",
         "ai_memory_enabled": "1",
         "ai_style_tone": "friendly",
         "ai_hourly_limit": "6",
         "ai_chat_cooldown_min": "10",
     },
-    "Аналитик": {
+    "analyst": {
         "ui_density": "normal",
         "ai_memory_enabled": "1",
         "ai_style_tone": "expert",
         "ai_hourly_limit": "4",
         "ai_chat_cooldown_min": "20",
     },
-    "Compact Ops": {
+    "compact_ops": {
         "ui_density": "compact",
         "ai_memory_enabled": "1",
         "ai_style_tone": "neutral",
@@ -154,6 +154,22 @@ APP_PROFILES = {
         "ai_chat_cooldown_min": "12",
     },
 }
+# Older builds stored Russian / mixed profile names in settings.
+PROFILE_ALIASES = {
+    "Кастом": "custom",
+    "Оператор": "operator",
+    "Аналитик": "analyst",
+    "Compact Ops": "compact_ops",
+    "custom": "custom",
+    "operator": "operator",
+    "analyst": "analyst",
+    "compact_ops": "compact_ops",
+}
+
+
+def normalize_profile(value: object) -> str:
+    text = str(value or "").strip()
+    return PROFILE_ALIASES.get(text, "custom" if text not in APP_PROFILES else text)
 
 
 def init_fonts() -> None:
@@ -196,7 +212,8 @@ def apply_button_role(button, role="secondary") -> None:
         "primary": {
             "fg_color": COLORS["accent"],
             "hover_color": COLORS["accent_hover"],
-            "text_color": COLORS["bg"],
+            # Contrasting ink on the accent (not page bg — that reads as dark-on-green in light mode).
+            "text_color": ("#FFFFFF", "#101113"),
             "border_width": 0,
         },
         "secondary": {"fg_color": COLORS["elevated"], "hover_color": COLORS["hover"], "text_color": COLORS["text"]},
@@ -220,6 +237,27 @@ def apply_button_role(button, role="secondary") -> None:
     }
     button.configure(**{**base, **roles.get(role, roles["secondary"])})
     button._studio_styled = True
+
+
+def clear_studio_style(widget) -> None:
+    """Drop cached style flags so ``style_tree`` reapplies colors after a theme switch."""
+    if hasattr(widget, "_studio_styled"):
+        try:
+            delattr(widget, "_studio_styled")
+        except Exception:
+            widget._studio_styled = False
+    try:
+        children = widget.winfo_children()
+    except Exception:
+        return
+    for child in children:
+        clear_studio_style(child)
+
+
+def restyle_after_theme_change(root) -> None:
+    """Re-run role styling after light/dark switch (CTk tuples auto-update; roles may not)."""
+    clear_studio_style(root)
+    style_tree(root)
 
 
 def style_tree(widget) -> None:
@@ -266,7 +304,7 @@ def style_tree(widget) -> None:
                 corner_radius=6,
                 border_width=2,
                 fg_color=COLORS["accent"],
-                checkmark_color=COLORS["bg"],
+                checkmark_color=("#FFFFFF", "#101113"),
                 border_color=COLORS["subtle"],
                 hover_color=COLORS["accent_soft"],
             )

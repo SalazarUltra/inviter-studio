@@ -91,13 +91,27 @@ class WarmupActions:
         self.log_callback = log_callback
         self.account_id = account_id
         self.memory_enabled = memory_enabled
-        self.tone = tone
+        self.tone = (tone or "neutral").strip().lower() or "neutral"
         self.hourly_limit = max(1, int(hourly_limit or 6))
         self.chat_cooldown_min = max(1, int(chat_cooldown_min or 12))
         self.reply_chance = max(0, min(100, int(reply_chance if reply_chance is not None else 100)))
         # Messages we already reacted to in this run; re-sending the same
         # reaction on Telegram would toggle it off.
         self._reacted: set[tuple[str, int]] = set()
+
+    async def _effective_tone(self) -> str:
+        """Prefer the latest saved Warm-up tone so the dropdown steers live writing."""
+        if getattr(self.ai, "db", None):
+            try:
+                saved = str(await self.ai.db.get_setting("ai_style_tone", self.tone) or self.tone)
+                key = saved.strip().lower()
+                if key in {"neutral", "friendly", "expert"}:
+                    self.tone = key
+                    return key
+            except Exception:
+                pass
+        key = (self.tone or "neutral").strip().lower()
+        return key if key in {"neutral", "friendly", "expert"} else "neutral"
 
     async def go_online(self) -> dict[str, Any]:
         try:
@@ -367,7 +381,7 @@ class WarmupActions:
                 chat_key=chat_key,
                 peer_name=peer_name,
                 memory_enabled=self.memory_enabled,
-                tone=self.tone,
+                tone=await self._effective_tone(),
                 reply_to=reply,
                 chat_title=peer_name,
                 own_recent=own_recent,

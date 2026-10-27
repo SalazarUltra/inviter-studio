@@ -7,18 +7,22 @@ from tkinter import messagebox
 
 import customtkinter as ctk
 
+from core.account_display import account_headline, profile_from_user
 from core.account_manager import AccountManager
-from core.database import Database, effective_account_age_days
+from core.database import Database, effective_account_age_days, is_flood_blocking
 from core.inviter import InviterEngine
 from core.user_feedback import explain_error
 from core.validation import validate_account
-from ui.components import empty_state, page_intro
+from ui.components import empty_state, page_intro, set_page_intro
 from ui.dispatch import post_ui
 from ui.entry_utils import setup_entry
 from ui.hints import hint, tip
 from ui.i18n import t
 from ui.summary_card import SummaryCard
 from ui.theme import COLORS, FONTS, apply_button_role, get_density_preset, init_fonts, style_card, style_tree
+
+ACCOUNT_FILTERS = ("all", "enabled", "disabled", "check")
+FILTER_DEBOUNCE_MS = 220
 
 STATUS_COLORS = {
     "active": COLORS["success"],
@@ -56,8 +60,10 @@ class AccountsTab(ctk.CTkFrame):
         self.proxy_visible = False
         self._density_mode = "normal"
         self._all_accounts = []
+        self._filter_code = "all"
+        self._filter_job = None
         self.search_var = ctk.StringVar()
-        self.filter_var = ctk.StringVar(value="Все")
+        self.filter_var = ctk.StringVar(value=t("accounts.filter.all"))
 
         self.container = ctk.CTkFrame(self, fg_color="transparent")
         self.container.pack(fill="both", expand=True)
@@ -68,11 +74,11 @@ class AccountsTab(ctk.CTkFrame):
         self.left_frame = ctk.CTkFrame(self.container, fg_color="transparent")
         self.left_frame.grid(row=0, column=0, sticky="nsew", padx=(16, 8), pady=16)
 
-        page_intro(
+        self.intro = page_intro(
             self.left_frame,
-            "Аккаунты",
-            "Ваши подключения к Telegram. Всё необходимое — на одной карточке.",
-            "ПОДКЛЮЧЕНИЯ",
+            t("accounts.title"),
+            t("accounts.desc"),
+            t("accounts.kicker"),
         )
         top = ctk.CTkFrame(
             self.left_frame,
@@ -90,10 +96,8 @@ class AccountsTab(ctk.CTkFrame):
             corner_radius=12,
             height=36,
             font=FONTS["subhead"],
-            fg_color=COLORS["accent"],
-            hover_color=COLORS["warning"],
-            text_color=COLORS["text"],
         )
+        apply_button_role(self.add_button, "primary")
         self.add_button.pack(side="left", padx=16, pady=12)
         filters = ctk.CTkFrame(self.left_frame, fg_color="transparent")
         filters.pack(fill="x", pady=(0, 8))
@@ -104,10 +108,11 @@ class AccountsTab(ctk.CTkFrame):
         self.search_entry.grid(row=0, column=1, sticky="ew", padx=(0, 8))
         self.filter_menu = ctk.CTkOptionMenu(
             filters,
-            values=["Все", "Включённые", "Выключенные", "Нужна проверка"],
+            values=self._filter_labels(),
             variable=self.filter_var,
             width=150,
             height=30,
+            command=self._on_filter_change,
         )
         self.filter_menu.grid(row=0, column=2, sticky="e")
         self._small_filter = None
@@ -136,10 +141,43 @@ class AccountsTab(ctk.CTkFrame):
             width=340,
         )
         style_card(self.right_frame, color=COLORS["accent"])
-
         self.refresh_table()
-        self.search_var.trace_add("write", lambda *_: self._render_accounts(self._all_accounts))
-        self.filter_var.trace_add("write", lambda *_: self._render_accounts(self._all_accounts))
+        self.search_var.trace_add("write", lambda *_: self._schedule_filter_render())
+
+    def _filter_labels(self) -> list[str]:
+        return [t(f"accounts.filter.{key}") for key in ACCOUNT_FILTERS]
+
+    def _on_filter_change(self, label: str) -> None:
+        labels = self._filter_labels()
+        try:
+            self._filter_code = ACCOUNT_FILTERS[labels.index(label)]
+        except ValueError:
+            self._filter_code = "all"
+        self._schedule_filter_render()
+
+    def _schedule_filter_render(self) -> None:
+        if self._filter_job is not None:
+            try:
+                self.after_cancel(self._filter_job)
+            except Exception:
+                pass
+        self._filter_job = self.after(FILTER_DEBOUNCE_MS, lambda: self._render_accounts(self._all_accounts))
+
+    def _account_matches(self, account: dict, query: str) -> bool:
+        haystack = " ".join(
+            str(account.get(key) or "")
+            for key in ("phone", "tg_first_name", "tg_last_name", "tg_username")
+        ).casefold()
+        if query and query not in haystack:
+            return False
+        code = self._filter_code
+        if code == "enabled":
+            return bool(account.get("is_enabled", 1))
+        if code == "disabled":
+            return not account.get("is_enabled", 1)
+        if code == "check":
+            return account.get("status") != "active"
+        return True
 
     def _safe_after(self, callback) -> None:
         post_ui(self, callback)
@@ -567,6 +605,14 @@ class AccountsTab(ctk.CTkFrame):
                 self._safe_after(lambda exc=exc: messagebox.showerror("Ошибка", explain_error(exc)))
                 return
             if result["status"] == "ok":
+                if self.pending_account_payload is not None:
+                    self.pending_account_payload.update(
+                        {
+                            "tg_first_name": result.get("tg_first_name") or "",
+                            "tg_last_name": result.get("tg_last_name") or "",
+                            "tg_username": result.get("tg_username") or "",
+                        }
+                    )
                 self._safe_after(self._save_account)
             elif result["status"] == "password_required":
                 self._safe_after(lambda: self.twofa_section.pack(fill="x", padx=0, pady=(4, 0)))
@@ -602,6 +648,14 @@ class AccountsTab(ctk.CTkFrame):
                 self._safe_after(lambda exc=exc: messagebox.showerror("Ошибка", explain_error(exc)))
                 return
             if result["status"] == "ok":
+                if self.pending_account_payload is not None:
+                    self.pending_account_payload.update(
+                        {
+                            "tg_first_name": result.get("tg_first_name") or "",
+                            "tg_last_name": result.get("tg_last_name") or "",
+                            "tg_username": result.get("tg_username") or "",
+                        }
+                    )
                 self._safe_after(self._save_account)
             else:
                 self._safe_after(
@@ -615,27 +669,24 @@ class AccountsTab(ctk.CTkFrame):
 
     def _status_text(self, account: dict) -> str:
         if int(account.get("is_enabled", 1)) == 0:
-            return "Не выбран для задач"
+            return t("status.disabled")
         status = account.get("status") or "inactive"
         if status == "flood" and account.get("flood_until"):
             try:
                 delta = datetime.fromisoformat(account["flood_until"]) - datetime.now()
                 seconds = max(int(delta.total_seconds()), 0)
             except Exception:
-                return "Ожидание Telegram"
+                return t("status.flood")
             if not seconds:
-                return "Пауза истекла · готов к проверке"
+                return t("status.flood_expired")
             if seconds >= 3600:
-                return f"Пауза Telegram ({seconds // 3600} ч {seconds % 3600 // 60} мин)"
-            return f"Ожидание ({(seconds + 59) // 60} мин)"
-        mapping = {
-            "active": "Готов",
-            "error": "Ошибка",
-            "inactive": "Неактивен",
-            "restricted": "Отправка требует проверки",
-            "unauthorized": "Нужен вход",
-        }
-        return mapping.get(status, status)
+                return t("status.flood_hours", h=seconds // 3600, min=seconds % 3600 // 60)
+            return t("status.flood_wait", min=(seconds + 59) // 60)
+        if status == "active":
+            return t("status.ready")
+        key = f"status.{status}"
+        text = t(key)
+        return text if text != key else status
 
     def refresh_table(self) -> None:
         fut = self.run_coro(self.db.get_accounts())
@@ -653,27 +704,26 @@ class AccountsTab(ctk.CTkFrame):
 
     def retranslate(self) -> None:
         """Re-render labels after a language switch (no restart)."""
+        set_page_intro(
+            self.intro,
+            title=t("accounts.title"),
+            description=t("accounts.desc"),
+            kicker=t("accounts.kicker"),
+        )
         self.add_button.configure(text=t("accounts.add"))
         self.phone_label.configure(text=t("accounts.phone"))
+        labels = self._filter_labels()
+        self.filter_menu.configure(values=labels)
+        self.filter_var.set(labels[ACCOUNT_FILTERS.index(self._filter_code)])
         self.summary_card.retranslate()
         self._render_accounts(self._all_accounts)
 
     def _render_accounts(self, accounts: list[dict]) -> None:
+        self._filter_job = None
         self._all_accounts = accounts
         query = self.search_var.get().strip().casefold()
-        selected = self.filter_var.get()
         all_count = len(accounts)
-        accounts = [
-            account
-            for account in accounts
-            if query in account["phone"].casefold()
-            and (
-                selected == "Все"
-                or (selected == "Включённые" and account.get("is_enabled", 1))
-                or (selected == "Выключенные" and not account.get("is_enabled", 1))
-                or (selected == "Нужна проверка" and account.get("status") != "active")
-            )
-        ]
+        accounts = [account for account in accounts if self._account_matches(account, query)]
         density = get_density_preset(self._density_mode)
         for widget in self.table.winfo_children():
             widget.destroy()
@@ -714,25 +764,25 @@ class AccountsTab(ctk.CTkFrame):
                 status_color = COLORS["muted"]
             content = ctk.CTkFrame(card, fg_color="transparent")
             content.pack(fill="x", padx=12, pady=(6, 2))
-            ctk.CTkLabel(content, text=account["phone"], anchor="w", font=FONTS["subhead"]).pack(side="left")
+            ctk.CTkLabel(content, text=account_headline(account), anchor="w", font=FONTS["subhead"]).pack(side="left")
             switch = ctk.CTkSwitch(content, text=t("accounts.use"), width=110, font=FONTS["small"])
-            tip(switch, "Разрешить использовать аккаунт в задачах. Сам по себе переключатель ничего не запускает.")
+            tip(switch, t("accounts.use_tip"))
             if int(account.get("is_enabled", 1)) == 1:
                 switch.select()
             else:
                 switch.deselect()
             switch.configure(command=lambda aid=account["id"], sw=switch: self.toggle_account(aid, bool(sw.get())))
             switch.pack(side="right")
-            device_text = "Устройство не задано"
+            device_text = t("accounts.device_unset")
             if account.get("device_profile"):
                 try:
                     device = json.loads(account["device_profile"])
-                    device_text = str(device.get("device_model", "Устройство не задано"))
+                    device_text = str(device.get("device_model") or t("accounts.device_unset"))
                 except (ValueError, TypeError, AttributeError):
                     pass
             ctk.CTkLabel(
                 card,
-                text=f"{self._status_text(account)} • {device_text} • Прокси: {proxy_text}",
+                text=f"{self._status_text(account)} • {device_text} • {t('accounts.proxy_label', value=proxy_text)}",
                 anchor="w",
                 text_color=status_color,
                 font=FONTS["small"],
@@ -742,9 +792,14 @@ class AccountsTab(ctk.CTkFrame):
             actions.pack(fill="x", padx=12, pady=(0, density["card_pad_y"]))
             ctk.CTkLabel(
                 actions,
-                text=f"Сегодня: приглашений {account.get('added_today') or 0}; сообщений {account.get('sent_today') or 0}"
-                f" / лимит {account.get('daily_limit', 40)} на режим"
-                f" (доступно сейчас: {InviterEngine.get_safe_daily_limit(account)}, возраст {effective_account_age_days(account)} дн.)",
+                text=t(
+                    "accounts.today",
+                    invites=account.get("added_today") or 0,
+                    sent=account.get("sent_today") or 0,
+                    limit=account.get("daily_limit", 40),
+                    safe=InviterEngine.get_safe_daily_limit(account),
+                    age=effective_account_age_days(account),
+                ),
                 font=FONTS["small"],
                 text_color=COLORS["muted"],
             ).pack(anchor="w", pady=(0, 5))
@@ -806,6 +861,7 @@ class AccountsTab(ctk.CTkFrame):
             account = await self.db.get_account(account_id)
             if not account:
                 return "Аккаунт не найден"
+            account = await self.db.clear_expired_flood(account)
             mgr = AccountManager(account)
             try:
                 await mgr.connect()
@@ -813,17 +869,29 @@ class AccountsTab(ctk.CTkFrame):
                 me = await mgr.client.get_me() if mgr.client else None
             finally:
                 await mgr.disconnect()
-            if authorized and me:
-                result = f"Вход и соединение работают: {me.first_name} @{me.username or ''}".strip()
-                if account.get("status") == "restricted":
-                    result += (
-                        "\n\nTelegram ранее отклонил отправку с этого аккаунта. "
-                        "Проверка входа не подтверждает возможность отправлять личные сообщения "
-                        "и не снимает ограничение. Проверьте состояние аккаунта в Telegram. "
-                        "После устранения причины откройте «Изменить» и выберите «Готов»."
-                    )
-                return result
-            return "Сессия не активна"
+            if not authorized or not me:
+                return "Сессия не активна"
+            profile = profile_from_user(me)
+            await self.db.update_account_profile(
+                account_id,
+                first_name=profile["tg_first_name"],
+                last_name=profile["tg_last_name"],
+                username=profile["tg_username"],
+            )
+            name = " ".join(part for part in (profile["tg_first_name"], profile["tg_last_name"]) if part).strip()
+            handle = f"@{profile['tg_username']}" if profile["tg_username"] else ""
+            result = f"Вход и соединение работают: {name} {handle}".strip()
+            previous = account.get("status") or "inactive"
+            # Successful login check clears soft warnings; an active Telegram pause stays until it expires.
+            if previous == "flood" and is_flood_blocking(account):
+                result += "\n\nВход в порядке, но Telegram ещё держит паузу — статус «Пауза» остаётся до её окончания."
+            elif previous in {"restricted", "unauthorized", "error", "inactive"}:
+                await self.db.update_account_status(account_id, "active")
+                result += "\n\nСтатус обновлён: Готов. Если Telegram снова ограничит отправку, метка вернётся сама."
+            elif previous != "active":
+                await self.db.update_account_status(account_id, "active")
+                result += "\n\nСтатус обновлён: Готов."
+            return result
 
         fut = self.run_coro(worker())
 
@@ -832,6 +900,7 @@ class AccountsTab(ctk.CTkFrame):
                 result = f.result()
             except Exception as exc:  # noqa: BLE001
                 result = "Ошибка: " + explain_error(exc)
+            self._safe_after(self.refresh_table)
             self._safe_after(lambda: messagebox.showinfo("Тест аккаунта", result))
 
         fut.add_done_callback(done)
@@ -920,18 +989,18 @@ class AccountsTab(ctk.CTkFrame):
         )
 
         ctk.CTkLabel(form, text="Состояние (менять после проверки аккаунта)").pack(anchor="w", padx=8, pady=(10, 2))
-        statuses = {
-            "Готов": "active",
-            "Неактивен": "inactive",
-            "Ожидание Telegram": "flood",
-            "Отправка требует проверки": "restricted",
-            "Нужен вход": "unauthorized",
-            "Ошибка": "error",
+        status_codes = ("active", "inactive", "flood", "restricted", "unauthorized", "error")
+        status_labels = {
+            "active": t("status.ready"),
+            "inactive": t("status.inactive"),
+            "flood": t("status.flood"),
+            "restricted": t("status.restricted"),
+            "unauthorized": t("status.unauthorized"),
+            "error": t("status.error"),
         }
-        status_menu = ctk.CTkOptionMenu(form, values=list(statuses))
-        status_menu.set(
-            next((label for label, value in statuses.items() if value == account.get("status")), "Неактивен")
-        )
+        statuses = {status_labels[code]: code for code in status_codes}
+        status_menu = ctk.CTkOptionMenu(form, values=[status_labels[code] for code in status_codes])
+        status_menu.set(status_labels.get(account.get("status"), t("status.inactive")))
         status_menu.pack(fill="x", padx=8)
         hint(form, "Назначенная Telegram пауза сохраняется до указанного срока.", padx=8)
 

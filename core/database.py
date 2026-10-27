@@ -1057,8 +1057,8 @@ class Database(FollowupStore):
                     phone, api_id, api_hash, session_name,
                     proxy_type, proxy_host, proxy_port, proxy_login, proxy_password,
                     daily_limit, added_today, last_reset_date, status, flood_until, notes, created_at,
-                    device_profile, account_age_days
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'active', NULL, ?, ?, ?, ?)
+                    device_profile, account_age_days, tg_first_name, tg_last_name, tg_username
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'active', NULL, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     payload["phone"],
@@ -1076,6 +1076,9 @@ class Database(FollowupStore):
                     now,
                     payload.get("device_profile"),
                     int(payload.get("account_age_days") or 0),
+                    (str(payload.get("tg_first_name") or "").strip() or None),
+                    (str(payload.get("tg_last_name") or "").strip() or None),
+                    (str(payload.get("tg_username") or "").strip().lstrip("@") or None),
                 ),
             )
             await db.commit()
@@ -1119,10 +1122,40 @@ class Database(FollowupStore):
             if payload.get("account_age_days") not in (None, ""):
                 fields.append("account_age_days = ?")
                 values.append(int(payload["account_age_days"]))
+            if any(payload.get(key) not in (None, "") for key in ("tg_first_name", "tg_last_name", "tg_username")):
+                fields.extend(["tg_first_name = ?", "tg_last_name = ?", "tg_username = ?"])
+                values.extend(
+                    [
+                        (str(payload.get("tg_first_name") or "").strip() or None),
+                        (str(payload.get("tg_last_name") or "").strip() or None),
+                        (str(payload.get("tg_username") or "").strip().lstrip("@") or None),
+                    ]
+                )
             values.append(account_id)
             await db.execute(f"UPDATE accounts SET {', '.join(fields)} WHERE id = ?", values)
             await db.commit()
             return account_id, False
+
+    async def update_account_profile(
+        self,
+        account_id: int,
+        *,
+        first_name: str | None = None,
+        last_name: str | None = None,
+        username: str | None = None,
+    ) -> None:
+        """Store the Telegram display name from ``get_me()`` / a connection check."""
+        async with _connect() as db:
+            await db.execute(
+                "UPDATE accounts SET tg_first_name = ?, tg_last_name = ?, tg_username = ? WHERE id = ?",
+                (
+                    (str(first_name or "").strip() or None),
+                    (str(last_name or "").strip() or None),
+                    (str(username or "").strip().lstrip("@") or None),
+                    account_id,
+                ),
+            )
+            await db.commit()
 
     async def clear_expired_flood(self, account: dict[str, Any]) -> dict[str, Any]:
         """Reset a 'flood' account to active once its pause has passed (account dict is updated in place)."""
@@ -2618,6 +2651,9 @@ async def init_db() -> None:
                 "device_profile": "TEXT",
                 "sort_order": "INTEGER DEFAULT 0",
                 "warmup_status": "TEXT DEFAULT 'cold'",
+                "tg_first_name": "TEXT",
+                "tg_last_name": "TEXT",
+                "tg_username": "TEXT",
             },
             "targets": {
                 "sort_order": "INTEGER DEFAULT 0",

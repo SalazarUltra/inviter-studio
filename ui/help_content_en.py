@@ -336,7 +336,7 @@ GUIDES_EN = {
     },
     "warmup": {
         "title": "Warm-up: actions in selected chats",
-        "intro": "A separate task for one account: actions are spread over days.",
+        "intro": "A day-by-day action plan. You can warm several accounts in parallel — each keeps its own chats.",
         "blocks": [
             (
                 "What warm-up does",
@@ -345,27 +345,25 @@ GUIDES_EN = {
                 "not required to send a ready text from Task.",
             ),
             (
-                "How to start",
-                "Choose the account and a level of 3, 7 or 14 days. Refresh the list of chats the account is in and tick "
-                "the ones you need. Give a message topic and press “Start warm-up”. One account is warmed up at a time; "
-                "leave the program open.",
+                "How to start and several accounts",
+                "Choose an account (name and @username appear in the list) and a level of 3, 7 or 14 days. Refresh chats, "
+                "tick the ones you need, set a topic and press “Start warm-up”. To warm another account: switch it in the "
+                "list, tick its chats and press Start again. On the right: “Active warm-ups” and “Stop all”. The same "
+                "account cannot be in warm-up and a task/parsing at once. Leave the program open.",
             ),
             (
-                "AI, memory and frequency",
-                "With an active AI connection the account behaves like a live participant: reads the latest chat "
-                "messages and the discussion thread under a post, marks them read, puts a light reaction on a remark and "
-                "replies to it (shown as a branch in Telegram). It does not write a second message in a row if the last "
-                "one in the chat or thread is its own. Each account has its own memory per chat: the program remembers "
-                "what it wrote and does not repeat itself. “Reply probability” sets the share of reply actions among "
-                "messages: lower means it writes on its own on the topic more often. The hourly limit and chat pause cap "
-                "the overall frequency; save changes with the AI-parameters button. Clearing memory removes context but "
-                "does not lift send limits.",
+                "AI, tone and model prompt",
+                "With an active AI connection the account writes like a chat member. Tone (neutral / friendly / expert) "
+                "changes writing style; save AI parameters. The scenario block on the right shows the AI request text "
+                "(chat-agnostic; topic is a soft hint, live conversation comes first). Reply probability, hourly limit "
+                "and chat pause cap frequency. Each account has its own memory per chat. Clearing memory does not lift "
+                "send limits.",
             ),
             (
                 "Channels and stopping",
-                "In broadcast channels the program does not post messages. Chat rights and Telegram restrictions may "
-                "block actions. See the status, plan day and history on the right. “Stop” ends warm-up; it does not "
-                "resume by itself after closing.",
+                "In broadcast channels the program does not post. Chat rights and Telegram limits may block actions. "
+                "Status and plan day are for the selected account; other active warm-ups keep running. “Stop” ends the "
+                "selected run (or all if the selected one is idle). Warm-up does not resume by itself after closing.",
             ),
         ],
     },
@@ -402,11 +400,11 @@ GUIDES_EN = {
             ),
             (
                 "Tokens and cost",
-                "Tokens are units of text counted by the AI provider. They are not the number of Telegram messages. A "
-                "chat subscription and API quota may be paid separately; check the API balance and spending limit. The "
-                "counter shows the counted usage; check exact cost and charges in your own console. Enter the API key "
-                "only in the field meant for it. HTTP 401 means a key problem, 403 — access rights, 404 — the model or "
-                "API, 429 — quota or request rate.",
+                "Tokens are units of text counted by the AI provider, not Telegram message counts. Cards and the test "
+                "preview show an estimated request cost and total USD (from public rates or the provider’s billed cost "
+                "when available). Always confirm exact charges in the provider console: short replies can still use many "
+                "tokens because of the system prompt and reasoning. Enter the API key only in its field. HTTP 401 — key, "
+                "403 — rights, 404 — model/API, 429 — quota or rate.",
             ),
         ],
     },
@@ -450,10 +448,11 @@ GUIDES_EN = {
         "blocks": [
             (
                 "1. Choose the account and sources",
-                "Open Parsing and select a connected account. Paste public @addresses or https://t.me/name links, one "
-                "per line. For a private group press “My groups”, select it and press “Add”. This list belongs to the "
-                "selected account. t.me/+… invite links do not fit here: join manually in Telegram, then refresh “My "
-                "groups”. “Paste” and “Clear field” change only the sources field and do not delete results.",
+                "Open Parsing, pick an account (name and @username show in the list) or turn on “Several accounts”. "
+                "Paste public @addresses or https://t.me/name links, one per line. In multi mode “My groups” merges "
+                "chats from every ticked account and shows which account owns each chat; select a group and press "
+                "“Add”. t.me/+… invite links do not fit here: join manually, then refresh “My groups”. “Paste” and "
+                "“Clear field” change only the sources field.",
             ),
             (
                 "2. When joining is needed",
@@ -532,7 +531,9 @@ GUIDES_EN = {
                 "“New since the last run” shows, exports and passes to the audience only people whose Telegram ID was "
                 "not in the selected earlier run. Formats: XLSX (convenient for Excel), CSV, JSON, TXT (@usernames), TXT "
                 "with IDs (id:123456789 for people without a username). “Save file to PC” → folder and name in the "
-                "Windows dialog. The whole filtered segment is exported. Texts and phones are not saved.",
+                "Windows dialog. Optionally “To bot (TXT)” sends the same filtered segment as a TXT file to your bot "
+                "from Accounts → My bot… (token required; nothing is sent automatically). The whole filtered segment "
+                "is exported. Texts and phones are not saved.",
             ),
             (
                 "7. Pass to the audience",

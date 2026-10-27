@@ -5,11 +5,13 @@ from tkinter import messagebox
 
 import customtkinter as ctk
 
+from core.ai_pricing import RATES_AS_OF, format_usd, resolve_stored_cost
 from core.ai_providers import CATALOG_CHECKED, PROVIDERS, validate_connection
 from core.ai_writer import AIWriter
 from core.user_feedback import explain_error
 from ui.campaigns import show_report
-from ui.components import empty_state, page_intro
+from ui.components import empty_state, page_intro, set_page_intro
+from ui.i18n import t
 from ui.dispatch import post_ui
 from ui.entry_utils import paste_text, setup_entry
 from ui.hints import hint, tip
@@ -40,9 +42,7 @@ class TabAISettings(ctk.CTkFrame):
         post_ui(self, callback)
 
     def _build_ui(self) -> None:
-        page_intro(
-            self, "AI-студия", "AI для сообщений в прогреве. В задаче отправляется ваш готовый текст.", "МОДЕЛИ AI"
-        )
+        self.intro = page_intro(self, t("ai.title"), t("ai.desc"), t("ai.kicker"))
         main = ctk.CTkFrame(self, fg_color="transparent")
         main.pack(fill="both", expand=True, padx=20, pady=(0, 16))
         main.grid_columnconfigure(0, weight=1, uniform="ai")
@@ -201,6 +201,14 @@ class TabAISettings(ctk.CTkFrame):
         self.status_label.configure(text="Редактирование слева. Измените модель или ключ и сохраните.")
         self.name_entry.focus_set()
 
+    def retranslate(self) -> None:
+        set_page_intro(
+            self.intro,
+            title=t("ai.title"),
+            description=t("ai.desc"),
+            kicker=t("ai.kicker"),
+        )
+
     def _add_config(self) -> None:
         if self._save_inflight:
             return
@@ -296,17 +304,40 @@ class TabAISettings(ctk.CTkFrame):
             )
         total_tokens = 0
         total_cost = 0.0
+        any_estimate = False
+        any_unknown = False
         for cfg in configs:
             total_tokens += int(cfg.get("total_tokens") or 0)
-            total_cost += float(cfg.get("total_cost_usd") or 0.0)
+            amount, source = resolve_stored_cost(cfg)
+            if amount is None:
+                any_unknown = True
+            else:
+                total_cost += amount
+                if source == "estimate":
+                    any_estimate = True
             self._build_config_card(self.cards_frame, cfg)
         style_tree(self.cards_frame)
-        self.total_label.configure(text=f"Использовано: {total_tokens:,} токенов • Стоимость: см. кабинет провайдера")
+        if any_unknown and total_cost <= 0:
+            cost_text = t("ai.cost_unknown")
+        else:
+            cost_text = format_usd(total_cost, estimated=any_estimate, unknown=t("ai.cost_unknown"))
+            if any_estimate:
+                cost_text = f"{cost_text} ({t('ai.cost_estimate_note', as_of=RATES_AS_OF)})"
+        self.total_label.configure(
+            text=t("ai.total_usage", tokens=f"{total_tokens:,}", cost=cost_text)
+        )
 
     def _build_config_card(self, parent, config: dict):
         is_active = bool(config.get("is_active"))
-        cost = float(config.get("total_cost_usd", 0.0) or 0.0)
         tokens = int(config.get("total_tokens", 0) or 0)
+        amount, source = resolve_stored_cost(config)
+        cost_value = float(amount or 0.0)
+        if amount is None:
+            cost_label = t("ai.cost_unknown")
+        else:
+            cost_label = format_usd(amount, estimated=source == "estimate", unknown=t("ai.cost_unknown"))
+            if source == "estimate":
+                cost_label = f"{cost_label} ({t('ai.cost_estimate_note', as_of=RATES_AS_OF)})"
         card = ctk.CTkFrame(
             parent,
             fg_color=COLORS["surface"],
@@ -334,11 +365,16 @@ class TabAISettings(ctk.CTkFrame):
 
         stats = ctk.CTkFrame(card, fg_color=COLORS["bg"], corner_radius=12)
         stats.pack(fill="x", padx=12, pady=(0, 8))
-        ctk.CTkLabel(stats, text=f"Токенов: {tokens:,}", font=FONTS["small"], text_color=COLORS["muted"]).pack(
-            anchor="w", padx=8, pady=(6, 0)
+        ctk.CTkLabel(
+            stats,
+            text=t("ai.tokens", tokens=f"{tokens:,}"),
+            font=FONTS["small"],
+            text_color=COLORS["muted"],
+        ).pack(anchor="w", padx=8, pady=(6, 0))
+        cost_color = (
+            COLORS["success"] if cost_value < 0.01 else COLORS["warning"] if cost_value < 0.1 else COLORS["error"]
         )
-        cost_color = COLORS["success"] if cost < 0.01 else COLORS["warning"] if cost < 0.1 else COLORS["error"]
-        hint(stats, "Стоимость: см. кабинет провайдера", padx=8).configure(text_color=cost_color)
+        hint(stats, t("ai.cost", cost=cost_label), padx=8).configure(text_color=cost_color)
 
         btn_row = ctk.CTkFrame(card, fg_color="transparent")
         btn_row.pack(fill="x", padx=12, pady=(0, 10))
@@ -428,12 +464,30 @@ class TabAISettings(ctk.CTkFrame):
                 if result.exception():
                     messagebox.showerror("Проверка AI", str(result.exception()))
                 else:
-                    show_report(
-                        self,
-                        "Пример AI-сообщения",
-                        result.result()
-                        + f"\n\nИспользовано токенов: {writer.session_tokens}.\nВ Telegram не отправлено.",
-                    )
+                    stats = writer.get_session_stats()
+                    lines = [
+                        result.result(),
+                        "",
+                        t(
+                            "ai.preview_tokens",
+                            total=int(stats.get("tokens") or 0),
+                            input=int(stats.get("last_input_tokens") or 0),
+                            output=int(stats.get("last_output_tokens") or 0),
+                        ),
+                    ]
+                    reasoning = int(stats.get("last_reasoning_tokens") or 0)
+                    if reasoning:
+                        lines.append(t("ai.preview_reasoning", reasoning=reasoning))
+                    cost_text = stats.get("last_cost_formatted") or t("ai.cost_unknown")
+                    if stats.get("last_cost_source") == "estimate":
+                        cost_text = f"{cost_text} ({t('ai.cost_estimate_note', as_of=RATES_AS_OF)})"
+                    elif stats.get("last_cost_source") == "provider":
+                        cost_text = cost_text  # billed by provider
+                    lines.append(t("ai.preview_cost", cost=cost_text or t("ai.cost_unknown")))
+                    if reasoning or int(stats.get("tokens") or 0) > 400:
+                        lines.append(t("ai.preview_why_tokens"))
+                    lines.append(t("ai.preview_not_sent"))
+                    show_report(self, "Пример AI-сообщения", "\n".join(lines))
                     self.refresh_configs()
 
             self._safe_after(render)

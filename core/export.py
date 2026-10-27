@@ -288,6 +288,17 @@ def txt_lines_with_ids(rows) -> list[str]:
     return list(dict.fromkeys(lines))
 
 
+def parsed_txt_content(rows, format_name: str) -> str:
+    """Build a TXT body for parsed people. ``format_name`` is ``txt`` or ``txt_ids``."""
+    if format_name == "txt":
+        return "".join(
+            f"@{name}\n" for name in dict.fromkeys(row["username"] for row in rows if row.get("username"))
+        )
+    if format_name == "txt_ids":
+        return "".join(f"{line}\n" for line in txt_lines_with_ids(rows))
+    raise ValueError("Выберите TXT или TXT с ID")
+
+
 def write_parsed(path, rows, format_name):
     if format_name == "xlsx":
         write_parsed_xlsx(path, rows)
@@ -303,12 +314,8 @@ def write_parsed(path, rows, format_name):
             delete=False,
         ) as handle:
             temporary = Path(handle.name)
-            if format_name == "txt":
-                handle.write(
-                    "".join(f"@{name}\n" for name in dict.fromkeys(row["username"] for row in rows if row["username"]))
-                )
-            elif format_name == "txt_ids":
-                handle.write("".join(f"{line}\n" for line in txt_lines_with_ids(rows)))
+            if format_name in ("txt", "txt_ids"):
+                handle.write(parsed_txt_content(rows, format_name))
             elif format_name == "json":
                 json.dump(rows, handle, ensure_ascii=False, indent=2)
             elif format_name == "csv":

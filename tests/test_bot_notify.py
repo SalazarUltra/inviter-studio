@@ -15,7 +15,10 @@ from core.bot_notify import (
     detect_chat_id,
     load_bot_credentials,
     normalize_channel,
+    safe_document_filename,
     save_bot_settings,
+    send_document,
+    send_document_to_bot,
     send_message,
     send_to_bot,
     validate_chat_id,
@@ -85,8 +88,10 @@ class FakeAiohttp:
             async def __aexit__(self, *_exc):
                 return False
 
-            def post(self, url, json=None, allow_redirects=True):
-                outer.calls.append({"url": url, "json": json, "allow_redirects": allow_redirects})
+            def post(self, url, json=None, data=None, allow_redirects=True):
+                outer.calls.append(
+                    {"url": url, "json": json, "data": data, "allow_redirects": allow_redirects}
+                )
                 if outer.error:
                     raise outer.error
                 return FakeResponse(outer.status, outer.data)
@@ -187,6 +192,40 @@ class BotApiTests(unittest.IsolatedAsyncioTestCase):
             await send_message("bad", CHAT, "hi")
         self.assertEqual(fake.calls, [])
 
+    async def test_send_document_uses_multipart_and_safe_filename(self):
+        fake = FakeAiohttp()
+        with fake.patch():
+            await send_document(TOKEN, CHAT, "list@bad name!.txt", "@alice\n@bob\n", caption="Парсинг · 2")
+        call = fake.calls[0]
+        self.assertTrue(call["url"].endswith("/sendDocument"))
+        self.assertIsNone(call["json"])
+        self.assertIsNotNone(call["data"])
+        self.assertFalse(call["allow_redirects"])
+        self.assertEqual(fake.timeout.total, bot_notify.DOCUMENT_TIMEOUT)
+        by_name = {}
+        for options, headers, value in call["data"]._fields:
+            by_name[options["name"]] = (options, headers, value)
+        self.assertEqual(by_name["chat_id"][2], CHAT)
+        self.assertEqual(by_name["caption"][2], "Парсинг · 2")
+        options, headers, value = by_name["document"]
+        self.assertEqual(options["filename"], safe_document_filename("list@bad name!.txt"))
+        self.assertEqual(value, b"@alice\n@bob\n")
+        self.assertEqual(headers.get("Content-Type"), "text/plain; charset=utf-8")
+
+    async def test_send_document_rejects_empty_and_oversized(self):
+        fake = FakeAiohttp()
+        with fake.patch(), self.assertRaises(BotNotifyError):
+            await send_document(TOKEN, CHAT, "empty.txt", "")
+        with fake.patch(), self.assertRaises(BotNotifyError) as caught:
+            await send_document(TOKEN, CHAT, "big.txt", b"x" * (bot_notify.MAX_DOCUMENT_BYTES + 1))
+        self.assertIn("МБ", str(caught.exception))
+        self.assertEqual(fake.calls, [])
+
+    def test_safe_document_filename(self):
+        self.assertEqual(safe_document_filename("a b/@c!.TXT"), "a_b_c_.TXT")
+        self.assertTrue(safe_document_filename("list").endswith(".txt"))
+        self.assertEqual(safe_document_filename(""), "parsed.txt")
+
 
 class DetectChatTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
@@ -256,6 +295,21 @@ class StorageTests(DatabaseCase):
         with patch.object(bot_notify, "send_message", side_effect=OSError(f"boom {TOKEN}")):
             with self.assertRaises(BotNotifyError) as caught:
                 await send_to_bot(self.db, "x")
+        self.assertNotIn(TOKEN, str(caught.exception))
+
+    async def test_send_document_to_bot_uses_stored_credentials(self):
+        await save_bot_settings(self.db, token=TOKEN, chat_id=CHAT)
+        fake = FakeAiohttp()
+        with fake.patch():
+            await send_document_to_bot(self.db, "people.txt", "@a\n", caption="2 строки")
+        self.assertIn(f"/bot{TOKEN}/sendDocument", fake.calls[0]["url"])
+        self.assertIsNotNone(fake.calls[0]["data"])
+
+    async def test_send_document_to_bot_hides_unexpected_errors(self):
+        await save_bot_settings(self.db, token=TOKEN, chat_id=CHAT)
+        with patch.object(bot_notify, "send_document", side_effect=OSError(f"boom {TOKEN}")):
+            with self.assertRaises(BotNotifyError) as caught:
+                await send_document_to_bot(self.db, "x.txt", "x")
         self.assertNotIn(TOKEN, str(caught.exception))
 
     async def test_init_db_protects_plaintext_token_and_maps_legacy_flag(self):

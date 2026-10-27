@@ -27,6 +27,15 @@ PERIOD_CHOICES = {
     "Свои даты": "custom",
     "Вся доступная история": "all",
 }
+# Stable codes used by the UI (labels are translated separately).
+PERIOD_CODES = {
+    "7d": 7,
+    "30d": 30,
+    "90d": 90,
+    "custom": "custom",
+    "all": "all",
+}
+PERIOD_LOOKUP = {**PERIOD_CHOICES, **PERIOD_CODES}
 
 
 def utc(value):
@@ -37,7 +46,7 @@ def history_period(choice, start="", end="", now=None):
     now = now or datetime.now().astimezone()
     if now.tzinfo is None:
         raise ValueError("Время должно содержать часовой пояс")
-    selected = PERIOD_CHOICES.get(choice)
+    selected = PERIOD_LOOKUP.get(choice)
     if selected == "custom":
         try:
             begin_date, end_date = (

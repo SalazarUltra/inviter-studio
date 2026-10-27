@@ -284,7 +284,13 @@ class AccountManager:
                 return {"status": "code_required"}
 
             if await asyncio.wait_for(self.client.is_user_authorized(), timeout=15):
-                return {"status": "ok"}
+                me = await asyncio.wait_for(self.client.get_me(), timeout=15)
+                return {
+                    "status": "ok",
+                    "tg_first_name": str(getattr(me, "first_name", None) or "").strip(),
+                    "tg_last_name": str(getattr(me, "last_name", None) or "").strip(),
+                    "tg_username": str(getattr(me, "username", None) or "").strip().lstrip("@"),
+                }
             return {"status": "unauthorized"}
         except SessionPasswordNeededError:
             return {"status": "password_required"}

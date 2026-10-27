@@ -7,6 +7,7 @@ from tkinter import messagebox
 import customtkinter as ctk
 
 from core.ab_test import DEFAULT_SPLIT_A, normalize_split, planned_split, split_label
+from core.account_display import account_headline, account_menu_label
 from core.database import Database
 from core.diagnostics import estimate_messages_eta, format_report, message_usage_today, preflight
 from core.inviter import describe_next_available
@@ -1171,10 +1172,12 @@ class TaskTab(ctk.CTkFrame):
                 )
             )
             self.account_vars[account["id"]] = var
-            self._account_labels[account["id"]] = account["phone"]
+            self._account_labels[account["id"]] = account_headline(account) or account["phone"]
             checkbox = ctk.CTkCheckBox(
                 self.accounts_box,
-                text=f"{account['phone']} ({self._used_today(account)}/{account.get('daily_limit', 40)})",
+                text=account_menu_label(
+                    account, used=self._used_today(account), limit=account.get("daily_limit", 40)
+                ),
                 variable=var,
                 command=self.update_readiness,
             )

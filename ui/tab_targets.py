@@ -14,7 +14,8 @@ from core.export import write_targets_csv, write_targets_xlsx
 from core.user_feedback import explain_error
 from core.validation import parse_usernames, recipient_label
 from ui.campaigns import CampaignBar
-from ui.components import empty_state, page_intro
+from ui.components import empty_state, page_intro, set_page_intro
+from ui.i18n import t
 from ui.dispatch import post_ui
 from ui.hints import tip
 from ui.private_bridge_dialog import PrivateBridgeDialog
@@ -131,9 +132,7 @@ class TargetsTab(ctk.CTkFrame):
         self._query_generation = 0
         self._kind = None
 
-        self.intro = page_intro(
-            self, "Аудитория", "Загрузите список пользователей и следите за каждым результатом.", "ПОЛУЧАТЕЛИ"
-        )
+        self.intro = page_intro(self, t("targets.title"), t("targets.desc"), t("targets.kicker"))
         self.campaign_bar = CampaignBar(self)
         self.campaign_bar.pack(fill="x", padx=20, pady=(0, 4))
         editor_row = ctk.CTkFrame(self, fg_color="transparent")
@@ -860,3 +859,11 @@ class TargetsTab(ctk.CTkFrame):
             self._safe_after(render)
 
         fut.add_done_callback(done)
+
+    def retranslate(self) -> None:
+        set_page_intro(
+            self.intro,
+            title=t("targets.title"),
+            description=t("targets.desc"),
+            kicker=t("targets.kicker"),
+        )

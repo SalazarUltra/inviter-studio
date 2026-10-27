@@ -13,7 +13,7 @@ from typing import Any
 from telethon.errors import AuthKeyUnregisteredError, FloodWaitError, PeerFloodError
 
 from core.account_manager import AccountManager
-from core.ai_writer import AIWriter
+from core.ai_writer import AIWriter, normalize_tone
 from core.user_feedback import explain_error
 from core.warmup_actions import WarmupActions
 
@@ -155,7 +155,7 @@ class WarmupEngine:
         self.ai_writer = AIWriter(config=ai_config or {}, topic=topic, db=self.db)
         memory_enabled_setting = await self.db.get_setting("ai_memory_enabled", "1")
         memory_enabled = str(memory_enabled_setting or "1") == "1"
-        tone = str(await self.db.get_setting("ai_style_tone", "neutral") or "neutral").strip().lower()
+        tone = normalize_tone(await self.db.get_setting("ai_style_tone", "neutral"))
         try:
             hourly_limit = int(await self.db.get_setting("ai_hourly_limit", "6") or 6)
         except Exception:

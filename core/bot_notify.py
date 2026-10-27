@@ -1,8 +1,8 @@
 """User-owned Telegram bot notifications (Bot API over HTTPS).
 
 Each user connects THEIR OWN bot (created in @BotFather): the token is stored DPAPI-protected like API keys,
-the chat id is a plain number. The bot only delivers the same counters-only summary text as the Saved Messages
-path (see ``core.summary``): no recipient lists, no phone numbers.
+the chat id is a plain number. Automatic summaries stay counters-only (see ``core.summary``). Separately, the
+user can manually send a parsed TXT file (usernames / ids they already collected) via ``sendDocument``.
 
 Safety rules:
 * the token lives only in the request URL path; it is never logged and never put into an error message
@@ -33,10 +33,14 @@ CHANNELS = (CHANNEL_OFF, CHANNEL_SAVED, CHANNEL_BOT, CHANNEL_BOTH)
 
 API_BASE = "https://api.telegram.org"
 REQUEST_TIMEOUT = 15
+DOCUMENT_TIMEOUT = 60
 MAX_TEXT = 4096
+MAX_CAPTION = 1024
+MAX_DOCUMENT_BYTES = 20 * 1024 * 1024
 
 _TOKEN_RE = re.compile(r"^\d{6,12}:[A-Za-z0-9_-]{30,64}$")
 _CHAT_ID_RE = re.compile(r"^-?\d{1,15}$")
+_FILENAME_RE = re.compile(r"[^\w.\-]+", re.UNICODE)
 
 
 class BotNotifyError(RuntimeError):
@@ -119,18 +123,25 @@ def _error_for(status: int, data: Any, *, method: str) -> BotNotifyError:
             )
         if "too long" in description:
             return BotNotifyError("Сообщение слишком длинное для Telegram.")
+        if "file is too big" in description or "too big" in description:
+            return BotNotifyError("Файл слишком большой для Telegram. Сохраните его на ПК кнопкой «Сохранить файл».")
         return BotNotifyError("Telegram отклонил запрос бота. Проверьте токен и chat_id.")
     if status >= 500:
         return BotNotifyError("Сервис Telegram временно недоступен. Повторите позже.")
     return BotNotifyError(f"Telegram ответил кодом {status} ({method}). Проверьте токен и chat_id.")
 
 
-async def _call(token: str, method: str, payload: dict, timeout: float = REQUEST_TIMEOUT) -> Any:
-    """POST ``payload`` to a Bot API method and return ``result``; raises ``BotNotifyError`` only."""
+async def _post(token: str, method: str, *, json_payload: dict | None = None, form: aiohttp.FormData | None = None, timeout: float = REQUEST_TIMEOUT) -> Any:
+    """POST JSON or multipart to a Bot API method and return ``result``; raises ``BotNotifyError`` only."""
     url = f"{API_BASE}/bot{token}/{method}"
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
-            async with session.post(url, json=payload, allow_redirects=False) as response:
+            async with session.post(
+                url,
+                json=json_payload,
+                data=form,
+                allow_redirects=False,
+            ) as response:
                 status = response.status
                 try:
                     data = await response.json(content_type=None)
@@ -146,6 +157,17 @@ async def _call(token: str, method: str, payload: dict, timeout: float = REQUEST
     return data.get("result")
 
 
+async def _call(token: str, method: str, payload: dict, timeout: float = REQUEST_TIMEOUT) -> Any:
+    return await _post(token, method, json_payload=payload, timeout=timeout)
+
+
+def safe_document_filename(name: Any) -> str:
+    cleaned = _FILENAME_RE.sub("_", str(name or "").strip()).strip("._") or "parsed"
+    if not cleaned.lower().endswith(".txt"):
+        cleaned += ".txt"
+    return cleaned[:120]
+
+
 async def send_message(token: str, chat_id: str | int, text: str, *, timeout: float = REQUEST_TIMEOUT) -> None:
     token = validate_token(token)
     chat = validate_chat_id(chat_id)
@@ -154,6 +176,40 @@ async def send_message(token: str, chat_id: str | int, text: str, *, timeout: fl
         raise BotNotifyError("Пустое сообщение не отправляется.")
     payload = {"chat_id": int(chat), "text": body[:MAX_TEXT], "disable_web_page_preview": True}
     await _call(token, "sendMessage", payload, timeout)
+
+
+async def send_document(
+    token: str,
+    chat_id: str | int,
+    filename: str,
+    content: bytes | str,
+    *,
+    caption: str = "",
+    timeout: float = DOCUMENT_TIMEOUT,
+) -> None:
+    """Send a small text file through Bot API ``sendDocument`` (multipart)."""
+    token = validate_token(token)
+    chat = validate_chat_id(chat_id)
+    data = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+    if not data:
+        raise BotNotifyError("Пустой файл не отправляется.")
+    if len(data) > MAX_DOCUMENT_BYTES:
+        raise BotNotifyError(
+            f"Файл слишком большой для отправки через бота (больше {MAX_DOCUMENT_BYTES // (1024 * 1024)} МБ). "
+            "Сохраните его на ПК кнопкой «Сохранить файл»."
+        )
+    form = aiohttp.FormData()
+    form.add_field("chat_id", str(int(chat)))
+    caption_text = str(caption or "").strip()
+    if caption_text:
+        form.add_field("caption", caption_text[:MAX_CAPTION])
+    form.add_field(
+        "document",
+        data,
+        filename=safe_document_filename(filename),
+        content_type="text/plain; charset=utf-8",
+    )
+    await _post(token, "sendDocument", form=form, timeout=timeout)
 
 
 def _pick_chat(updates: Any) -> str | None:
@@ -241,3 +297,14 @@ async def send_to_bot(db, text: str) -> None:
         raise
     except Exception:  # noqa: BLE001 - unknown errors might quote the URL (= token); drop their text
         raise BotNotifyError("Не удалось отправить сообщение через бота. Проверьте интернет и настройки.") from None
+
+
+async def send_document_to_bot(db, filename: str, content: bytes | str, *, caption: str = "") -> None:
+    """Send a document through the user's own bot using the stored token and chat id."""
+    token, chat_id = await load_bot_credentials(db)
+    try:
+        await send_document(token, chat_id, filename, content, caption=caption)
+    except BotNotifyError:
+        raise
+    except Exception:  # noqa: BLE001 - unknown errors might quote the URL (= token); drop their text
+        raise BotNotifyError("Не удалось отправить файл через бота. Проверьте интернет и настройки.") from None

@@ -5,11 +5,13 @@ from datetime import datetime
 
 import customtkinter as ctk
 
+from core.account_display import account_headline, account_person_name
 from ui.artwork import studio_art
 from ui.conversion_panel import ConversionPanel
 from ui.dispatch import post_ui
+from ui.i18n import t
 from ui.icons import icon
-from ui.tab_logs import display_log_message
+from ui.tab_logs import action_label, display_log_message
 from ui.theme import (
     COLORS,
     FONTS,
@@ -22,6 +24,12 @@ from ui.theme import (
 )
 
 
+def account_status_label(status: str) -> str:
+    key = f"status.{status}"
+    text = t(key)
+    return text if text != key else t("status.unknown")
+
+
 class TabDashboard(ctk.CTkFrame):
     def __init__(self, parent, app):
         super().__init__(parent, fg_color=COLORS["bg"])
@@ -32,6 +40,10 @@ class TabDashboard(ctk.CTkFrame):
         self._last_accounts_sig = None
         self._last_logs_sig = None
         self._density_mode = "normal"
+        self._last_data = None
+        self._tool_buttons = {}
+        self._tool_descs = {}
+        self._stat_titles = {}
         self._build_ui()
         self._start_auto_refresh()
 
@@ -41,12 +53,13 @@ class TabDashboard(ctk.CTkFrame):
         content = self.scroll
         heading = ctk.CTkFrame(content, fg_color="transparent")
         heading.pack(fill="x", padx=18, pady=(10, 16))
-        ctk.CTkLabel(heading, text="Ваше рабочее пространство", font=FONTS["heading"]).pack(side="left")
+        self.workspace_label = ctk.CTkLabel(heading, text=t("dash.workspace"), font=FONTS["heading"])
+        self.workspace_label.pack(side="left")
         self.clock_label = ctk.CTkLabel(heading, text="", font=FONTS["small"], text_color=COLORS["muted"])
         self.clock_label.pack(side="right")
         self.support_button = ctk.CTkButton(
             heading,
-            text="Поддержать проект",
+            text=t("nav.support"),
             height=32,
             width=174,
             image=icon("support", COLORS["accent"], 16),
@@ -63,49 +76,46 @@ class TabDashboard(ctk.CTkFrame):
         hero.grid_columnconfigure(0, weight=1)
         copy = ctk.CTkFrame(hero, fg_color="transparent")
         copy.grid(row=0, column=0, sticky="nsew", padx=26, pady=24)
-        ctk.CTkLabel(copy, text="TELEGRAM. В ВАШЕМ РИТМЕ.", font=FONTS["label"], text_color=COLORS["accent"]).pack(
-            anchor="w"
+        self.hero_kicker = ctk.CTkLabel(
+            copy, text=t("dash.hero_kicker"), font=FONTS["label"], text_color=COLORS["accent"]
         )
-        ctk.CTkLabel(copy, text="Начните с трёх шагов", font=FONTS["heading"], justify="left", anchor="w").pack(
-            anchor="w", pady=(10, 8)
+        self.hero_kicker.pack(anchor="w")
+        self.hero_title = ctk.CTkLabel(
+            copy, text=t("dash.hero_title"), font=FONTS["heading"], justify="left", anchor="w"
         )
-        ctk.CTkLabel(
+        self.hero_title.pack(anchor="w", pady=(10, 8))
+        self.hero_body = ctk.CTkLabel(
             copy,
-            text="1. Подключите свой Telegram-аккаунт.\n2. Вставьте список людей в «Аудитории».\n3. Выберите режим и настройте «Задачу».",
+            text=t("dash.hero_body"),
             font=FONTS["body"],
             text_color=COLORS["hero_text"],
             justify="left",
-        ).pack(anchor="w")
-        cta = ctk.CTkButton(
+        )
+        self.hero_body.pack(anchor="w")
+        self.hero_cta = ctk.CTkButton(
             copy,
-            text="Пошаговая инструкция",
+            text=t("dash.hero_cta"),
             width=220,
             height=40,
             image=icon("arrow", COLORS["bg"], 16),
             compound="right",
             command=lambda: self.app.show_help("start"),
         )
-        apply_button_role(cta, "primary")
-        cta.pack(anchor="w", pady=(18, 0))
+        apply_button_role(self.hero_cta, "primary")
+        self.hero_cta.pack(anchor="w", pady=(18, 0))
         self.hero_art = ctk.CTkLabel(hero, text="", image=studio_art(330, 218))
         self.hero_art.grid(row=0, column=1, sticky="e", padx=(0, 22), pady=18)
         self.bind("<Configure>", self._resize_hero, add="+")
         section = ctk.CTkFrame(content, fg_color="transparent")
-
-        ctk.CTkLabel(section, text="Начните с нужного инструмента", font=FONTS["subhead"]).pack(side="left")
-        ctk.CTkLabel(section, text="РАБОЧЕЕ ПРОСТРАНСТВО", font=FONTS["label"], text_color=COLORS["subtle"]).pack(
-            side="right"
+        self.tools_title = ctk.CTkLabel(section, text=t("dash.tools_title"), font=FONTS["subhead"])
+        self.tools_title.pack(side="left")
+        self.tools_kicker = ctk.CTkLabel(
+            section, text=t("dash.tools_kicker"), font=FONTS["label"], text_color=COLORS["subtle"]
         )
+        self.tools_kicker.pack(side="right")
         tools = ctk.CTkFrame(content, fg_color="transparent")
-
         tools.grid_columnconfigure((0, 1, 2), weight=1, uniform="tools")
-        for column, (key, title, description) in enumerate(
-            (
-                ("accounts", "Аккаунты", "Подключение и управление"),
-                ("targets", "Аудитория", "Списки и результаты"),
-                ("ai", "AI-студия", "Модели и генерация"),
-            )
-        ):
+        for column, key in enumerate(("accounts", "targets", "ai")):
             card = ctk.CTkFrame(
                 tools, fg_color=COLORS["surface"], corner_radius=14, border_width=1, border_color=COLORS["border"]
             )
@@ -115,7 +125,7 @@ class TabDashboard(ctk.CTkFrame):
             ctk.CTkLabel(line, text="", image=icon(key, COLORS["accent"], 22), width=28).pack(side="left")
             button = ctk.CTkButton(
                 line,
-                text=title,
+                text=t(f"dash.tool.{key}"),
                 image=icon("arrow", COLORS["muted"], 15),
                 compound="right",
                 anchor="w",
@@ -126,28 +136,34 @@ class TabDashboard(ctk.CTkFrame):
             apply_button_role(button, "ghost")
             button.configure(text_color=COLORS["text"])
             button.pack(side="left", fill="x", expand=True)
-            ctk.CTkLabel(card, text=description, font=FONTS["small"], text_color=COLORS["muted"], anchor="w").pack(
-                fill="x", padx=16, pady=(0, 16)
+            desc = ctk.CTkLabel(
+                card, text=t(f"dash.tool.{key}_desc"), font=FONTS["small"], text_color=COLORS["muted"], anchor="w"
             )
+            desc.pack(fill="x", padx=16, pady=(0, 16))
+            self._tool_buttons[key] = button
+            self._tool_descs[key] = desc
         stats_title = ctk.CTkFrame(content, fg_color="transparent")
         stats_title.pack(fill="x", padx=18, pady=(0, 10))
-        ctk.CTkLabel(stats_title, text="Сейчас в пространстве", font=FONTS["subhead"]).pack(side="left")
-        ctk.CTkLabel(stats_title, text="●  Данные программы", font=FONTS["small"], text_color=COLORS["accent"]).pack(
-            side="right"
+        self.now_label = ctk.CTkLabel(stats_title, text=t("dash.now"), font=FONTS["subhead"])
+        self.now_label.pack(side="left")
+        self.live_label = ctk.CTkLabel(
+            stats_title, text=t("dash.live"), font=FONTS["small"], text_color=COLORS["accent"]
         )
+        self.live_label.pack(side="right")
         top_row = ctk.CTkFrame(content, fg_color="transparent")
         top_row.pack(fill="x", padx=18, pady=(0, 14))
         top_row.grid_columnconfigure((0, 1, 2), weight=1, uniform="stats")
-        self.card_accounts = self._make_stat_card(top_row, "АККАУНТЫ", col=0)
-        self.card_task = self._make_stat_card(top_row, "РЕЗУЛЬТАТЫ", col=1)
-        self.card_warmup = self._make_stat_card(top_row, "ПРОГРЕВ", col=2)
+        self.card_accounts = self._make_stat_card(top_row, t("dash.card.accounts"), col=0, key="accounts")
+        self.card_task = self._make_stat_card(top_row, t("dash.card.results"), col=1, key="results")
+        self.card_warmup = self._make_stat_card(top_row, t("dash.card.warmup"), col=2, key="warmup")
         section.pack(fill="x", padx=18, pady=(4, 12))
         tools.pack(fill="x", padx=18, pady=(0, 22))
         progress_block = ctk.CTkFrame(content, fg_color=COLORS["surface"], corner_radius=14)
         progress_block.pack(fill="x", padx=18, pady=(0, 14))
         progress_header = ctk.CTkFrame(progress_block, fg_color="transparent")
         progress_header.pack(fill="x", padx=18, pady=(14, 10))
-        ctk.CTkLabel(progress_header, text="Прогресс аудитории", font=FONTS["subhead"]).pack(side="left")
+        self.progress_title = ctk.CTkLabel(progress_header, text=t("dash.progress_title"), font=FONTS["subhead"])
+        self.progress_title.pack(side="left")
         self.progress_percent = ctk.CTkLabel(
             progress_header, text="0%", font=FONTS["subhead"], text_color=COLORS["accent"]
         )
@@ -156,7 +172,7 @@ class TabDashboard(ctk.CTkFrame):
         self.main_progress.pack(fill="x", padx=18, pady=(0, 10))
         self.main_progress.set(0)
         self.progress_label = ctk.CTkLabel(
-            progress_block, text="Нет активной задачи", font=FONTS["small"], text_color=COLORS["muted"]
+            progress_block, text=t("dash.no_task"), font=FONTS["small"], text_color=COLORS["muted"]
         )
         self.progress_label.pack(anchor="w", padx=18, pady=(0, 14))
         bottom = ctk.CTkFrame(content, fg_color="transparent")
@@ -164,19 +180,21 @@ class TabDashboard(ctk.CTkFrame):
         bottom.grid_columnconfigure((0, 1), weight=1, uniform="details")
         left_block = ctk.CTkFrame(bottom, fg_color=COLORS["surface"], corner_radius=14)
         left_block.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
-        ctk.CTkLabel(left_block, text="Ваши аккаунты", font=FONTS["subhead"]).pack(anchor="w", padx=18, pady=(16, 10))
+        self.accounts_title = ctk.CTkLabel(left_block, text=t("dash.your_accounts"), font=FONTS["subhead"])
+        self.accounts_title.pack(anchor="w", padx=18, pady=(16, 10))
         self.accounts_scroll = ctk.CTkScrollableFrame(left_block, fg_color="transparent", height=170)
         self.accounts_scroll.pack(fill="both", expand=True, padx=8, pady=(0, 12))
         right_block = ctk.CTkFrame(bottom, fg_color=COLORS["surface"], corner_radius=14)
         right_block.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
         log_header = ctk.CTkFrame(right_block, fg_color="transparent")
         log_header.pack(fill="x", padx=18, pady=(16, 10))
-        ctk.CTkLabel(log_header, text="Последние действия", font=FONTS["subhead"]).pack(side="left")
-        link = ctk.CTkButton(
-            log_header, text="Журнал ↗", width=90, height=26, command=lambda: self.app.switch_tab("logs")
+        self.recent_title = ctk.CTkLabel(log_header, text=t("dash.recent"), font=FONTS["subhead"])
+        self.recent_title.pack(side="left")
+        self.log_link = ctk.CTkButton(
+            log_header, text=t("dash.open_log"), width=90, height=26, command=lambda: self.app.switch_tab("logs")
         )
-        apply_button_role(link, "ghost")
-        link.pack(side="right")
+        apply_button_role(self.log_link, "ghost")
+        self.log_link.pack(side="right")
         self.recent_log = ctk.CTkTextbox(right_block, fg_color=COLORS["input"], font=FONTS["mono"], height=170)
         self.recent_log.pack(fill="both", expand=True, padx=18, pady=(0, 16))
         self.recent_log.configure(state="disabled")
@@ -190,7 +208,6 @@ class TabDashboard(ctk.CTkFrame):
                 "TIME": COLORS["subtle"],
             },
         )
-
         self.conversion = ConversionPanel(content, self.app)
         self.conversion.pack(fill="x", padx=18, pady=(0, 20))
 
@@ -205,7 +222,7 @@ class TabDashboard(ctk.CTkFrame):
     def _safe_after(self, callback) -> None:
         post_ui(self, callback)
 
-    def _make_stat_card(self, parent, title: str, col: int) -> ctk.CTkFrame:
+    def _make_stat_card(self, parent, title: str, col: int, key: str) -> ctk.CTkFrame:
         card = ctk.CTkFrame(
             parent,
             fg_color=COLORS["surface"],
@@ -221,15 +238,12 @@ class TabDashboard(ctk.CTkFrame):
             pady=0,
         )
         style_card(card, color=COLORS["accent"])
-        ctk.CTkLabel(
-            card,
-            text=title,
-            font=FONTS["label"],
-            text_color=COLORS["muted"],
-        ).pack(anchor="w", padx=14, pady=(12, 4))
+        title_label = ctk.CTkLabel(card, text=title, font=FONTS["label"], text_color=COLORS["muted"])
+        title_label.pack(anchor="w", padx=14, pady=(12, 4))
         content = ctk.CTkFrame(card, fg_color="transparent")
         content.pack(fill="both", expand=True, padx=14, pady=(0, 12))
         card.content = content  # type: ignore[attr-defined]
+        self._stat_titles[key] = title_label
         return card
 
     def _update_clock(self):
@@ -247,8 +261,10 @@ class TabDashboard(ctk.CTkFrame):
                 self.after_cancel(self._refresh_job)
             except Exception:
                 pass
-        self._refresh()
-        self._refresh_job = self.after(5000, self._start_auto_refresh)
+        # Refresh only while Overview is open — avoids background UI work.
+        if getattr(self.app, "current_tab_key", None) in (None, "dashboard"):
+            self._refresh()
+        self._refresh_job = self.after(8000, self._start_auto_refresh)
 
     def _refresh(self):
         if self.app._closing:
@@ -288,8 +304,14 @@ class TabDashboard(ctk.CTkFrame):
                         "day_total": session.get("day_total", 7),
                     }
                 )
+        from core.ai_pricing import resolve_stored_cost
+
         ai_configs = await db.get_ai_configs()
-        total_ai_cost = sum(float(c.get("total_cost_usd") or 0.0) for c in ai_configs)
+        total_ai_cost = 0.0
+        for cfg in ai_configs:
+            amount, _source = resolve_stored_cost(cfg)
+            if amount is not None:
+                total_ai_cost += float(amount)
         return {
             "accounts": accounts,
             "active_count": len(active),
@@ -307,6 +329,7 @@ class TabDashboard(ctk.CTkFrame):
     def _update_ui(self, data: dict):
         if data["campaign_id"] != self.app.db.campaign_id:
             return
+        self._last_data = data
         self._update_accounts_card(data)
         self._update_task_card(data)
         self._update_warmup_card(data)
@@ -323,29 +346,18 @@ class TabDashboard(ctk.CTkFrame):
         active = data["active_count"]
         flood = data["flood_count"]
         ctk.CTkLabel(
-            self.card_accounts.content,
-            text=str(total),
-            font=FONTS["stat"],
-            text_color=COLORS["text"],
+            self.card_accounts.content, text=str(total), font=FONTS["stat"], text_color=COLORS["text"]
         ).pack(anchor="w")
         ctk.CTkLabel(
-            self.card_accounts.content,
-            text="аккаунтов",
-            font=FONTS["small"],
-            text_color=COLORS["muted"],
+            self.card_accounts.content, text=t("dash.accounts_unit"), font=FONTS["small"], text_color=COLORS["muted"]
         ).pack(anchor="w", pady=(0, 6))
-        details = [(f"{active} активных", COLORS["success"])]
+        details = [(t("dash.active_n", n=active), COLORS["success"])]
         if flood:
-            details.append((f"Пауза Telegram: {flood}", COLORS["warning"]))
+            details.append((t("dash.flood_n", n=flood), COLORS["warning"]))
         if data["disabled_count"]:
-            details.append((f"{data['disabled_count']} отключён", COLORS["muted"]))
+            details.append((t("dash.disabled_n", n=data["disabled_count"]), COLORS["muted"]))
         for text, color in details:
-            ctk.CTkLabel(
-                self.card_accounts.content,
-                text=text,
-                font=FONTS["small"],
-                text_color=color,
-            ).pack(anchor="w")
+            ctk.CTkLabel(self.card_accounts.content, text=text, font=FONTS["small"], text_color=color).pack(anchor="w")
 
     def _update_task_card(self, data: dict):
         for w in self.card_task.content.winfo_children():
@@ -363,30 +375,27 @@ class TabDashboard(ctk.CTkFrame):
         ).pack(anchor="w")
         ctk.CTkLabel(
             self.card_task.content,
-            text=f"успешно из {total}",
+            text=t("dash.success_of", total=total),
             font=FONTS["small"],
             text_color=COLORS["muted"],
         ).pack(anchor="w", pady=(0, 6))
         if pending > 0:
             ctk.CTkLabel(
                 self.card_task.content,
-                text=f"⏳  {pending} ожидает",
+                text=t("dash.pending_n", n=pending),
                 font=FONTS["small"],
                 text_color=COLORS["warning"],
             ).pack(anchor="w")
         if errors > 0:
             ctk.CTkLabel(
                 self.card_task.content,
-                text=f"{errors} ошибок",
+                text=t("dash.errors_n", n=errors),
                 font=FONTS["small"],
                 text_color=COLORS["error"],
             ).pack(anchor="w")
         if total == 0:
             ctk.CTkLabel(
-                self.card_task.content,
-                text="Список не загружен",
-                font=FONTS["small"],
-                text_color=COLORS["muted"],
+                self.card_task.content, text=t("dash.list_empty"), font=FONTS["small"], text_color=COLORS["muted"]
             ).pack(anchor="w")
 
     def _update_warmup_card(self, data: dict):
@@ -395,37 +404,27 @@ class TabDashboard(ctk.CTkFrame):
         sessions = data["warmup_sessions"]
         if not sessions:
             ctk.CTkLabel(
-                self.card_warmup.content,
-                text="—",
-                font=FONTS["stat"],
-                text_color=COLORS["muted"],
+                self.card_warmup.content, text="—", font=FONTS["stat"], text_color=COLORS["muted"]
             ).pack(anchor="w")
             ctk.CTkLabel(
-                self.card_warmup.content,
-                text="прогрев не запущен",
-                font=FONTS["small"],
-                text_color=COLORS["muted"],
+                self.card_warmup.content, text=t("dash.warmup_off"), font=FONTS["small"], text_color=COLORS["muted"]
             ).pack(anchor="w")
             return
         ctk.CTkLabel(
-            self.card_warmup.content,
-            text=str(len(sessions)),
-            font=FONTS["stat"],
-            text_color=COLORS["accent"],
+            self.card_warmup.content, text=str(len(sessions)), font=FONTS["stat"], text_color=COLORS["accent"]
         ).pack(anchor="w")
         ctk.CTkLabel(
-            self.card_warmup.content,
-            text="в прогреве",
-            font=FONTS["small"],
-            text_color=COLORS["muted"],
+            self.card_warmup.content, text=t("dash.warmup_on"), font=FONTS["small"], text_color=COLORS["muted"]
         ).pack(anchor="w", pady=(0, 6))
         for s in sessions[:2]:
-            day = s["day_current"]
-            total = s["day_total"]
-            phone_short = s["phone"][-4:]
             ctk.CTkLabel(
                 self.card_warmup.content,
-                text=f"...{phone_short}  День {day}/{total}",
+                text=t(
+                    "dash.warmup_day",
+                    phone=str(s["phone"])[-4:],
+                    day=s["day_current"],
+                    total=s["day_total"],
+                ),
                 font=FONTS["small"],
                 text_color=COLORS["warning"],
             ).pack(anchor="w")
@@ -433,10 +432,7 @@ class TabDashboard(ctk.CTkFrame):
             cost = data["total_ai_cost"]
             color = COLORS["success"] if cost < 0.01 else COLORS["warning"]
             ctk.CTkLabel(
-                self.card_warmup.content,
-                text=f"AI: ${cost:.4f}",
-                font=FONTS["small"],
-                text_color=color,
+                self.card_warmup.content, text=f"AI: ${cost:.4f}", font=FONTS["small"], text_color=color
             ).pack(anchor="w", pady=(4, 0))
 
     def _update_progress(self, data: dict):
@@ -448,12 +444,18 @@ class TabDashboard(ctk.CTkFrame):
             self.main_progress.set(pct)
             self.progress_percent.configure(text=f"{int(pct * 100)}%")
             self.progress_label.configure(
-                text=f"Успешно {added} из {total}  •  Осталось: {stats.get('pending', 0)}  •  Ошибок: {stats.get('errors', 0)}"
+                text=t(
+                    "dash.progress_line",
+                    added=added,
+                    total=total,
+                    pending=stats.get("pending", 0),
+                    errors=stats.get("errors", 0),
+                )
             )
         else:
             self.main_progress.set(0)
             self.progress_percent.configure(text="0%")
-            self.progress_label.configure(text="Список не загружен")
+            self.progress_label.configure(text=t("dash.list_empty"))
 
     def _update_accounts_list(self, accounts: list, kind="invite"):
         counter_key = "sent_today" if kind == "messages" else "added_today"
@@ -466,6 +468,9 @@ class TabDashboard(ctk.CTkFrame):
                 int(a.get(counter_key, 0) or 0),
                 int(a.get("daily_limit", 40)),
                 a.get("device_profile") or "",
+                a.get("tg_first_name") or "",
+                a.get("tg_last_name") or "",
+                a.get("tg_username") or "",
             )
             for a in accounts
         )
@@ -476,10 +481,7 @@ class TabDashboard(ctk.CTkFrame):
             w.destroy()
         if not accounts:
             ctk.CTkLabel(
-                self.accounts_scroll,
-                text="Нет аккаунтов",
-                font=FONTS["body"],
-                text_color=COLORS["muted"],
+                self.accounts_scroll, text=t("dash.no_accounts"), font=FONTS["body"], text_color=COLORS["muted"]
             ).pack(pady=16)
             return
         status_map = {
@@ -489,14 +491,6 @@ class TabDashboard(ctk.CTkFrame):
             "inactive": ("I", COLORS["muted"]),
             "restricted": ("R", COLORS["error"]),
             "unauthorized": ("!", COLORS["warning"]),
-        }
-        status_text_map = {
-            "active": "Активен",
-            "flood": "Пауза Telegram",
-            "error": "Ошибка",
-            "inactive": "Неактивен",
-            "restricted": "Отправка требует проверки",
-            "unauthorized": "Нужен вход",
         }
         for acc in accounts:
             card = ctk.CTkFrame(
@@ -513,43 +507,43 @@ class TabDashboard(ctk.CTkFrame):
             if not acc.get("is_enabled", 1):
                 status = "inactive"
             dot, color = status_map.get(status, ("I", COLORS["muted"]))
-            status_text = status_text_map.get(status, "Неизвестно")
-            ctk.CTkLabel(
-                row1,
-                text=f"{dot}  {acc['phone']}",
-                font=FONTS["subhead"],
-                text_color=color,
-            ).pack(side="left")
+            name = account_person_name(acc)
+            title = f"{dot}  {name}" if name else f"{dot}  {acc['phone']}"
+            ctk.CTkLabel(row1, text=title, font=FONTS["subhead"], text_color=color).pack(side="left")
             added_today = int(acc.get(counter_key, 0) or 0)
             limit = int(acc.get("daily_limit", 40))
             limit_color = COLORS["error"] if added_today >= limit else COLORS["text"]
-            ctk.CTkLabel(
-                row1,
-                text=f"{added_today}/{limit}",
-                font=FONTS["subhead"],
-                text_color=limit_color,
-            ).pack(side="right")
+            ctk.CTkLabel(row1, text=f"{added_today}/{limit}", font=FONTS["subhead"], text_color=limit_color).pack(
+                side="right"
+            )
             row2 = ctk.CTkFrame(card, fg_color="transparent")
-            row2.pack(fill="x", padx=12, pady=(0, density["row_pad_y"] * 2))
+            row2.pack(fill="x", padx=12, pady=(0, density["row_pad_y"]))
+            subtitle = account_headline(acc) if name else acc["phone"]
+            if name:
+                # Name already on row1 — show phone + @user on the second line.
+                parts = [acc["phone"]]
+                username = str(acc.get("tg_username") or "").strip().lstrip("@")
+                if username:
+                    parts.insert(0, "@" + username)
+                subtitle = " · ".join(parts)
+            ctk.CTkLabel(row2, text=subtitle, font=FONTS["label"], text_color=COLORS["muted"]).pack(side="left")
+            ctk.CTkLabel(row2, text=account_status_label(status), font=FONTS["label"], text_color=color).pack(
+                side="right"
+            )
+            row3 = ctk.CTkFrame(card, fg_color="transparent")
+            row3.pack(fill="x", padx=12, pady=(0, density["row_pad_y"] * 2))
             device = ""
             if acc.get("device_profile"):
                 try:
-                    d = json.loads(acc["device_profile"])
-                    device = d.get("device_model", "")
+                    device = json.loads(acc["device_profile"]).get("device_model", "") or ""
                 except Exception:
-                    pass
+                    device = ""
             ctk.CTkLabel(
-                row2,
-                text=f"Устройство: {device}" if device else "Устройство: Неизвестно",
+                row3,
+                text=t("dash.device", value=device or t("dash.device_unknown")),
                 font=FONTS["label"],
                 text_color=COLORS["muted"],
             ).pack(side="left")
-            ctk.CTkLabel(
-                row2,
-                text=status_text,
-                font=FONTS["label"],
-                text_color=color,
-            ).pack(side="right")
 
     def _update_recent_log(self, logs: list):
         signature = tuple((entry.get("created_at"), entry.get("action"), entry.get("message")) for entry in logs[:15])
@@ -559,18 +553,21 @@ class TabDashboard(ctk.CTkFrame):
         self.recent_log.configure(state="normal")
         self.recent_log.delete("1.0", "end")
         if not logs:
-            self.recent_log.insert("end", "Нет записей\n", "INFO")
+            self.recent_log.insert("end", t("dash.no_logs") + "\n", "INFO")
+            self.recent_log.configure(state="disabled")
             return
         icons = {
-            "ADD_SUCCESS": ("[УСПЕХ]", "SUCCESS"),
-            "ADD_ERROR": ("[ОШИБКА]", "ERROR"),
-            "FLOOD_WAIT": ("[ПАУЗА]", "WARN"),
-            "SKIP": ("[ПРОПУСК]", "INFO"),
-            "CONNECT": ("[СВЯЗЬ]", "INFO"),
-            "INFO": ("[СВЕДЕНИЕ]", "INFO"),
-            "SUCCESS": ("[УСПЕХ]", "SUCCESS"),
-            "ERROR": ("[ОШИБКА]", "ERROR"),
-            "WARN": ("[ВНИМАНИЕ]", "WARN"),
+            "ADD_SUCCESS": (t("log.tag.success"), "SUCCESS"),
+            "ADD_ERROR": (t("log.tag.error"), "ERROR"),
+            "FLOOD_WAIT": (t("log.tag.flood"), "WARN"),
+            "SKIP": (t("log.tag.skip"), "INFO"),
+            "CONNECT": (t("log.tag.connect"), "INFO"),
+            "INFO": (t("log.tag.info"), "INFO"),
+            "SUCCESS": (t("log.tag.success"), "SUCCESS"),
+            "ERROR": (t("log.tag.error"), "ERROR"),
+            "WARN": (t("log.tag.warn"), "WARN"),
+            "MESSAGE_SENT": (t("log.tag.success"), "SUCCESS"),
+            "DISCONNECT": (t("log.tag.connect"), "INFO"),
         }
         for log in logs[:15]:
             try:
@@ -579,10 +576,12 @@ class TabDashboard(ctk.CTkFrame):
             except Exception:
                 time_str = "--:--"
             action = log.get("action", "INFO")
-            icon, tag = icons.get(action, ("•", "INFO"))
-            msg = display_log_message(log.get("message", ""))[:60]
+            mark, tag = icons.get(action, ("•", "INFO"))
+            raw = display_log_message(log.get("message", ""))
+            # Prefer a translated action label when the raw body is empty or still a known action code.
+            msg = (raw or action_label(action))[:60]
             self.recent_log.insert("end", f"[{time_str}] ", "TIME")
-            self.recent_log.insert("end", f"{icon} {msg}\n", tag)
+            self.recent_log.insert("end", f"{mark} {msg}\n", tag)
         self.recent_log.see("end")
         self.recent_log.configure(state="disabled")
 
@@ -596,8 +595,34 @@ class TabDashboard(ctk.CTkFrame):
         super().destroy()
 
     def retranslate(self) -> None:
-        """Relabel the translated dashboard sections after a language switch."""
+        """Relabel Overview after a language switch and rebuild dynamic cards."""
+        self.workspace_label.configure(text=t("dash.workspace"))
+        self.support_button.configure(text=t("nav.support"))
+        self.hero_kicker.configure(text=t("dash.hero_kicker"))
+        self.hero_title.configure(text=t("dash.hero_title"))
+        self.hero_body.configure(text=t("dash.hero_body"))
+        self.hero_cta.configure(text=t("dash.hero_cta"))
+        self.tools_title.configure(text=t("dash.tools_title"))
+        self.tools_kicker.configure(text=t("dash.tools_kicker"))
+        for key, button in self._tool_buttons.items():
+            button.configure(text=t(f"dash.tool.{key}"))
+            self._tool_descs[key].configure(text=t(f"dash.tool.{key}_desc"))
+        self.now_label.configure(text=t("dash.now"))
+        self.live_label.configure(text=t("dash.live"))
+        self._stat_titles["accounts"].configure(text=t("dash.card.accounts"))
+        self._stat_titles["results"].configure(text=t("dash.card.results"))
+        self._stat_titles["warmup"].configure(text=t("dash.card.warmup"))
+        self.progress_title.configure(text=t("dash.progress_title"))
+        self.accounts_title.configure(text=t("dash.your_accounts"))
+        self.recent_title.configure(text=t("dash.recent"))
+        self.log_link.configure(text=t("dash.open_log"))
         self.conversion.retranslate()
+        self._last_accounts_sig = None
+        self._last_logs_sig = None
+        if self._last_data:
+            self._update_ui(self._last_data)
+        else:
+            self._refresh()
 
     def on_density_change(self, mode: str) -> None:
         self._density_mode = "compact" if mode == "compact" else "normal"

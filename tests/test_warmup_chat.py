@@ -86,6 +86,7 @@ class SendMessageToChatTests(unittest.TestCase):
             get_ai_send_limits=AsyncMock(return_value=(0, None)),
             get_ai_messages=AsyncMock(return_value=memory_rows or []),
             record_ai_send=AsyncMock(),
+            get_setting=AsyncMock(return_value="neutral"),
         )
         ai = SimpleNamespace(
             db=db,
@@ -111,9 +112,18 @@ class SendMessageToChatTests(unittest.TestCase):
         self.assertEqual(kwargs.get("reply_to"), 7)
         ai.generate_message.assert_awaited_once()
         self.assertEqual(ai.generate_message.await_args.kwargs["reply_to"]["text"], "Что думаете про обновление?")
+        self.assertEqual(ai.generate_message.await_args.kwargs["tone"], "neutral")
         self.assertFalse(ai.generate_message.await_args.kwargs["first_in_chat"])
         db.record_ai_send.assert_awaited_once()
         ai.remember_sent_message.assert_awaited_once()
+
+    def test_saved_tone_is_passed_into_generation(self):
+        actions, _client, ai, db = self.actions()
+        db.get_setting = AsyncMock(return_value="expert")
+        result = self.run_send(actions)
+        self.assertTrue(result["success"], result)
+        self.assertEqual(ai.generate_message.await_args.kwargs["tone"], "expert")
+        self.assertEqual(actions.tone, "expert")
 
     def test_skips_when_newest_message_is_own(self):
         actions, client, ai, _ = self.actions(memory_rows=[{"role": "assistant", "content": "Наше прошлое сообщение"}])
