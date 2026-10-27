@@ -183,6 +183,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       - uses: actions/download-artifact@v4
         with:
           name: portable-${{ needs.build.outputs.version }}
@@ -209,6 +213,7 @@ jobs:
 
       # Policy: GitHub keeps only the newest portable release (and its tag).
       # Older ZIPs/tags are removed so /releases/latest always matches core/version.py.
+      # Uses the API (no local git tag ops) so this works on the artifact-only runner.
       - name: Replace previous releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -220,10 +225,10 @@ jobs:
           for tag in "${tags[@]}"; do
             if [ "$tag" != "$KEEP_TAG" ]; then
               echo "Deleting release $tag"
-              gh release delete "$tag" --yes --cleanup-tag
+              gh release delete "$tag" --yes
+              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${tag}" || true
             fi
           done
-          # Drop any leftover v* tags that never had (or no longer have) a release.
           mapfile -t leftovers < <(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/v" --jq '.[].ref' | sed 's#^refs/tags/##')
           for tag in "${leftovers[@]}"; do
             if [ "$tag" != "$KEEP_TAG" ]; then
