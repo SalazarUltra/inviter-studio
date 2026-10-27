@@ -398,6 +398,15 @@ class AccountManager:
             raise ValueError("Получатель должен быть другим действующим пользователем")
         return user
 
+    async def send_saved_message(self, text: str) -> int | None:
+        """Send ``text`` to this account's own «Избранное» (test send; nobody else receives it)."""
+        if not self.client:
+            raise RuntimeError("Клиент не подключён")
+        validate_message(text)
+        sent = await asyncio.wait_for(self.client.send_message("me", text, link_preview=False), timeout=30)
+        message_id = getattr(sent, "id", None)
+        return message_id if isinstance(message_id, int) else None
+
     async def send_direct_message(self, user, text: str, random_id: int) -> dict:
         if not self.client:
             return {"success": False, "error": "unauthorized"}

@@ -801,6 +801,71 @@ class Database(FollowupStore):
             )
             await db.commit()
 
+    async def resolve_uncertain_deliveries(self, usernames, delivered: bool) -> int:
+        """Manual answer for «Проверить» rows of a messages campaign.
+
+        ``delivered=True``  -> the user saw the message in the chat: ledger and target become ``sent``
+        (a never-confirmed second message is cancelled). ``delivered=False`` -> it did not go out:
+        the ledger row and its armed/uncertain follow-up are removed and the target returns to
+        ``pending``. Only ``uncertain`` rows are touched; returns how many recipients were resolved.
+        """
+        names = list(dict.fromkeys(normalize_username(name) for name in usernames))
+        if not names:
+            return 0
+        if await self.get_campaign_kind() != "messages":
+            raise ValueError("Ручная отметка доступна только в кампании личных сообщений")
+        now, resolved = _now_iso(), 0
+        async with _connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            for name in names:
+                cur = await db.execute(
+                    "SELECT id FROM targets WHERE campaign_id=? AND username=? AND status='uncertain'",
+                    (self.campaign_id, name),
+                )
+                target = await cur.fetchone()
+                if not target:
+                    continue
+                cur = await db.execute("SELECT state FROM message_deliveries WHERE username=?", (name,))
+                ledger = await cur.fetchone()
+                if ledger and ledger[0] != "uncertain":
+                    continue
+                if delivered:
+                    if ledger:
+                        await db.execute(
+                            "UPDATE message_deliveries SET state='sent',completed_at=COALESCE(completed_at,?) "
+                            "WHERE username=? AND state='uncertain'",
+                            (now, name),
+                        )
+                    await db.execute(
+                        "UPDATE message_followups SET state='cancelled',completed_at=? "
+                        "WHERE username=? AND state IN ('uncertain','armed')",
+                        (now, name),
+                    )
+                    await db.execute(
+                        "UPDATE targets SET status='sent',processed_at=?,error_message=? WHERE id=?",
+                        (now, "Отмечено вручную: сообщение ушло", target[0]),
+                    )
+                else:
+                    await db.execute(
+                        "DELETE FROM message_followups WHERE username=? AND state IN ('uncertain','armed')", (name,)
+                    )
+                    await db.execute("DELETE FROM message_deliveries WHERE username=? AND state='uncertain'", (name,))
+                    await db.execute(
+                        "UPDATE targets SET status='pending',added_by_account_id=NULL,processed_at=NULL,"
+                        "error_message=NULL WHERE id=?",
+                        (target[0],),
+                    )
+                resolved += 1
+            await db.commit()
+        if resolved:
+            await self.add_log(
+                None,
+                None,
+                "MESSAGE_RESOLVED",
+                f"Отмечено вручную: {'ушло' if delivered else 'не ушло'} — {resolved}",
+            )
+        return resolved
+
     async def add_account(self, payload: dict[str, Any]) -> int:
         now = _now_iso()
         today = _today_iso()
@@ -1476,6 +1541,10 @@ class Database(FollowupStore):
         unknown = [status for status in chosen if status not in RESETTABLE_TARGET_STATUSES]
         if unknown:
             raise ValueError("Недопустимый статус для повторной попытки: " + ", ".join(map(str, unknown)))
+        if "uncertain" in chosen and await self.get_campaign_kind() == "messages":
+            # Unknown outcome of a direct message: never auto-retry (risk of a duplicate).
+            # The user resolves it manually via resolve_uncertain_deliveries().
+            chosen = tuple(status for status in chosen if status != "uncertain")
         if not chosen:
             return 0
         placeholders = ",".join("?" for _ in chosen)

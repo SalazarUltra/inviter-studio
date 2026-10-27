@@ -28,6 +28,7 @@ from telethon.errors import (
 from core.account_manager import is_followup_reply
 from core.followup_store import FOLLOWUP_WAIT_HOURS_DEFAULT, clamp_wait_hours
 from core.inviter import PEER_FLOOD_COOLDOWN_SECONDS
+from core.message_template import render_message
 from core.user_feedback import explain_error
 
 EXPIRE_CHECK_SECONDS = 30
@@ -208,7 +209,11 @@ class ReplyFollowups:
                 if not self.engine.running or self.engine.paused:
                     await self.db.finish_followup(row["username"], "ready")
                     return
-                result = await manager.send_direct_message(peer, claimed["text"], claimed["random_id"])
+                # Names are not stored for follow-ups, so {имя} falls back to «друг»; {a|b} still varies.
+                text = render_message(claimed["text"], getattr(peer, "first_name", None))
+                if not text.strip() or len(text.encode("utf-16-le")) // 2 > 4096:
+                    text = claimed["text"]
+                result = await manager.send_direct_message(peer, text, claimed["random_id"])
                 error = result.get("error")
                 if result.get("success"):
                     await self.db.finish_followup(row["username"], "sent", result.get("message_id"))

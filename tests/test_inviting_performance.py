@@ -251,7 +251,10 @@ class PrivateBridgeTests(DatabaseCase):
         )
         self.assertEqual(await new_db.get_setting("message_text"), "Привет https://t.me/mygroup")
         self.assertEqual(await new_db.get_setting("operation_mode"), "messages")
-        self.assertEqual(await new_db.get_setting("interval_min"), "33")
+        # A copied fast pace (33 s) is raised to the conservative DM preset.
+        self.assertEqual(await new_db.get_setting("interval_min"), "60")
+        self.assertGreaterEqual(int(await new_db.get_setting("interval_max")), 120)
+        self.assertLessEqual(int(await new_db.get_setting("protection_consecutive")), 3)
         self.assertEqual(await new_db.get_setting("selected_accounts"), "[1]")
         # The source campaign keeps its own results.
         self.assertEqual(await self.db.count_targets("private"), 2)

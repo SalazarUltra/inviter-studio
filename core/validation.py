@@ -12,6 +12,30 @@ def validate_message(value: str) -> str:
     return value
 
 
+# Direct messages to strangers are the riskiest action (PeerFlood): keep the gap soft.
+MESSAGES_MIN_INTERVAL = 45
+MESSAGES_DEFAULT_INTERVAL = (60, 120)
+INVITE_MAX_INTERVAL = 300
+MESSAGES_MAX_INTERVAL = 86400
+
+
+def validate_interval(mode: str, interval_min: int, interval_max: int) -> None:
+    """Raise a Russian ValueError when the interval is unsafe or inconsistent for the mode."""
+    maximum = MESSAGES_MAX_INTERVAL if mode == "messages" else INVITE_MAX_INTERVAL
+    if mode == "messages" and interval_min < MESSAGES_MIN_INTERVAL and interval_min <= interval_max:
+        raise ValueError(_soft_interval_text())
+    if not 10 <= interval_min <= interval_max <= maximum:
+        raise ValueError(f"Укажите интервал от 10 до {maximum} секунд. Минимум не должен быть больше максимума.")
+
+
+def _soft_interval_text() -> str:
+    return (
+        f"Для личных сообщений минимальный интервал — {MESSAGES_MIN_INTERVAL} секунд "
+        f"(рекомендуем {MESSAGES_DEFAULT_INTERVAL[0]}–{MESSAGES_DEFAULT_INTERVAL[1]}): "
+        "частая отправка незнакомым людям быстро приводит к ограничению аккаунта (PeerFlood)."
+    )
+
+
 def normalize_username(value: str) -> str:
     value = value.strip().lstrip("\ufeff")
     if value.startswith(("https://", "http://", "t.me/", "telegram.me/")):

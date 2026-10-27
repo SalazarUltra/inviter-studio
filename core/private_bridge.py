@@ -26,6 +26,36 @@ COPIED_SETTINGS = (
     "protection_break_max",
     "selected_accounts",
 )
+# Direct messages to strangers risk PeerFlood: the bridge never copies a faster pace than this.
+CONSERVATIVE_INTERVAL_MIN = 60
+CONSERVATIVE_INTERVAL_MAX = 120
+CONSERVATIVE_MAX_CONSECUTIVE = 3
+PEER_FLOOD_WARNING = (
+    "Внимание: личные сообщения незнакомым людям — самое рискованное действие. "
+    "Слишком быстрая отправка вызывает PeerFlood (Telegram блокирует рассылку на ~24 ч). "
+    f"Поэтому интервал будет не меньше {CONSERVATIVE_INTERVAL_MIN} сек, а перерыв — после "
+    f"{CONSERVATIVE_MAX_CONSECUTIVE} сообщений подряд или чаще."
+)
+
+
+def conservative_settings(settings: dict) -> dict:
+    """Return copied invite settings tightened to a safe preset for direct messages."""
+
+    def number(key, default):
+        try:
+            return int(str(settings.get(key, default)).strip())
+        except ValueError:
+            return default
+
+    result = dict(settings)
+    low = max(CONSERVATIVE_INTERVAL_MIN, number("interval_min", CONSERVATIVE_INTERVAL_MIN))
+    high = max(CONSERVATIVE_INTERVAL_MAX, number("interval_max", CONSERVATIVE_INTERVAL_MAX), low)
+    result["interval_min"], result["interval_max"] = str(low), str(high)
+    result["protection_consecutive"] = str(max(1, min(CONSERVATIVE_MAX_CONSECUTIVE, number("protection_consecutive", 3))))
+    break_min = max(1, number("protection_break_min", 5))
+    result["protection_break_min"] = str(break_min)
+    result["protection_break_max"] = str(max(break_min, number("protection_break_max", 15)))
+    return result
 
 
 def chat_link(raw: str) -> str:
@@ -87,7 +117,7 @@ async def create_private_dm_campaign(db, message: str, *, name: str | None = Non
             value = await db.get_setting(key)
             if value is not None:
                 settings[key] = value
-        await new_db.save_campaign_settings(settings)
+        await new_db.save_campaign_settings(conservative_settings(settings))
         pending = (await new_db.get_targets_stats())["pending"]
     except Exception:
         try:

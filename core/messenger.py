@@ -16,6 +16,7 @@ from telethon.errors import (
 from core.account_manager import AccountManager, classify_recipient_rpc, rpc_error_text
 from core.followups import ReplyFollowups
 from core.inviter import PEER_FLOOD_COOLDOWN_SECONDS, InviterEngine
+from core.message_template import SAMPLE_NAME, render_message
 from core.user_feedback import explain_error
 from core.validation import validate_message
 
@@ -29,6 +30,7 @@ class MessageEngine(InviterEngine):
 
     async def start(self, accounts, text, interval_min, interval_max):
         validate_message(text)
+        validate_message(render_message(text, SAMPLE_NAME))
         if self.running:
             raise RuntimeError("Задача уже выполняется")
         if not accounts or not 10 <= interval_min <= interval_max <= 86400:
@@ -60,7 +62,7 @@ class MessageEngine(InviterEngine):
                 else None
             )
             if self.followup_text is not None:
-                validate_message(self.followup_text)
+                validate_message(render_message(validate_message(self.followup_text), SAMPLE_NAME))
             await self.db.recover_message_deliveries()
             await self.db.recover_followups()
             await self.db.reset_processing_to_pending()
@@ -162,11 +164,12 @@ class MessageEngine(InviterEngine):
                     quota_available = any(
                         a.get("is_enabled")
                         and a.get("status") not in {"restricted", "unauthorized", "inactive"}
-                        and int(a.get("sent_today") or 0) < self.get_safe_daily_limit(a)
+                        and self.daily_used(a) < self.get_safe_daily_limit(a)
                         for a in usable_accounts
                     )
                     reason = (
-                        "Дневной лимит первых сообщений исчерпан. Задача ждёт его сброса; ответы для вторых сообщений продолжают отслеживаться."
+                        "Дневной лимит первых сообщений исчерпан (он общий с вторыми). "
+                        "Задача ждёт его сброса; ответы на отправленные сообщения продолжают отслеживаться."
                         if not quota_available
                         else "Аккаунты на паузе или перерыве. Задача подождёт и проверит доступность снова."
                     )
@@ -291,6 +294,17 @@ class MessageEngine(InviterEngine):
                     await self.db.mark_target(claimed, "pending")
                     claimed = None
                     continue
+                try:
+                    rendered = validate_message(render_message(text, getattr(user, "first_name", None)))
+                except ValueError as exc:
+                    await self.db.mark_target(
+                        claimed, "error", error_message=f"Текст после подстановки {{имя}} и вариантов не подходит: {exc}"
+                    )
+                    claimed = None
+                    self._session_counts["errors"] += 1
+                    self.log_callback("ERROR", f"@{target['username']}: текст после подстановки некорректен ({exc})")
+                    await self._progress()
+                    continue
                 random_id = await self.db.reserve_delivery(
                     claimed,
                     account["id"],
@@ -311,7 +325,7 @@ class MessageEngine(InviterEngine):
                     continue
                 if self.status_callback:
                     self.status_callback(f"Сообщение @{target['username']} через {account['phone']}")
-                result = await manager.send_direct_message(user, text, random_id)
+                result = await manager.send_direct_message(user, rendered, random_id)
                 if result.get("success"):
                     await self.db.finish_delivery(reserved, "sent", result.get("message_id"))
                     claimed = reserved = None
@@ -513,6 +527,11 @@ class MessageEngine(InviterEngine):
         if self.progress_callback:
             self.progress_callback(stats["sent"], stats["total"])
 
+    @staticmethod
+    def daily_used(account: dict) -> int:
+        """First messages + follow-ups sent today (they share a single daily budget)."""
+        return int(account.get("sent_today") or 0) + int(account.get("followups_today") or 0)
+
     async def _pick_available_account(self, accounts, *, followup=False):
         now = datetime.now()
         for step in range(len(accounts)):
@@ -531,14 +550,25 @@ class MessageEngine(InviterEngine):
                 account = await self.db.clear_expired_flood(account)
                 if account.get("status") == "flood":
                     continue
-            # The configured daily quota is the number of initial outreach
-            # messages. A requested reply-triggered follow-up has its own
-            # counter with the same conservative limit and must remain
-            # sendable once the first-message quota is reached.
-            if not followup and int(account.get("sent_today") or 0) >= self.get_safe_daily_limit(account):
-                continue
-            if followup and int(account.get("followups_today") or 0) >= self.get_safe_daily_limit(account):
+            # One combined daily budget per account: first messages and
+            # reply-triggered follow-ups both count against the safe limit.
+            if self.daily_used(account) >= self.get_safe_daily_limit(account):
                 continue
             self._rr_index = (index + 1) % len(accounts)
             return account
         return None
+
+
+async def send_test_message(db, account_id, text):
+    """Render ``text`` with a sample name and send it to the account's own «Избранное»."""
+    account = await db.get_account(account_id)
+    if not account:
+        raise ValueError("Аккаунт не найден")
+    rendered = validate_message(render_message(validate_message(text), SAMPLE_NAME))
+    manager = AccountManager(account, db)
+    try:
+        await manager.connect()
+        await manager.send_saved_message(rendered)
+    finally:
+        await manager.disconnect()
+    return rendered

@@ -50,7 +50,7 @@ class FollowupFixtures(DatabaseCase):
 
 
 class FollowupDatabaseTests(FollowupFixtures):
-    async def test_second_message_does_not_consume_first_message_quota(self):
+    async def test_second_message_shares_daily_budget_with_first_messages(self):
         account, _ = await self.seed()
         await self.db.set_setting("task_status", "running")
         await self.db.receive_followup_reply(account["id"], 123, 11)
@@ -61,9 +61,8 @@ class FollowupDatabaseTests(FollowupFixtures):
         account_at_limit = {**account, "daily_limit": 10, "sent_today": 10, "account_age_days": 45}
         with patch.object(engine.db, "get_account", new=AsyncMock(return_value=account_at_limit)):
             self.assertIsNone(await engine._pick_available_account([account]))
-            available = await engine._pick_available_account([account], followup=True)
-        self.assertEqual(available["id"], account["id"])
-        # Follow-ups have their own metric and do not raise the first-message quota.
+            self.assertIsNone(await engine._pick_available_account([account], followup=True))
+        # Follow-ups use their own counter, but it counts against the same combined daily cap.
         self.assertEqual((await self.db.get_account(account["id"]))["sent_today"], 1)
         await self.db.set_setting("task_status", "stopped")
         await self.db.bulk_insert_targets(["bobby"])
@@ -478,7 +477,7 @@ class FollowupEngineTests(FollowupFixtures):
         self.manager.send_direct_message.assert_not_called()
         self.assertTrue(await self.has_state("cancelled"))
 
-    async def test_first_message_quota_does_not_block_second(self):
+    async def test_exhausted_combined_quota_defers_second(self):
         account = await self.configure(seed=True)
         await self.db.set_setting("task_status", "running")
         await self.db.receive_followup_reply(account["id"], 123, 11)
@@ -487,18 +486,36 @@ class FollowupEngineTests(FollowupFixtures):
         from core.database import _connect
 
         async with _connect() as connection:
-            # Exhausted first-message quota must not defer the follow-up.
+            # First messages already used the whole combined daily budget: the follow-up waits.
             await connection.execute(
                 "UPDATE accounts SET sent_today=40, last_message_reset_date=?", (date.today().isoformat(),)
             )
             await connection.commit()
         task = await self.run_engine(account)
+        await asyncio.sleep(0.3)
+        self.engine.stop()
         await asyncio.wait_for(task, 5)
-        # The seeded first message is not re-sent; only the follow-up goes out.
+        self.manager.send_direct_message.assert_not_called()
+        self.assertEqual((await self.db.get_account(account["id"]))["followups_today"], 0)
+
+    async def test_second_message_sends_while_combined_quota_remains(self):
+        account = await self.configure(seed=True)
+        await self.db.set_setting("task_status", "running")
+        await self.db.receive_followup_reply(account["id"], 123, 11)
+        from datetime import date
+
+        from core.database import _connect
+
+        async with _connect() as connection:
+            await connection.execute(
+                "UPDATE accounts SET sent_today=39, last_message_reset_date=?", (date.today().isoformat(),)
+            )
+            await connection.commit()
+        task = await self.run_engine(account)
+        await asyncio.wait_for(task, 5)
         self.assertEqual(self.manager.send_direct_message.await_count, 1)
         fresh = await self.db.get_account(account["id"])
-        self.assertEqual(fresh["sent_today"], 40)
-        self.assertEqual(fresh["followups_today"], 1)
+        self.assertEqual((fresh["sent_today"], fresh["followups_today"]), (39, 1))
         self.assertTrue(await self.has_state("sent"))
 
 

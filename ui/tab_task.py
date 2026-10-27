@@ -7,11 +7,20 @@ from tkinter import messagebox
 import customtkinter as ctk
 
 from core.database import Database
-from core.diagnostics import format_report, preflight
+from core.diagnostics import estimate_messages_eta, format_report, message_usage_today, preflight
 from core.inviter import describe_next_available
+from core.message_template import SAMPLE_NAME, has_placeholders, preview_message
+from core.messenger import send_test_message
 from core.scheduler import TaskScheduler
 from core.user_feedback import explain_error
-from core.validation import normalize_username, time_minutes, validate_message
+from core.validation import (
+    MESSAGES_DEFAULT_INTERVAL,
+    MESSAGES_MIN_INTERVAL,
+    normalize_username,
+    time_minutes,
+    validate_interval,
+    validate_message,
+)
 from ui.campaigns import CampaignBar, show_report
 from ui.components import page_intro
 from ui.dispatch import post_ui
@@ -38,6 +47,7 @@ class TaskTab(ctk.CTkFrame):
         self.log_callback = log_callback
         self.account_vars: dict[int, ctk.BooleanVar] = {}
         self._account_labels = {}
+        self._accounts_info: dict[int, dict] = {}
         self.chat_values: list[str] = []
         self._counter_inflight = False
         self._saved_account_ids = []
@@ -303,6 +313,9 @@ class TaskTab(ctk.CTkFrame):
         ]
         lines.insert(3, "Аккаунты: " + (", ".join(selected_names) or "не выбраны"))
         if self.operation_mode() == "messages":
+            eta = self._eta_line(stats.get("pending", 0))
+            if eta:
+                lines.extend(["", eta])
             lines.extend(["", "Первое сообщение:", self.message_box.get("1.0", "end-1c") or "Не заполнено"])
             if self.followup_enabled.get():
                 lines.extend(
@@ -336,6 +349,35 @@ class TaskTab(ctk.CTkFrame):
         self.review_box.insert("1.0", text)
         self.review_box.yview_moveto(position)
         self.review_box.configure(state="disabled")
+
+    def _used_today(self, account: dict) -> int:
+        if self.operation_mode() == "messages":
+            return sum(message_usage_today(account))  # first + follow-ups share one budget
+        return account.get("added_today") or 0
+
+    def _eta_line(self, pending: int) -> str:
+        """Approximate days and today's remaining capacity for the selected accounts (messages mode)."""
+        selected = [
+            self._accounts_info[key] for key, var in self.account_vars.items() if var.get() and key in self._accounts_info
+        ]
+        if not selected:
+            return ""
+        try:
+            low = int(self.interval_min_entry.get().strip())
+            high = int(self.interval_max_entry.get().strip())
+        except ValueError:
+            return ""
+        return estimate_messages_eta(selected, pending, low, max(low, high), self._schedule_hours())
+
+    def _schedule_hours(self) -> float | None:
+        if not self.schedule_enabled.get():
+            return None
+        try:
+            start = time_minutes(self.schedule_from_entry.get().strip())
+            end = time_minutes(self.schedule_to_entry.get().strip())
+        except ValueError:
+            return None
+        return ((end - start) % 1440 or 1440) / 60
 
     def _build_layout(self) -> None:
         chat_block = self._block("01  /  Режим и получатели")
@@ -447,7 +489,45 @@ class TaskTab(ctk.CTkFrame):
         )
         self.message_box = ctk.CTkTextbox(self.message_frame, height=140, wrap="word", font=FONTS["body"])
         self.message_box.bind("<<Modified>>", self._message_modified, add="+")
-        self.message_box.pack(fill="x", padx=16, pady=(6, 8))
+        self.message_box.pack(fill="x", padx=16, pady=(6, 4))
+        hint(
+            self.message_frame,
+            "Подстановки: {имя} или {name} — имя получателя (если неизвестно — «друг»); "
+            "{привет|здравствуйте|добрый день} — случайный вариант для каждого сообщения. "
+            "Так тексты отличаются, а рассылка выглядит менее шаблонной.",
+        )
+        preview_row = ctk.CTkFrame(self.message_frame, fg_color="transparent")
+        preview_row.pack(fill="x", padx=16, pady=(0, 4))
+        self.preview_message_btn = ctk.CTkButton(
+            preview_row, text="Предпросмотр", width=130, height=28, command=self.show_message_preview
+        )
+        apply_button_role(self.preview_message_btn, "secondary")
+        self.preview_message_btn.pack(side="left", padx=(0, 8))
+        tip(
+            self.preview_message_btn,
+            f"Показать текст так, как увидит получатель по имени «{SAMPLE_NAME}». Ничего не отправляется.",
+        )
+        self.test_message_btn = ctk.CTkButton(
+            preview_row, text="Тест в Избранное", width=150, height=28, command=self.send_test_to_saved
+        )
+        apply_button_role(self.test_message_btn, "accent-line")
+        self.test_message_btn.pack(side="left")
+        tip(
+            self.test_message_btn,
+            "Отправить готовый текст себе в «Избранное» через первый выбранный аккаунт. "
+            "Получателям из списка ничего не уходит; перед отправкой будет вопрос.",
+        )
+        self.preview_label = ctk.CTkLabel(
+            self.message_frame,
+            text="",
+            font=FONTS["small"],
+            text_color=COLORS["text"],
+            justify="left",
+            anchor="w",
+            wraplength=480,
+        )
+        wrap_label(self.preview_label)
+        self.preview_label.pack(fill="x", padx=16, pady=(0, 8))
         self.followup_enabled = ctk.BooleanVar(value=False)
         self.followup_switch = ctk.CTkSwitch(
             self.message_frame,
@@ -473,7 +553,9 @@ class TaskTab(ctk.CTkFrame):
         hint(
             self.followup_frame,
             "Отправляется один раз с того же аккаунта после нового входящего сообщения. "
-            "Старые сообщения, реакции и прочтения не считаются ответом. Пауза, расписание и дневные лимиты действуют.\n"
+            "Старые сообщения, реакции и прочтения не считаются ответом. Пауза и расписание действуют.\n"
+            "Дневной лимит общий: первые и вторые сообщения вместе не превышают дневной лимит аккаунта "
+            "(например, 40 первых — вторым места не останется).\n"
             "Держите задачу запущенной, пока ждёте ответы. После выхода запустите её вручную. "
             "Изменение текста применяется к новым первым сообщениям; уже ожидающие сохраняют прежний второй текст.",
         )
@@ -529,6 +611,12 @@ class TaskTab(ctk.CTkFrame):
             interval_block,
             "В приглашениях пауза считается отдельно для каждого аккаунта: пока один отдыхает, остальные работают. "
             "Первые действия каждого аккаунта идут с удвоенной паузой (тёплый старт).",
+        )
+        hint(
+            interval_block,
+            f"Личные сообщения: минимум {MESSAGES_MIN_INTERVAL} сек, рекомендуем "
+            f"{MESSAGES_DEFAULT_INTERVAL[0]}–{MESSAGES_DEFAULT_INTERVAL[1]}. Быстрая отправка незнакомым людям "
+            "ведёт к PeerFlood — Telegram блокирует рассылку с аккаунта примерно на сутки.",
         )
         tip(
             self.interval_min_entry,
@@ -818,6 +906,7 @@ class TaskTab(ctk.CTkFrame):
         for widget in self.accounts_box.winfo_children():
             widget.destroy()
         enabled_accounts = [acc for acc in accounts if int(acc.get("is_enabled", 1)) == 1]
+        self._accounts_info = {acc["id"]: acc for acc in enabled_accounts}
         if not enabled_accounts:
             ctk.CTkLabel(self.accounts_box, text="Нет добавленных аккаунтов").pack(anchor="w", padx=8, pady=8)
             self._update_buttons_state()
@@ -832,7 +921,7 @@ class TaskTab(ctk.CTkFrame):
             self._account_labels[account["id"]] = account["phone"]
             checkbox = ctk.CTkCheckBox(
                 self.accounts_box,
-                text=f"{account['phone']} ({account.get('sent_today' if self.operation_mode() == 'messages' else 'added_today') or 0}/{account.get('daily_limit', 40)})",
+                text=f"{account['phone']} ({self._used_today(account)}/{account.get('daily_limit', 40)})",
                 variable=var,
                 command=self.update_readiness,
             )
@@ -889,6 +978,7 @@ class TaskTab(ctk.CTkFrame):
             self.message_box,
             self.paste_message_btn,
             self.template_button,
+            self.test_message_btn,
             self.interval_min_entry,
             self.interval_max_entry,
             self.schedule_switch,
@@ -983,6 +1073,7 @@ class TaskTab(ctk.CTkFrame):
             )
             self.chat_controls.pack_forget()
             self.message_frame.pack(fill="x")
+            self._soften_message_interval()
         else:
             self.mode_hint.configure(
                 text="Добавляет людей прямо в группу или канал. Выбранным аккаунтам нужны права администратора с правом приглашения."
@@ -990,6 +1081,78 @@ class TaskTab(ctk.CTkFrame):
             self.message_frame.pack_forget()
             self.chat_controls.pack(fill="x")
         self.refresh_accounts()
+
+    def _soften_message_interval(self) -> None:
+        """Switching to direct messages with an invite-style fast pace: offer the safe default."""
+        if self._loading_campaign:
+            return
+        try:
+            low = int(self.interval_min_entry.get().strip())
+        except ValueError:
+            return
+        if low >= MESSAGES_MIN_INTERVAL:
+            return
+        for entry, value in zip((self.interval_min_entry, self.interval_max_entry), MESSAGES_DEFAULT_INTERVAL):
+            entry.delete(0, "end")
+            entry.insert(0, str(value))
+        self.set_status(
+            f"Для личных сообщений интервал изменён на {MESSAGES_DEFAULT_INTERVAL[0]}–"
+            f"{MESSAGES_DEFAULT_INTERVAL[1]} сек (минимум {MESSAGES_MIN_INTERVAL})."
+        )
+
+    def show_message_preview(self) -> None:
+        text = self.message_box.get("1.0", "end-1c")
+        if not text.strip():
+            self.preview_label.configure(text="Введите текст сообщения.")
+            return
+        note = "" if has_placeholders(text) else "\n(Подстановок нет — текст уйдёт без изменений.)"
+        self.preview_label.configure(text=f"Предпросмотр для «{SAMPLE_NAME}»:\n{preview_message(text)}{note}")
+
+    def send_test_to_saved(self) -> None:
+        if self._starting or self.scheduler.is_running():
+            messagebox.showwarning("Задача выполняется", "Остановите задачу: аккаунт нужен для тестовой отправки.")
+            return
+        text = self.message_box.get("1.0", "end-1c")
+        try:
+            validate_message(text)
+        except ValueError as exc:
+            messagebox.showerror("Тест в Избранное", explain_error(exc))
+            return
+        selected = [key for key, var in self.account_vars.items() if var.get()]
+        if not selected:
+            messagebox.showerror("Тест в Избранное", "Отметьте аккаунт, через который отправить тест.")
+            return
+        account_id = selected[0]
+        phone = self._account_labels.get(account_id, str(account_id))
+        if not messagebox.askyesno(
+            "Тест в Избранное",
+            f"Отправить текст в «Избранное» аккаунта {phone}?\n"
+            f"Имя получателя подставится как «{SAMPLE_NAME}». Никому из списка сообщение не уйдёт.",
+            parent=self.app,
+        ):
+            return
+        self._starting = True
+        self._update_buttons_state()
+        self.set_status(f"Тестовая отправка в «Избранное» ({phone})…")
+        db = self.db
+        future = self.run_coro(send_test_message(db, account_id, text))
+
+        def done(result):
+            def render():
+                self._starting = False
+                self._update_buttons_state()
+                if result.cancelled():
+                    self.set_status("Тестовая отправка отменена")
+                elif result.exception():
+                    self.set_status("Тест не отправлен")
+                    messagebox.showerror("Тест в Избранное", explain_error(result.exception()))
+                else:
+                    self.set_status("Тест отправлен в «Избранное»")
+                    self.preview_label.configure(text=f"Отправлено в «Избранное»:\n{result.result()}")
+
+            self._safe_after(render)
+
+        future.add_done_callback(done)
 
     def task_values(self):
         if self._loading_campaign:
@@ -1016,9 +1179,7 @@ class TaskTab(ctk.CTkFrame):
             interval_max = int(self.interval_max_entry.get().strip())
         except ValueError:
             raise ValueError("Введите минимальный и максимальный интервал целыми числами, в секундах.") from None
-        maximum = 86400 if mode == "messages" else 300
-        if not 10 <= interval_min <= interval_max <= maximum:
-            raise ValueError(f"Укажите интервал от 10 до {maximum} секунд. Минимум не должен быть больше максимума.")
+        validate_interval(mode, interval_min, interval_max)
         selected_ids = [account_id for account_id, var in self.account_vars.items() if var.get()]
         if not selected_ids:
             raise ValueError("Выберите хотя бы один аккаунт")
@@ -1079,13 +1240,17 @@ class TaskTab(ctk.CTkFrame):
         }
 
         async def load():
-            values = {key: await db.get_setting(key, value) for key, value in defaults.items()}
             try:
-                values["kind"] = await db.get_campaign_kind()
+                kind = await db.get_campaign_kind()
             except ValueError:
                 # Startup may briefly hold the deleted default scope before
                 # App restores the last remaining campaign.
                 return None
+            if kind == "messages":
+                # Softer defaults for direct messages (PeerFlood risk).
+                defaults["interval_min"], defaults["interval_max"] = map(str, MESSAGES_DEFAULT_INTERVAL)
+            values = {key: await db.get_setting(key, value) for key, value in defaults.items()}
+            values["kind"] = kind
             return values
 
         future = self.run_coro(load())
@@ -1274,6 +1439,7 @@ class TaskTab(ctk.CTkFrame):
             messagebox.showerror("Проверка", explain_error(exc))
             return
         db = self.db
+        schedule_hours = self._schedule_hours()
         self._starting = True
         self._update_buttons_state()
         future = self.run_coro(
@@ -1285,6 +1451,9 @@ class TaskTab(ctk.CTkFrame):
                 mode=settings["operation_mode"],
                 message=settings["message_text"],
                 followup_enabled=settings["followup_enabled"] == "1",
+                interval_min=low,
+                interval_max=high,
+                schedule_hours=schedule_hours,
             )
         )
 

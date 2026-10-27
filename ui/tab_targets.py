@@ -55,7 +55,12 @@ RETRY_STATUS_CHOICES = (
 )
 
 
-def ask_retry_statuses(parent) -> tuple[str, ...] | None:
+def retry_choices(messages: bool = False) -> tuple[tuple[str, str, bool], ...]:
+    """Retry checkboxes; «Требует проверки» is never auto-retried in messages campaigns."""
+    return tuple(choice for choice in RETRY_STATUS_CHOICES if not (messages and choice[0] == "uncertain"))
+
+
+def ask_retry_statuses(parent, messages: bool = False) -> tuple[str, ...] | None:
     """Modal checkbox dialog; returns chosen statuses, or None when cancelled."""
     dialog = ctk.CTkToplevel(parent)
     dialog.title("Повторить получателей")
@@ -69,12 +74,19 @@ def ask_retry_statuses(parent) -> tuple[str, ...] | None:
         anchor="w",
     ).pack(fill="x", padx=20, pady=(16, 8))
     variables = {}
-    for status, label, default in RETRY_STATUS_CHOICES:
+    for status, label, default in retry_choices(messages):
         variables[status] = ctk.BooleanVar(value=default)
         ctk.CTkCheckBox(dialog, text=label, variable=variables[status]).pack(anchor="w", padx=24, pady=3)
     ctk.CTkLabel(
         dialog,
-        text="Закрытые и не найденные обычно не изменятся при повторе.",
+        text=(
+            "Закрытые и не найденные обычно не изменятся при повторе.\n"
+            "«Проверить» в личных сообщениях не повторяется автоматически: отметьте вручную, ушло или нет."
+            if messages
+            else "Закрытые и не найденные обычно не изменятся при повторе."
+        ),
+        wraplength=360,
+        justify="left",
         font=FONTS["small"],
         text_color=COLORS["muted"],
         anchor="w",
@@ -115,6 +127,7 @@ class TargetsTab(ctk.CTkFrame):
         self.page = 0
         self.page_size = 100
         self._query_generation = 0
+        self._kind = None
 
         self.intro = page_intro(
             self, "Аудитория", "Загрузите список пользователей и следите за каждым результатом.", "ПОЛУЧАТЕЛИ"
@@ -270,6 +283,37 @@ class TargetsTab(ctk.CTkFrame):
             "Получателям со статусом «Закрытый» нельзя добавить людей в чат напрямую. "
             "Создаётся кампания личных сообщений с вашей ссылкой на группу; отправка начнётся только после запуска.",
         )
+        # Messages campaigns only: manual answer for «Проверить» rows of the current filter/search.
+        self.resolve_frame = ctk.CTkFrame(top, fg_color="transparent")
+        self.resolve_frame.grid(row=3, column=0, columnspan=5, sticky="ew", padx=5, pady=(0, 8))
+        self.resolve_frame.grid_columnconfigure((0, 1), weight=1)
+        for column, (text, delivered, role, help_text) in enumerate(
+            (
+                (
+                    "Отметил: ушло (все в фильтре)",
+                    True,
+                    "secondary",
+                    "Вы проверили переписку: сообщения доставлены. Получатели станут «Отправлено» и повторно не получат текст.",
+                ),
+                (
+                    "Отметил: не ушло (все в фильтре)",
+                    False,
+                    "accent-line",
+                    "Вы проверили переписку: сообщения не доставлены. Получатели вернутся в очередь и получат текст при запуске.",
+                ),
+            )
+        ):
+            button = ctk.CTkButton(
+                self.resolve_frame,
+                text=text,
+                height=32,
+                font=FONTS["small"],
+                command=lambda value=delivered: self.resolve_uncertain(None, value),
+            )
+            apply_button_role(button, role)
+            button.grid(row=0, column=column, sticky="ew", padx=(0, 6) if column == 0 else (0, 0))
+            tip(button, help_text)
+        self.resolve_frame.grid_remove()
 
         search_row = ctk.CTkFrame(self, fg_color="transparent")
         search_row.pack(fill="x", padx=16, pady=(0, 6))
@@ -359,6 +403,8 @@ class TargetsTab(ctk.CTkFrame):
 
     def _render_rows(self, rows: list[dict]) -> None:
         density = get_density_preset(self._density_mode)
+        messages = self._messages_mode()
+        self._sync_resolve_controls()
         for widget in self.table.winfo_children():
             widget.destroy()
 
@@ -401,8 +447,93 @@ class TargetsTab(ctk.CTkFrame):
             ctk.CTkLabel(
                 row, text=(item.get("error_message") or "-")[:300], width=120, wraplength=180, anchor="w"
             ).grid(row=0, column=4, padx=6, pady=density["row_pad_y"], sticky="w")
+            if item["status"] == "uncertain" and messages:
+                actions = ctk.CTkFrame(row, fg_color="transparent")
+                actions.grid(row=0, column=5, padx=6, sticky="e")
+                for text, delivered, role in (("Ушло", True, "secondary"), ("Не ушло", False, "accent-line")):
+                    button = ctk.CTkButton(
+                        actions,
+                        text=text,
+                        width=72,
+                        height=26,
+                        font=FONTS["small"],
+                        command=lambda name=item["username"], value=delivered: self.resolve_uncertain([name], value),
+                    )
+                    apply_button_role(button, role)
+                    button.pack(side="left", padx=2)
+                    tip(
+                        button,
+                        "Отметил: сообщение ушло — больше не писать."
+                        if delivered
+                        else "Отметил: сообщение не ушло — вернуть в очередь.",
+                    )
 
         style_tree(self.table)
+
+    def _messages_mode(self) -> bool:
+        if getattr(self, "_kind", None):
+            return self._kind == "messages"
+        task_tab = getattr(self.winfo_toplevel(), "task_tab", None)
+        try:
+            return bool(task_tab) and task_tab.operation_mode() == "messages"
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _sync_resolve_controls(self) -> None:
+        show = self._messages_mode() and FILTER_MAP.get(self.current_filter.get()) == "uncertain"
+        if show:
+            self.resolve_frame.grid()
+        else:
+            self.resolve_frame.grid_remove()
+
+    def resolve_uncertain(self, usernames, delivered: bool) -> None:
+        """Manual «ушло / не ушло» for uncertain recipients: selected row or the whole filter."""
+        if not self._ensure_task_stopped("отметить результат отправки"):
+            return
+        db, search = self.db, self.search_entry.get()
+
+        async def pick():
+            if usernames is not None:
+                return list(usernames)
+            rows = await db.get_targets("uncertain", None, search)
+            return [row["username"] for row in rows]
+
+        def picked(result):
+            def render():
+                if self.db is not db or result.cancelled():
+                    return
+                if result.exception():
+                    messagebox.showerror("Результат отправки", explain_error(result.exception()))
+                    return
+                names = result.result()
+                if not names:
+                    messagebox.showinfo("Результат отправки", "Нет получателей со статусом «Проверить».")
+                    return
+                answer = "ушло" if delivered else "не ушло"
+                consequence = (
+                    "Они станут «Отправлено» и повторно не получат сообщение."
+                    if delivered
+                    else "Они вернутся в очередь, а запись в общем журнале будет удалена: "
+                    "сообщение отправится повторно при следующем запуске."
+                )
+                if not messagebox.askyesno(
+                    "Подтвердите отметку",
+                    f"Вы проверили переписку и отмечаете «{answer}» для получателей: {len(names)}.\n{consequence}",
+                    parent=self.winfo_toplevel(),
+                ):
+                    return
+                future = self.run_coro(db.resolve_uncertain_deliveries(names, delivered))
+                future.add_done_callback(
+                    lambda outcome: self._safe_after(
+                        lambda: self.finish_operation(outcome, f"Отмечено вручную ({answer}): {outcome.result()}")
+                        if not outcome.cancelled() and not outcome.exception()
+                        else self.finish_operation(outcome, "")
+                    )
+                )
+
+            self._safe_after(render)
+
+        self.run_coro(pick()).add_done_callback(picked)
 
     def begin_audience_import(self) -> None:
         app = self.winfo_toplevel()
@@ -505,7 +636,7 @@ class TargetsTab(ctk.CTkFrame):
         if self.winfo_toplevel().scheduler.is_running() or self.winfo_toplevel().task_tab._starting:
             messagebox.showwarning("Задача выполняется", "Остановите задачу перед возвратом получателей в очередь")
             return
-        statuses = ask_retry_statuses(self)
+        statuses = ask_retry_statuses(self, self._messages_mode())
         if statuses is None:
             return
         if not statuses:
@@ -658,19 +789,24 @@ class TargetsTab(ctk.CTkFrame):
             pages = max(1, (count + self.page_size - 1) // self.page_size)
             selected = min(page, pages - 1)
             rows = await db.get_targets(current, self.page_size, search, selected * self.page_size)
-            return rows, count, pages, selected
+            try:
+                kind = await db.get_campaign_kind()
+            except ValueError:
+                kind = "invite"
+            return rows, count, pages, selected, kind
 
         fut = self.run_coro(fetch())
 
         def done(f):
             try:
-                rows, count, pages, selected = f.result()
+                rows, count, pages, selected, kind = f.result()
             except Exception:
                 return
 
             def render():
                 if self.db is not db or generation != self._query_generation:
                     return
+                self._kind = kind
                 self.page = selected
                 self.page_label.configure(text=f"{selected + 1} / {pages} · {count}")
                 self._render_rows(rows)

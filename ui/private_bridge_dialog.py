@@ -6,6 +6,7 @@ import customtkinter as ctk
 
 from core.private_bridge import (
     DEFAULT_TEMPLATE,
+    PEER_FLOOD_WARNING,
     build_message,
     chat_link,
     create_private_dm_campaign,
@@ -28,8 +29,8 @@ class PrivateBridgeDialog(ctk.CTkToplevel):
         self.count = count
         self.busy = False
         self.title("Написать закрытым со ссылкой")
-        self.geometry("560x560")
-        self.minsize(480, 460)
+        self.geometry("560x640")
+        self.minsize(480, 540)
         self.transient(self.app)
         ctk.CTkLabel(self, text="Написать закрытым со ссылкой", font=FONTS["heading"]).pack(
             anchor="w", padx=20, pady=(16, 4)
@@ -64,7 +65,7 @@ class PrivateBridgeDialog(ctk.CTkToplevel):
             self.export_button.configure(state="disabled")
         ctk.CTkLabel(
             self,
-            text="Текст сообщения · {ссылка} заменится ссылкой",
+            text="Текст сообщения · {ссылка} заменится ссылкой · можно {имя} и {привет|здравствуйте}",
             font=FONTS["small"],
             text_color=COLORS["muted"],
         ).pack(anchor="w", padx=20)
@@ -73,11 +74,20 @@ class PrivateBridgeDialog(ctk.CTkToplevel):
         self.message_box.insert("1.0", DEFAULT_TEMPLATE)
         hint(
             self,
-            "Будет создана новая кампания «Личные сообщения» с этими получателями и настройками аккаунтов/интервала "
-            "из текущей. Текст можно проверить на вкладке «Задача» — отправка начнётся только по кнопке запуска. "
+            "Будет создана новая кампания «Личные сообщения» с этими получателями и аккаунтами из текущей; "
+            "темп смягчается автоматически (интервал от 60 сек, перерыв каждые ≤3 сообщения). Текст можно проверить на вкладке «Задача» — отправка начнётся только по кнопке запуска. "
             "Люди, которым вы уже писали, повторно не получат сообщение.",
             padx=20,
         )
+        ctk.CTkLabel(
+            self,
+            text=PEER_FLOOD_WARNING,
+            font=FONTS["small"],
+            text_color=COLORS["warning"],
+            wraplength=500,
+            justify="left",
+            anchor="w",
+        ).pack(fill="x", padx=20, pady=(0, 6))
         self.status = ctk.CTkLabel(
             self, text="", font=FONTS["small"], text_color=COLORS["muted"], wraplength=500, justify="left", anchor="w"
         )

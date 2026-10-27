@@ -9,7 +9,74 @@ from core.user_feedback import explain_error
 from core.validation import normalize_username, validate_message
 
 
-async def preflight(db, account_ids, chat, live=False, mode="invite", message="", followup_enabled=False):
+UNUSABLE_STATUSES = {"restricted", "unauthorized", "inactive"}
+
+
+def message_usage_today(account: dict) -> tuple[int, int]:
+    """(first messages, follow-ups) sent today; counters from earlier days do not count."""
+    today = datetime.now().date().isoformat()
+    first = int(account.get("sent_today") or 0) if account.get("last_message_reset_date") == today else 0
+    second = int(account.get("followups_today") or 0) if account.get("followup_reset_date") == today else 0
+    return first, second
+
+
+def estimate_messages_eta(accounts, pending, interval_min, interval_max, schedule_hours=None) -> str:
+    """Russian one-liner: approximate days to send ``pending`` first messages and today's capacity.
+
+    First messages and follow-ups share one daily budget per account (the safe daily limit).
+    """
+    usable = [
+        a
+        for a in accounts
+        if int(a.get("is_enabled", 1)) == 1
+        and a.get("status") not in UNUSABLE_STATUSES
+        and InviterEngine.get_safe_daily_limit(a) > 0
+    ]
+    if not usable:
+        return "Оценка срока: нет аккаунтов с доступным дневным лимитом"
+    daily = sum(InviterEngine.get_safe_daily_limit(a) for a in usable)
+    used_first = used_second = 0
+    for account in usable:
+        first, second = message_usage_today(account)
+        used_first, used_second = used_first + first, used_second + second
+    remaining = sum(
+        max(0, InviterEngine.get_safe_daily_limit(a) - sum(message_usage_today(a))) for a in usable
+    )
+    average = max(1.0, (max(1, int(interval_min)) + max(1, int(interval_max))) / 2)
+    window = 86400 if not schedule_hours else max(0.1, min(24, schedule_hours)) * 3600
+    # The interval is shared by all accounts, so it can be the real bottleneck.
+    per_day = max(1, min(daily, int(window / average)))
+    pending = max(0, int(pending))
+    today = (
+        f"сегодня можно ещё {remaining} из {daily} "
+        f"(первых {used_first}, вторых {used_second} уже отправлено — лимит общий)"
+    )
+    if pending == 0:
+        return f"Оценка срока: очередь пуста · {today}"
+    first_day = min(pending, min(remaining, int(window / average)))
+    after = pending - first_day
+    extra_days = -(-after // per_day) if after else 0
+    if extra_days == 0 and first_day >= pending:
+        span = "хватит сегодня"
+    elif first_day:
+        span = f"~{extra_days + 1} дн."
+    else:
+        span = f"~{extra_days} дн. (со следующего дня)"
+    return f"Оценка срока: {pending} в очереди → {span} · {today} · темп ≈ {per_day} в день"
+
+
+async def preflight(
+    db,
+    account_ids,
+    chat,
+    live=False,
+    mode="invite",
+    message="",
+    followup_enabled=False,
+    interval_min=None,
+    interval_max=None,
+    schedule_hours=None,
+):
     results = []
 
     def add(label, ok, detail, *, blocking=True):
@@ -52,6 +119,13 @@ async def preflight(db, account_ids, chat, live=False, mode="invite", message=""
     )
     accounts = await db.get_accounts_by_ids(account_ids)
     add("Аккаунты", bool(accounts) and len(accounts) == len(set(account_ids)), f"Выбрано: {len(accounts)}")
+    if mode == "messages" and interval_min is not None and interval_max is not None:
+        add(
+            "Оценка срока",
+            True,
+            estimate_messages_eta(accounts, pending, interval_min, interval_max, schedule_hours).split(": ", 1)[1],
+            blocking=False,
+        )
     first_message_accounts = []
     followup_accounts = []
     invite_accounts = []
@@ -67,7 +141,11 @@ async def preflight(db, account_ids, chat, live=False, mode="invite", message=""
         count_key = "sent_today" if mode == "messages" else "added_today"
         date_key = "last_message_reset_date" if mode == "messages" else "last_reset_date"
         used_today = (
-            int(account.get(count_key) or 0) if account.get(date_key) == datetime.now().date().isoformat() else 0
+            sum(message_usage_today(account))  # first messages and follow-ups share one daily budget
+            if mode == "messages"
+            else int(account.get(count_key) or 0)
+            if account.get(date_key) == datetime.now().date().isoformat()
+            else 0
         )
         remaining = max(0, InviterEngine.get_safe_daily_limit(account) - used_today)
         flood = account.get("flood_until")
