@@ -2,7 +2,7 @@
 
 from tkinter import messagebox
 
-from core.campaign_queue import plan_next
+from core.campaign_queue import get_auto_continue, needs_confirmation, plan_next
 
 SWITCH_WAIT_STEPS = 40  # x 250 ms: the finished task releases its sessions shortly after the callback
 LOAD_WAIT_STEPS = 60
@@ -12,6 +12,7 @@ class QueueRunner:
     def __init__(self, app):
         self.app = app
         self.chain: list[int] = []  # campaigns already run in the current queue (loop guard)
+        self.session_confirmed = False  # the user answered «Да» once in this session: do not ask again
 
     def offer(self, finished_db, summary) -> None:
         """UI thread. `finished_db` is the campaign scope of the run that just ended."""
@@ -19,7 +20,11 @@ class QueueRunner:
         if finished_db is None or app._closing:
             return
         chain = [*self.chain, finished_db.campaign_id]
-        future = app.run_coro(plan_next(finished_db, summary, chain))
+
+        async def decide():
+            return await plan_next(finished_db, summary, chain), await get_auto_continue(finished_db)
+
+        future = app.run_coro(decide())
 
         def done(result):
             def render():
@@ -28,13 +33,14 @@ class QueueRunner:
                 if result.cancelled() or result.exception():
                     self.chain = []
                     return
-                self.handle(result.result(), chain)
+                plan, auto = result.result()
+                self.handle(plan, chain, auto_continue=auto)
 
             app._safe_after(render)
 
         future.add_done_callback(done)
 
-    def handle(self, plan, chain) -> None:
+    def handle(self, plan, chain, auto_continue=False) -> None:
         app = self.app
         if plan["action"] == "none":
             self.chain = []
@@ -44,14 +50,22 @@ class QueueRunner:
             app.set_status(plan["message"])
             app.notify("Очередь кампаний", plan["message"], warning=True)
             return
-        if not messagebox.askyesno(
-            "Очередь кампаний",
-            plan["message"] + "\n\nОткрыть эту кампанию и запустить её сейчас?\n"
-            "«Нет» — очередь остановится, кампания останется на месте.",
-            parent=app,
-        ):
-            self.chain = []
-            return
+        if needs_confirmation(auto_continue, self.session_confirmed):
+            if not messagebox.askyesno(
+                "Очередь кампаний",
+                plan["message"] + "\n\nОткрыть эту кампанию и запустить её сейчас?\n"
+                "«Да» — дальше в этой сессии следующие кампании запускаются без вопроса "
+                "(постоянно: флажок «Автозапуск следующей»).\n"
+                "«Нет» — очередь остановится, кампания останется на месте.",
+                parent=app,
+            ):
+                self.chain = []
+                return
+            self.session_confirmed = True
+        else:
+            text = f"Автозапуск очереди: следующая кампания «{plan['name']}»."
+            app.set_status(text)
+            app.notify("Очередь кампаний", text)
         self.chain = chain
         self.start(plan["next_id"], 0)
 

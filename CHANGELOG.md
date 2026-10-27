@@ -8,6 +8,18 @@ Releases are portable-only (ZIP + SHA-256), unsigned.
 
 ## [Unreleased]
 
+## [1.2.25] — 2026-10-27
+
+### Добавлено
+- Сводки через собственного Telegram-бота: токен хранится через DPAPI, chat_id вводится или определяется кнопкой; канал: выкл / «Избранное» / бот / оба. Только счётчики. / Summaries via the user's own Telegram bot (DPAPI token, counters only).
+- Очередь кампаний: автопродолжение — следующая кампания запускается автоматически. / Queue auto-continue.
+- Динамический бюджет авторов сообщений при парсинге (делится между аккаунтами). / Dynamic chat-authors budget.
+- Светлая и тёмная тема. / Light and dark theme.
+- Справка и интерфейс новых экранов на английском (EN help + i18n). / EN help and i18n for the new screens.
+
+### Изменено
+- Портативный ZIP стал меньше. / Smaller portable ZIP.
+
 ## [1.2.24] — 2026-10-27
 
 ### Добавлено
@@ -63,7 +75,8 @@ Releases are portable-only (ZIP + SHA-256), unsigned.
 - `start.bat` сам снимает блокировку «скачано из интернета» (`Unblock-File`). / Auto-unblock on launch.
 - Пользовательские данные (`profile`, `data`, `sessions`, `*.db`, `.env`) не попадают ни в git, ни в ZIP; сборка проверяет это. / User data never ships.
 
-[Unreleased]: https://github.com/SalazarUltra/inviter-studio/compare/v1.2.24...HEAD
+[Unreleased]: https://github.com/SalazarUltra/inviter-studio/compare/v1.2.25...HEAD
+[1.2.25]: https://github.com/SalazarUltra/inviter-studio/releases/tag/v1.2.25
 [1.2.24]: https://github.com/SalazarUltra/inviter-studio/releases/tag/v1.2.24
 [1.2.23]: https://github.com/SalazarUltra/inviter-studio/releases/tag/v1.2.23
 [1.2.22]: https://github.com/SalazarUltra/inviter-studio/releases/tag/v1.2.22

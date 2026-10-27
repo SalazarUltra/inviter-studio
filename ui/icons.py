@@ -5,9 +5,18 @@ from functools import lru_cache
 import customtkinter as ctk
 from PIL import Image, ImageDraw
 
+from ui.theme import COLORS
+
 
 @lru_cache(maxsize=64)
-def icon(name, color="#9A9EA8", size=20):
+def icon(name, color=COLORS["muted"], size=20):
+    """A CTkImage with a light and a dark variant (it follows the appearance mode); `color` is a (light, dark) pair or a single color string."""
+    light, dark = (color[0], color[1]) if isinstance(color, (tuple, list)) else (color, color)
+    return ctk.CTkImage(light_image=_draw(name, light), dark_image=_draw(name, dark), size=(size, size))
+
+
+@lru_cache(maxsize=128)
+def _draw(name, color):
     scale = 4
     canvas = Image.new("RGBA", (24 * scale, 24 * scale))
     draw = ImageDraw.Draw(canvas)
@@ -83,4 +92,4 @@ def icon(name, color="#9A9EA8", size=20):
         line(((3, 8), (12, 3), (21, 8), (12, 13), (3, 8)))
         line(((3, 13), (12, 18), (21, 13)))
         line(((3, 18), (12, 23), (21, 18)))
-    return ctk.CTkImage(light_image=canvas, dark_image=canvas, size=(size, size))
+    return canvas

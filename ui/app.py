@@ -34,7 +34,19 @@ from ui.tab_parsing import ParsingTab
 from ui.tab_targets import TargetsTab
 from ui.tab_task import TaskTab
 from ui.tab_warmup import TabWarmup
-from ui.theme import APP_PROFILES, COLORS, FONTS, apply_button_role, init_fonts, style_tree
+from ui.theme import (
+    APP_PROFILES,
+    COLORS,
+    FONTS,
+    THEME_SETTING_KEY,
+    THEMES,
+    apply_button_role,
+    current_theme,
+    init_fonts,
+    normalize_theme,
+    set_theme,
+    style_tree,
+)
 
 
 class App(ctk.CTk):
@@ -119,6 +131,7 @@ class App(ctk.CTk):
         style_tree(self)
         self._load_profile_setting()
         self._load_density_setting()
+        self._load_theme_setting()
         self._load_notification_setting()
         self._load_language_setting()
         self._load_last_campaign()
@@ -138,7 +151,7 @@ class App(ctk.CTk):
     def _build_shell(self):
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
-        self.sidebar = ctk.CTkFrame(self, width=208, corner_radius=0, fg_color="#141619")
+        self.sidebar = ctk.CTkFrame(self, width=208, corner_radius=0, fg_color=COLORS["sidebar"])
         self.sidebar.grid(row=0, column=0, sticky="ns")
         self.sidebar.pack_propagate(False)
         brand = ctk.CTkFrame(self.sidebar, fg_color="transparent")
@@ -255,6 +268,19 @@ class App(ctk.CTk):
         )
         self.lang_menu.pack(side="left", padx=(0, 8))
         self.lang_tip = tip(self.lang_menu, t("nav.language_tip"))
+        # Light/dark appearance: separate from the density presets and from the profile.
+        self.theme_var = ctk.StringVar(value=self._theme_label(current_theme()))
+        self.theme_menu = ctk.CTkOptionMenu(
+            settings,
+            values=[self._theme_label(code) for code in THEMES],
+            variable=self.theme_var,
+            width=104,
+            height=32,
+            font=FONTS["small"],
+            command=self._on_theme_change,
+        )
+        self.theme_menu.pack(side="left", padx=(0, 8))
+        self.theme_tip = tip(self.theme_menu, t("nav.theme_tip"))
         self.profile_menu = ctk.CTkOptionMenu(
             settings,
             values=list(APP_PROFILES),
@@ -374,6 +400,9 @@ class App(ctk.CTk):
         self.new_task_button.configure(text=t("nav.new_task"))
         self.notifications_switch.configure(text=t("nav.notifications"))
         self.lang_tip.text = t("nav.language_tip")
+        self.theme_menu.configure(values=[self._theme_label(code) for code in THEMES])
+        self.theme_var.set(self._theme_label(current_theme()))
+        self.theme_tip.text = t("nav.theme_tip")
         tip(self.help_button, t("nav.help_tip"))
         tip(self.new_task_button, t("nav.new_task_tip"))
         self._update_breadcrumb()
@@ -381,11 +410,44 @@ class App(ctk.CTk):
         if self.status_text.cget("text") == previous_ready:
             self.status_text.configure(text=self._last_ready_text)
         self.title(f"Inviter Studio {VERSION}")
-        for tab in (self.task_tab, self.accounts_tab):
+        for tab in (self.task_tab, self.accounts_tab, self.dashboard_tab):
             try:
                 tab.retranslate()
             except Exception:
                 logging.getLogger(__name__).exception("Не удалось перевести раздел")
+
+    @staticmethod
+    def _theme_label(code: str) -> str:
+        return t(f"theme.{normalize_theme(code)}")
+
+    def _on_theme_change(self, label: str) -> None:
+        code = next((code for code in THEMES if self._theme_label(code) == label), current_theme())
+        self.set_ui_theme(code, persist=True)
+
+    def set_ui_theme(self, theme, *, persist: bool = False) -> None:
+        """Switch light/dark without a restart (density and profile are untouched); optionally store `ui_theme`."""
+        code = set_theme(normalize_theme(theme))
+        self.theme_var.set(self._theme_label(code))
+        if persist:
+            future = self.run_coro(self.db.set_setting(THEME_SETTING_KEY, code))
+
+            def done(result):
+                if result.cancelled() or result.exception():
+                    self._safe_after(lambda: self.set_status(t("theme.save_failed"), COLORS["error"]))
+
+            future.add_done_callback(done)
+
+    def _load_theme_setting(self) -> None:
+        future = self.run_coro(self.db.get_setting(THEME_SETTING_KEY, "dark"))
+
+        def done(result):
+            if result.cancelled() or result.exception():
+                return
+            code = normalize_theme(result.result())
+            if code != current_theme():
+                self._safe_after(lambda: self.set_ui_theme(code))
+
+        future.add_done_callback(done)
 
     def _load_language_setting(self) -> None:
         future = self.run_coro(self.db.get_setting(LANG_SETTING_KEY, DEFAULT_LANG))
@@ -889,7 +951,7 @@ class App(ctk.CTk):
                 f"dlg.complete.{outcome}" if outcome in {"completed", "failed", "stopped"} else "dlg.complete.other"
             )
             self.notify(title, t("dlg.complete.text"), warning=outcome == "failed")
-            # Opt-in Saved Messages summary: counters only, sent after the engine released its sessions.
+            # Opt-in summary (Saved Messages and/or own Telegram bot): counters only, sent after the engine released its sessions.
             self.run_coro(deliver_task_summary(self.db, summary, log=self.add_log))
             self.task_tab.show_summary(summary)
             self.queue_runner.offer(finished_db, summary)  # campaign queue: asks before starting the next one

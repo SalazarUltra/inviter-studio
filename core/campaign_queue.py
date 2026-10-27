@@ -18,6 +18,26 @@ TRIGGERS = (ON_SUCCESS, ON_ALWAYS)
 # Run outcomes (summary["outcome"]) that may continue the queue for each trigger.
 CONTINUE_OUTCOMES = {ON_SUCCESS: {"completed"}, ON_ALWAYS: {"completed", "failed"}}
 MAX_CHAIN = 25
+# Global (not per campaign) switch: start the next campaign without asking each time. Stop, an empty next campaign,
+# a deleted one and loops still end the queue; only the confirmation dialog is skipped.
+AUTO_KEY = "queue_auto_continue"
+
+
+def parse_auto_continue(value) -> bool:
+    return str(value if value is not None else "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def needs_confirmation(auto_continue: bool, session_confirmed: bool) -> bool:
+    """Ask the user before starting the next campaign unless they already agreed (setting or this session)."""
+    return not (auto_continue or session_confirmed)
+
+
+async def get_auto_continue(db) -> bool:
+    return parse_auto_continue(await db.get_setting(AUTO_KEY, "0"))
+
+
+async def set_auto_continue(db, enabled: bool) -> None:
+    await db.set_setting(AUTO_KEY, "1" if enabled else "0")
 
 
 def normalize_trigger(value) -> str:

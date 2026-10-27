@@ -143,7 +143,9 @@ def prepare_portable_handoff(root: Path, package: Path) -> Path:
             "Не отключайте защиту Windows ради запуска неизвестного файла.\n",
             encoding="utf-8-sig",
         )
-        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+        # Level 9 = smallest portable ZIP. Deflate stays the method: Explorer, tar.exe (update.bat) and the
+        # release check all read it natively, unlike LZMA/Zstd ZIPs. See "Portable size" in tools/build_windows.py.
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
             for path in sorted(staging.rglob("*")):
                 if path.is_file():
                     if any(part.lower() in {"profile", "data", "sessions", "backups"} for part in path.parts):

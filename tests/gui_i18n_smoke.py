@@ -4,6 +4,7 @@ import asyncio
 import json
 import tempfile
 import threading
+import time
 import traceback
 from pathlib import Path
 from unittest.mock import patch
@@ -71,11 +72,25 @@ def main():
                 yield lambda: read(app.db.get_setting("first_run_wizard_done")) == "1"
                 # Summary card exists and is opt-in (off by default).
                 card = app.accounts_tab.summary_card
-                assert not card.enabled_var.get() and card.title_label.cget("text") == "Summary to Saved Messages"
-                card.enabled_var.set(True)
+                assert card._current_channel() == "off" and card.title_label.cget("text") == "Telegram summaries"
+                card.channel_var.set(card._channel_labels()["saved"])
                 card._save()  # no account yet -> refused, stays off
-                assert not card.enabled_var.get()
+                assert card._current_channel() == "off"
                 assert read(app.db.get_setting("summary_enabled")) in (None, "0")
+                card.channel_var.set(card._channel_labels()["bot"])
+                card._save()  # own bot needs no account; the channel is stored even before the bot is set up
+                yield lambda: read(app.db.get_setting("notify_channel")) == "bot"
+                card._open_bot_dialog()
+                dialog = card._bot_dialog
+                assert dialog.winfo_exists() and dialog.test_button.cget("text") == "Send test"
+                dialog.detect()  # no token yet -> refused locally, no network call
+                assert "token" in dialog.status.cget("text").lower()
+                # CustomTkinter schedules its own delayed icon/lift callbacks on a new Toplevel; destroying it
+                # before they fire can hard-crash Tk on Windows (access violation), so let them settle first.
+                settle = time.monotonic() + 0.6
+                yield lambda: time.monotonic() > settle
+                dialog.destroy()
+                yield lambda: not dialog.winfo_exists()
                 # Back to Russian, restart-free.
                 app._on_language_change("Русский")
                 assert app.nav_buttons["task"].cget("text") == "Задача"

@@ -1,4 +1,10 @@
-"""Plain-language, offline instructions for the behavior implemented by this app."""
+"""Plain-language, offline instructions for the behavior implemented by this app.
+
+Russian guides live here (``GUIDES``); the English edition is ``ui.help_content_en.GUIDES_EN``. Use ``get_guides``
+to get the guides for the active language.
+"""
+
+from ui.i18n import DEFAULT_LANG, get_language, normalize_lang
 
 GUIDES = {
     "start": {
@@ -408,12 +414,39 @@ GUIDES = {
 }
 
 
-def search_guides(query: str):
-    aliases = {"личка": "личн", "личку": "личн", "ники": "ник", "рассылка": "сообщен"}
+def get_guides(lang=None):
+    """Guides for ``lang`` (default: the active UI language), keyed like ``GUIDES``.
+
+    Russian is the source of truth. A translated guide may omit any of title/intro/blocks; whatever is missing
+    falls back to the Russian text so the dialog never shows an empty section.
+    """
+    code = normalize_lang(lang) if lang is not None else get_language()
+    if code == DEFAULT_LANG:
+        return GUIDES
+    from ui.help_content_en import GUIDES_EN
+
+    translations = {"en": GUIDES_EN}.get(code, {})
+    merged = {}
+    for key, source in GUIDES.items():
+        translated = translations.get(key) or {}
+        merged[key] = {
+            "title": translated.get("title") or source["title"],
+            "intro": translated.get("intro") or source["intro"],
+            "blocks": translated.get("blocks") or source["blocks"],
+        }
+    return merged
+
+
+RU_ALIASES = {"личка": "личн", "личку": "личн", "ники": "ник", "рассылка": "сообщен"}
+
+
+def search_guides(query: str, lang=None):
+    code = normalize_lang(lang) if lang is not None else get_language()
+    aliases = RU_ALIASES if code == DEFAULT_LANG else {}
     words = [aliases.get(word, word) for word in query.casefold().split()]
     return [
         (key, heading, text)
-        for key, guide in GUIDES.items()
+        for key, guide in get_guides(code).items()
         for heading, text in guide["blocks"]
         if all(word in f"{guide['title']} {heading} {text}".casefold() for word in words)
     ]

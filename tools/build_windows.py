@@ -16,6 +16,32 @@ from tools.distribution import prepare_portable_handoff
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# --- Portable size ------------------------------------------------------------------------------------------
+# The ZIP is mostly the PyInstaller onedir runtime, so the size is controlled here and in tools/distribution.py:
+#  * EXCLUDED_MODULES keep optional Pillow codecs and dev-only stdlib packages out of the analysis. The app only
+#    draws icons with ImageDraw, never decodes AVIF/WebP or uses colour management; Pillow guards each of these
+#    imports (`try: from . import _avif ... except ImportError`), so excluding them is safe. PIL._avif alone is ~7.5 MB.
+#  * prune_package() is a second, defensive pass over the finished folder (stray caches, unused Tk locales,
+#    optional codecs if an exclude was ignored). Python 3.14 embeds the Tcl/Tk 9 scripts in the DLLs, so there is
+#    normally no locale folder to strip; the Tcl 8.6 layout (older Python) is handled when present.
+#  * UPX is deliberately NOT used (`--noupx`): packed executables trigger antivirus false positives and Smart App
+#    Control blocks, which matters more than the few MB it would save. Add it only if a trusted signing
+#    certificate is configured (INVITER_SIGNING_THUMBPRINT) and the package is re-tested.
+#  * tools/distribution.py writes the ZIP with Deflate level 9 (best ratio; build time is not a concern).
+EXCLUDED_MODULES = (
+    "PIL._avif",
+    "PIL._webp",
+    "PIL._imagingcms",
+    "tkinter.test",
+    "test",
+    "idlelib",
+    "lib2to3",
+    "pydoc_data",
+)
+# Tcl 8.6 layout only: keep English and Russian message catalogs, drop the other ~100 locales.
+KEPT_TK_LOCALES = ("en", "ru")
+OPTIONAL_PIL_BINARIES = ("_avif", "_webp", "_imagingcms")
+
 
 def find_signtool():
     explicit = os.environ.get("SIGNTOOL_PATH")
@@ -73,6 +99,39 @@ def sign_artifacts(paths):
         print(f"Подписан: {artifact}")
 
 
+def prune_package(package: Path) -> int:
+    """Remove files the app never loads from a finished onedir package; returns the bytes freed.
+
+    Safe to run repeatedly. Only touches `_internal`, never user-data folders.
+    """
+    internal = package / "_internal"
+    freed = 0
+
+    def drop(path: Path) -> None:
+        nonlocal freed
+        if path.is_dir():
+            freed += sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+            shutil.rmtree(path, ignore_errors=True)
+        elif path.is_file():
+            freed += path.stat().st_size
+            path.unlink(missing_ok=True)
+
+    for cache in list(internal.rglob("__pycache__")):
+        drop(cache)
+    for stem in OPTIONAL_PIL_BINARIES:
+        for binary in list((internal / "PIL").glob(f"{stem}*.pyd")):
+            drop(binary)
+    for tk_data in ("_tcl_data", "_tk_data", "tcl", "tk"):
+        messages = internal / tk_data / "msgs"
+        if not messages.is_dir():
+            continue
+        for catalog in list(messages.glob("*.msg")):
+            language = catalog.stem.split("_")[0].lower()
+            if language not in KEPT_TK_LOCALES:
+                drop(catalog)
+    return freed
+
+
 def validate_package(package):
     if not (package / "InviterStudio.exe").is_file() or not (package / "_internal").is_dir():
         raise RuntimeError("Нет полной сборки приложения: нужны InviterStudio.exe и _internal")
@@ -122,13 +181,14 @@ def main():
                 "--noconfirm",
                 "--onedir",
                 "--windowed",
-                "--noupx",
+                "--noupx",  # see "Portable size" above: UPX is intentionally off
                 "--name",
                 "InviterStudio",
                 "--icon",
                 str(assets / "app.ico"),
                 "--version-file",
                 str(resource),
+                *[arg for module in EXCLUDED_MODULES for arg in ("--exclude-module", module)],
                 "--collect-data",
                 "customtkinter",
                 "--add-data",
@@ -152,6 +212,9 @@ def main():
         )
         if not package.resolve().is_relative_to((ROOT / "dist").resolve()):
             raise RuntimeError("Путь сборки должен находиться внутри dist")
+    freed = prune_package(package)
+    if freed:
+        print(f"Убрано лишнего из сборки: {freed / 1024 / 1024:.1f} МБ")
     validate_package(package)
     # Signing the executable itself is what Windows Smart App Control trusts;
     # a wrapper archive inherits nothing.

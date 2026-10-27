@@ -14,7 +14,7 @@ from core.user_feedback import explain_error
 from ui.campaigns import CampaignBar
 from ui.components import page_intro
 from ui.dispatch import post_ui
-from ui.theme import COLORS, FONTS, init_fonts, style_card
+from ui.theme import COLORS, FONTS, bind_text_tags, init_fonts, style_card
 
 LOG_COLORS = {
     "SUCCESS": COLORS["success"],
@@ -223,9 +223,7 @@ class LogsTab(ctk.CTkFrame):
         self.log_box.bind("<Button-3>", self.show_log_context_menu)
 
         text_widget = self.log_box._textbox
-        for level, color in LOG_COLORS.items():
-            text_widget.tag_config(level, foreground=color)
-        text_widget.tag_config("TIME", foreground=COLORS["muted"])
+        bind_text_tags(text_widget, {**LOG_COLORS, "TIME": COLORS["muted"]})
         self.search_var.trace_add("write", self.schedule_filter)
         self.filter_var.trace_add("write", self.schedule_filter)
 

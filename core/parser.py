@@ -45,6 +45,9 @@ from core.validation import id_recipient, normalize_username
 MAX_SOURCES = 10
 MAX_PER_SOURCE = 5000
 MAX_RUN_RECORDS = 20000
+MIN_GRANT = 100  # smallest slice of the shared budget handed to a source (one history page)
+GROW_WAIT_STEPS = 150  # x GROW_WAIT_SECONDS: how long a source waits for more shared budget before giving up
+GROW_WAIT_SECONDS = 0.2
 # Telegram caps the plain participant list on big groups; searching by first letters/digits reaches the rest.
 SEARCH_QUERIES = tuple("abcdefghijklmnopqrstuvwxyz") + tuple("абвгдеёжзийклмнопрстуфхцчшщыэюя") + tuple("0123456789")
 PAGE_DELAY = 0.5
@@ -620,6 +623,53 @@ class ParserEngine:
     def _record_budget():
         return MAX_RUN_RECORDS
 
+    @staticmethod
+    def _reserve(ctx, wanted, holding=False) -> int:
+        """Take up to `wanted` records from the shared budget for one source and return how many were granted.
+
+        The budget is not split once at the start: each reservation takes a fair share of what is left among the
+        workers that still have sources and no reservation yet, so records that finished or failed accounts did not
+        use (returned by `_release`) flow to the accounts that are still working. A grant is never smaller than one
+        history page (when that much is left), so the reader does not fall into a stream of tiny requests.
+        `holding` is True when the caller already holds a reservation and asks for more.
+        """
+        available = max(0, ctx.budget)
+        others_idle = max(0, len(ctx.working) - ctx.holders - (0 if holding else 1))
+        share = -(-available // (others_idle + 1))
+        grant = min(max(0, wanted), available, max(share, MIN_GRANT))
+        if grant and not holding:
+            ctx.holders += 1
+        ctx.budget -= grant
+        ctx.outstanding += grant
+        return grant
+
+    async def _grow(self, ctx, wanted) -> int:
+        """More budget for a source that is still being read (the caller holds a reservation already).
+
+        Waits (without any Telegram request) while other accounts that have not reserved yet are about to take their
+        share, or while others hold the whole budget and may still return part of it. When every holder is waiting
+        like this nobody can release anything, so it gives up instead of waiting for each other.
+        """
+        ctx.growing += 1
+        try:
+            for _ in range(GROW_WAIT_STEPS):
+                if ctx.budget > 0 and len(ctx.working) - ctx.holders <= 0:
+                    break
+                if ctx.budget <= 0 and ctx.holders <= ctx.growing:
+                    return 0
+                await asyncio.sleep(GROW_WAIT_SECONDS)
+            return self._reserve(ctx, wanted, holding=True) if ctx.budget > 0 else 0
+        finally:
+            ctx.growing -= 1
+
+    @staticmethod
+    def _release(ctx, reserved, used, holding) -> None:
+        """Return the unused part of a reservation to the shared budget."""
+        ctx.outstanding -= reserved
+        ctx.budget += max(0, reserved - max(0, used))
+        if holding:
+            ctx.holders -= 1
+
     async def _create_run(self, accounts, sources, ctx):
         """Create the saved run row. The authors engine overrides this to store its period and scan limit."""
         return await self.db.create_parse_run(accounts[0]["id"], sources, limit_per_source=ctx.limit)
@@ -634,6 +684,9 @@ class ParserEngine:
             detail="",
             budget=self._record_budget(),  # records not yet reserved by a source
             outstanding=0,  # records reserved by sources that are being read right now
+            holders=0,  # workers that hold a reservation right now
+            growing=0,  # holders waiting for more budget (see _grow)
+            working=set(),  # accounts that still have sources to read (budget is shared between them)
             successful=0,
             collected=0,
             seen_sources=set(),
@@ -691,6 +744,8 @@ class ParserEngine:
 
     async def _drain(self, accounts, queues, ctx):
         """Run one worker per account until its own list and the shared hand-over list are empty."""
+        # Counted before any worker starts, so the first one does not take the whole budget.
+        ctx.working = {a["id"] for a in accounts if queues.get(a["id"]) or ctx.orphans}
         if len(accounts) == 1:  # single account: exactly the old sequential behaviour, in the same task
             await self._worker(accounts[0], queues.setdefault(accounts[0]["id"], deque()), ctx)
             return
@@ -710,6 +765,12 @@ class ParserEngine:
                 raise result
 
     async def _worker(self, account, own, ctx):
+        try:
+            await self._work(account, own, ctx)
+        finally:
+            ctx.working.discard(account["id"])  # its unused budget is now shared by the others
+
+    async def _work(self, account, own, ctx):
         if (not own and not ctx.orphans) or ctx.stop:
             return
         manager = self._new_manager(account)
@@ -752,7 +813,7 @@ class ParserEngine:
     async def _process_source(self, manager, account, reference, own, ctx):
         """Read one source. Returns «ok» to continue, anything else to stop this account's loop."""
         source_id = None
-        initial, seen, reserved = 0, set(), 0
+        initial, seen, reserved, holding = 0, set(), 0, False
         try:
             # Several accounts reserve from one record budget: wait while it is fully reserved elsewhere.
             while ctx.budget <= 0 and ctx.outstanding > 0:
@@ -773,10 +834,9 @@ class ParserEngine:
             search_pos = int((saved or {}).get("search_pos") or 0)
             await self.db.save_parse_source(self.run_id, str(reference), info, "running", "", len(seen))
             self.progress(f"Получение участников: {info['title']}")
-            cap = min(ctx.limit, ctx.budget + len(seen))
-            reserved = max(0, cap - len(seen))
-            ctx.budget -= reserved
-            ctx.outstanding += reserved
+            reserved = self._reserve(ctx, ctx.limit - len(seen))
+            holding = reserved > 0
+            cap = min(ctx.limit, len(seen) + reserved)
 
             async def save(batch, new_count, reference=reference, info=info, seen=seen):
                 ctx.collected += len(batch)
@@ -826,8 +886,7 @@ class ParserEngine:
             self.progress(ctx.detail)
         finally:
             # Unused part of the reservation goes back to the shared budget.
-            ctx.outstanding -= reserved
-            ctx.budget += max(0, reserved - max(0, len(seen) - initial))
+            self._release(ctx, reserved, len(seen) - initial, holding)
         if ctx.budget <= 0 and ctx.outstanding <= 0:
             ctx.outcome = "partial"
             ctx.detail = "Достигнут общий предел 20000 записей; оставшиеся группы не запрашивались."

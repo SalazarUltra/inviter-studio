@@ -7,7 +7,6 @@ import customtkinter as ctk
 from core.ab_test import format_ab_stats
 from core.backup import create_backup, stage_restore
 from core.campaign_transfer import (
-    SECRETS_NOTICE,
     export_campaign,
     import_campaign,
     parse_campaign_import,
@@ -15,6 +14,7 @@ from core.campaign_transfer import (
 )
 from ui.dispatch import post_ui
 from ui.hints import hint, tip
+from ui.i18n import t
 from ui.theme import FONTS, apply_button_role, style_tree
 
 
@@ -171,26 +171,18 @@ class CampaignBar(ctk.CTkFrame):
         transfer = ctk.CTkFrame(dialog, fg_color="transparent")
         transfer.pack(fill="x", padx=20, pady=(0, 6))
         dialog.export_button = ctk.CTkButton(
-            transfer, text="Экспорт в JSON…", width=205, command=lambda: self.export_file(dialog)
+            transfer, text=t("transfer.export_btn"), width=205, command=lambda: self.export_file(dialog)
         )
         dialog.export_button.pack(side="left", fill="x", expand=True, padx=(0, 6))
         dialog.import_button = ctk.CTkButton(
-            transfer, text="Импорт из JSON…", width=205, command=lambda: self.import_file(dialog)
+            transfer, text=t("transfer.import_btn"), width=205, command=lambda: self.import_file(dialog)
         )
         dialog.import_button.pack(side="left", fill="x", expand=True)
         for button in (dialog.export_button, dialog.import_button):
             apply_button_role(button, "secondary")
-        tip(
-            dialog.export_button,
-            "Сохранить тексты, настройки и получателей в файл. Ключи API, сессии, прокси и ключи ИИ не экспортируются.",
-        )
-        tip(dialog.import_button, "Создать НОВУЮ кампанию из файла. Текущая кампания не меняется.")
-        hint(
-            dialog,
-            "Файл кампании не содержит ключей API, сессий, прокси и ключей ИИ. В нём список получателей — "
-            "не публикуйте его. Аккаунты после импорта нужно выбрать заново.",
-            padx=20,
-        )
+        tip(dialog.export_button, t("transfer.export_tip"))
+        tip(dialog.import_button, t("transfer.import_tip"))
+        hint(dialog, t("transfer.hint"), padx=20)
         dialog.delete_button = ctk.CTkButton(
             dialog, text="Удалить эту кампанию", height=32, command=lambda: self.delete(dialog)
         )
@@ -202,9 +194,8 @@ class CampaignBar(ctk.CTkFrame):
     def export_file(self, owner=None):
         db = self.app.db
         answer = messagebox.askyesnocancel(
-            "Экспорт кампании",
-            SECRETS_NOTICE + "\n\nДобавить в файл статусы получателей (отправлено, ошибка и т. д.)?\n"
-            "Да — со статусами. Нет — только список. Отмена — не экспортировать.",
+            t("transfer.export_title"),
+            t("transfer.export_ask", notice=t("transfer.secrets_notice")),
             parent=owner or self.app,
         )
         if answer is None:
@@ -213,25 +204,25 @@ class CampaignBar(ctk.CTkFrame):
         safe = "".join(ch for ch in current if ch.isalnum() or ch in " _-")[:40].strip() or "campaign"
         path = filedialog.asksaveasfilename(
             parent=owner or self.app,
-            title="Экспорт кампании",
+            title=t("transfer.export_title"),
             defaultextension=".json",
             initialfile=f"{safe}.json",
-            filetypes=[("Кампания BotInvityer (JSON)", "*.json")],
+            filetypes=[(t("transfer.file_type"), "*.json")],
         )
         if path:
             self._operation(
                 export_campaign(db, path, include_statuses=answer),
-                "Кампания сохранена в файл. Ключи API, сессии, прокси и ключи ИИ в него не попали.",
+                t("transfer.export_done"),
             )
 
     def import_file(self, owner=None):
         if self.app.scheduler.is_running() or self.app.task_tab._starting:
-            messagebox.showwarning("Задача выполняется", "Остановите задачу перед импортом кампании")
+            messagebox.showwarning(t("transfer.busy_title"), t("transfer.busy_text"))
             return
         path = filedialog.askopenfilename(
             parent=owner or self.app,
-            title="Импорт кампании",
-            filetypes=[("Кампания BotInvityer (JSON)", "*.json"), ("Все файлы", "*.*")],
+            title=t("transfer.import_title"),
+            filetypes=[(t("transfer.file_type"), "*.json"), (t("transfer.all_files"), "*.*")],
         )
         if not path:
             return
@@ -244,38 +235,34 @@ class CampaignBar(ctk.CTkFrame):
                 return
             if result.exception():
                 error = result.exception()
-                post_ui(self, lambda: messagebox.showerror("Импорт кампании", str(error), parent=owner or self.app))
+                post_ui(
+                    self,
+                    lambda: messagebox.showerror(t("transfer.import_title"), str(error), parent=owner or self.app),
+                )
                 return
             post_ui(self, lambda: self._confirm_import(result.result(), owner))
 
         self.app.run_coro(load()).add_done_callback(loaded)
 
     def _confirm_import(self, parsed, owner=None):
-        kind = "Личные сообщения" if parsed["kind"] == "messages" else "Приглашения"
+        kind = t("transfer.kind.messages") if parsed["kind"] == "messages" else t("transfer.kind.invite")
         lines = [
-            f"Название: {parsed['name']}",
-            f"Режим: {kind}",
-            f"Получателей: {len(parsed['targets'])}",
+            t("transfer.confirm.name", name=parsed["name"]),
+            t("transfer.confirm.mode", kind=kind),
+            t("transfer.confirm.count", n=len(parsed["targets"])),
         ]
         if parsed["settings"].get("ab_enabled") == "1":
-            lines.append(f"A/B-тест текста: доля A — {parsed['settings'].get('ab_split_a', '50')}%")
+            lines.append(t("transfer.confirm.ab", split=parsed["settings"].get("ab_split_a", "50")))
         notes = []
         if parsed["ignored"]:
-            notes.append("Пропущены неизвестные поля: " + ", ".join(parsed["ignored"][:8]))
+            notes.append(t("transfer.confirm.ignored", fields=", ".join(parsed["ignored"][:8])))
         if parsed["secrets_dropped"]:
-            notes.append(
-                "Секретные поля из файла проигнорированы и не сохранены: " + ", ".join(parsed["secrets_dropped"][:8])
-            )
-        text = (
-            "\n".join(lines)
-            + ("\n\n" + "\n".join(notes) if notes else "")
-            + "\n\nБудет создана НОВАЯ кампания; текущая не изменится. Аккаунты, ключи API и прокси не импортируются: "
-            "выберите аккаунты на вкладке «Задача». Получатели, которые уже есть в общем журнале отправок, повторно не получат сообщение.\n\nИмпортировать?"
-        )
-        if not messagebox.askyesno("Импорт кампании", text, parent=owner or self.app):
+            notes.append(t("transfer.confirm.secrets", fields=", ".join(parsed["secrets_dropped"][:8])))
+        text = "\n".join(lines) + ("\n\n" + "\n".join(notes) if notes else "") + "\n\n" + t("transfer.confirm.body")
+        if not messagebox.askyesno(t("transfer.import_title"), text, parent=owner or self.app):
             return
         if self.app.scheduler.is_running() or self.app.task_tab._starting:
-            messagebox.showwarning("Задача выполняется", "Остановите задачу перед импортом кампании")
+            messagebox.showwarning(t("transfer.busy_title"), t("transfer.busy_text"))
             return
         future = self.app.run_coro(import_campaign(self.app.db, parsed))
 
@@ -285,7 +272,7 @@ class CampaignBar(ctk.CTkFrame):
 
             def render():
                 if result.exception():
-                    messagebox.showerror("Импорт кампании", str(result.exception()), parent=owner or self.app)
+                    messagebox.showerror(t("transfer.import_title"), str(result.exception()), parent=owner or self.app)
                     return
                 outcome = result.result()
                 if owner is not None and owner.winfo_exists():
@@ -295,11 +282,11 @@ class CampaignBar(ctk.CTkFrame):
                     bar.refresh()
                 stats = outcome["stats"]
                 messagebox.showinfo(
-                    "Импорт кампании",
-                    f"Создана новая кампания. Получателей добавлено: {stats['inserted']}"
-                    + (f", дубликатов: {stats['duplicates']}" if stats["duplicates"] else "")
-                    + (f"; без @username пропущено: {stats['no_username']}" if stats.get("no_username") else "")
-                    + ".\nВыберите аккаунты на вкладке «Задача».",
+                    t("transfer.import_title"),
+                    t("transfer.done", inserted=stats["inserted"])
+                    + (t("transfer.done_dupes", n=stats["duplicates"]) if stats["duplicates"] else "")
+                    + (t("transfer.done_no_username", n=stats["no_username"]) if stats.get("no_username") else "")
+                    + t("transfer.done_tail"),
                     parent=self.app,
                 )
 

@@ -158,7 +158,7 @@ class ChatAuthorsEngine(ParserEngine):
     async def _process_source(self, manager, account, reference, own, ctx):
         """Read the history of one source. «ok» continues this account's loop; anything else stops it."""
         since, until = ctx.options.get("since"), ctx.options.get("until")
-        info, count, reserved, source_id = {}, 0, 0, None
+        info, count, reserved, source_id, holding = {}, 0, 0, None, False
         try:
             # Several accounts reserve from one message budget: wait while it is fully reserved elsewhere.
             while ctx.budget <= 0 and ctx.outstanding > 0:
@@ -169,12 +169,23 @@ class ChatAuthorsEngine(ParserEngine):
                 return "ok"
             ctx.seen_sources.add(source_id)
             await self.db.save_parse_source(self.run_id, str(reference), info, "running", "Чтение доступной истории")
-            cap, cursor, messages_seen, people = min(ctx.limit, ctx.budget), 0, set(), {}
-            reserved = cap
-            ctx.budget -= reserved
-            ctx.outstanding += reserved
+            # A fair share of what is left; more is requested below while this source still has history to read,
+            # so budget freed by finished or failed accounts reaches the accounts that are still working.
+            reserved = cap = self._reserve(ctx, ctx.limit)
+            holding = reserved > 0
+            cursor, messages_seen, people = 0, set(), {}
             reason, excluded, found = "", 0, 0
-            while count < cap:
+
+            async def top_up():
+                nonlocal cap, reserved
+                if not holding or cap >= ctx.limit:
+                    return False
+                extra = await self._grow(ctx, ctx.limit - cap)
+                cap += extra
+                reserved += extra
+                return extra > 0
+
+            while count < cap or (not reason and await top_up()):
                 response = await asyncio.wait_for(
                     manager.client(history_request(entity, cursor, min(100, cap - count), until)), 30
                 )
@@ -274,8 +285,7 @@ class ChatAuthorsEngine(ParserEngine):
             self.progress(ctx.detail)
         finally:
             # Messages really read stay spent; the unused part of the reservation goes back to the shared budget.
-            ctx.outstanding -= reserved
-            ctx.budget += max(0, reserved - count)
+            self._release(ctx, reserved, count, holding)
         if ctx.budget <= 0 and ctx.outstanding <= 0:
             ctx.outcome = "partial"
             ctx.detail = "Достигнут общий предел 20000 просмотренных сообщений; остальные источники не запрашивались."

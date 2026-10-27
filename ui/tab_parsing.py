@@ -42,7 +42,7 @@ from ui.components import page_intro
 from ui.dispatch import post_ui
 from ui.entry_utils import paste_text
 from ui.hints import hint, tip, wrap_label
-from ui.theme import COLORS, FONTS, apply_button_role, style_tree
+from ui.theme import COLORS, FONTS, apply_button_role, on_theme_change, resolve, style_tree
 
 RUN_LABELS = {
     "running": "Получение",
@@ -460,20 +460,26 @@ class ParsingTab(ctk.CTkFrame):
         table_frame.pack_propagate(False)
         table_frame.grid_rowconfigure(0, weight=1)
         table_frame.grid_columnconfigure(0, weight=1)
-        style = ttk.Style(self)
-        style.configure(
-            "Parser.Treeview",
-            background=COLORS["input"],
-            fieldbackground=COLORS["input"],
-            foreground=COLORS["text"],
-            rowheight=28,
-            font=("Segoe UI", 10),
-        )
-        style.map(
-            "Parser.Treeview",
-            background=[("selected", COLORS["accent_soft"])],
-            foreground=[("selected", COLORS["accent"])],
-        )
+
+        def style_table(_theme=None):
+            style = ttk.Style(self)
+            style.configure(
+                "Parser.Treeview",
+                background=resolve(COLORS["input"]),
+                fieldbackground=resolve(COLORS["input"]),
+                foreground=resolve(COLORS["text"]),
+                rowheight=28,
+                font=("Segoe UI", 10),
+            )
+            style.map(
+                "Parser.Treeview",
+                background=[("selected", resolve(COLORS["accent_soft"]))],
+                foreground=[("selected", resolve(COLORS["accent"]))],
+            )
+
+        style_table()
+        self._unsubscribe_table_style = on_theme_change(style_table)
+        self.bind("<Destroy>", lambda event: self._unsubscribe_table_style() if event.widget is self else None, add="+")
         self.table = ttk.Treeview(
             table_frame,
             columns=("id", "username", "name", "activity", "messages", "last_post", "sources"),

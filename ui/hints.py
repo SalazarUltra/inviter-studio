@@ -4,7 +4,7 @@ import tkinter as tk
 
 import customtkinter as ctk
 
-from ui.theme import COLORS, FONTS
+from ui.theme import COLORS, FONTS, resolve
 
 
 def wrap_label(label, minimum=200):
@@ -68,7 +68,7 @@ class ControlTooltip:
         ):
             return
         # Native Toplevel avoids delayed theme/icon callbacks on a short-lived tooltip.
-        self.window = tk.Toplevel(self.widget, takefocus=False, bg=COLORS["border"])
+        self.window = tk.Toplevel(self.widget, takefocus=False, bg=resolve(COLORS["border"]))
         self.window.withdraw()
         self.window.overrideredirect(True)
         self.window.attributes("-topmost", True)
@@ -77,8 +77,8 @@ class ControlTooltip:
             self.window,
             text=self.text,
             justify="left",
-            bg=COLORS["elevated"],
-            fg=COLORS["text"],
+            bg=resolve(COLORS["elevated"]),
+            fg=resolve(COLORS["text"]),
             font=("Segoe UI", 10),
             wraplength=int(320 * scale),
             padx=12,

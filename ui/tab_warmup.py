@@ -16,7 +16,7 @@ from core.warmup_engine import WarmupEngine
 from ui.components import empty_state, page_intro
 from ui.dispatch import post_ui
 from ui.hints import tip
-from ui.theme import COLORS, FONTS, init_fonts, style_card, style_tree
+from ui.theme import COLORS, FONTS, bind_text_tags, init_fonts, style_card, style_tree
 
 WARMUP_ACTION_LABELS = {
     "go_online": "Статус онлайн",
@@ -384,10 +384,15 @@ class TabWarmup(ctk.CTkFrame):
             state="normal",
         )
         self.log_box.pack(fill="both", expand=True, padx=16, pady=(0, 16))
-        self.log_box.tag_config("SUCCESS", foreground=COLORS["success"])
-        self.log_box.tag_config("ERROR", foreground=COLORS["error"])
-        self.log_box.tag_config("INFO", foreground=COLORS["muted"])
-        self.log_box.tag_config("WARN", foreground=COLORS["warning"])
+        bind_text_tags(
+            self.log_box,
+            {
+                "SUCCESS": COLORS["success"],
+                "ERROR": COLORS["error"],
+                "INFO": COLORS["muted"],
+                "WARN": COLORS["warning"],
+            },
+        )
 
     def _load_ai_memory_setting(self) -> None:
         fut = self.run_coro(self.db.get_setting("ai_memory_enabled", "1"))

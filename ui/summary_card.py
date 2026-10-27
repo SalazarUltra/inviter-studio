@@ -1,9 +1,21 @@
-"""Opt-in settings card: short run summary to Telegram Saved Messages via one chosen account."""
+"""Opt-in settings card: short run summary to Saved Messages (one chosen account) and/or the user's own bot."""
 
 from __future__ import annotations
 
 import customtkinter as ctk
 
+from core.bot_notify import (
+    CHANNEL_BOT,
+    CHANNEL_BOTH,
+    CHANNEL_OFF,
+    CHANNEL_SAVED,
+    NOTIFY_CHANNEL_KEY,
+    NOTIFY_CHAT_ID_KEY,
+    NOTIFY_TOKEN_KEY,
+    normalize_channel,
+    uses_bot,
+    uses_saved,
+)
 from core.summary import (
     MODE_DAILY,
     MODE_TASK,
@@ -14,6 +26,7 @@ from core.summary import (
     normalize_mode,
     send_to_saved,
 )
+from ui.bot_notify_dialog import BotNotifyDialog
 from ui.dispatch import post_ui
 from ui.hints import hint, wrap_label
 from ui.i18n import get_language, t
@@ -27,15 +40,24 @@ class SummaryCard(ctk.CTkFrame):
         self.run_coro = run_coro
         self._accounts: dict[str, int] = {}
         self._loading = True
+        self._bot_ready = False
+        self._bot_dialog = None
         style_card(self, color=COLORS["accent"])
         self.title_label = ctk.CTkLabel(self, text="", font=FONTS["subhead"], anchor="w")
         self.title_label.pack(fill="x", padx=16, pady=(12, 4))
-        self.enabled_var = ctk.BooleanVar(value=False)
-        self.enable_check = ctk.CTkCheckBox(
-            self, text="", variable=self.enabled_var, command=self._save, font=FONTS["body"]
-        )
-        self.enable_check.pack(anchor="w", padx=16, pady=(0, 6))
         self.hint_label = hint(self, "")
+        channel_row = ctk.CTkFrame(self, fg_color="transparent")
+        channel_row.pack(fill="x", padx=16, pady=(0, 6))
+        self.channel_caption = ctk.CTkLabel(channel_row, text="", font=FONTS["small"])
+        self.channel_caption.pack(side="left")
+        self.channel_var = ctk.StringVar()
+        self.channel_menu = ctk.CTkOptionMenu(
+            channel_row, values=[""], variable=self.channel_var, width=190, height=30, command=lambda _v: self._save()
+        )
+        self.channel_menu.pack(side="left", padx=(6, 8))
+        self.bot_button = ctk.CTkButton(channel_row, text="", height=30, width=110, command=self._open_bot_dialog)
+        apply_button_role(self.bot_button, "secondary")
+        self.bot_button.pack(side="left")
         row = ctk.CTkFrame(self, fg_color="transparent")
         row.pack(fill="x", padx=16, pady=(0, 6))
         self.mode_caption = ctk.CTkLabel(row, text="", font=FONTS["small"])
@@ -69,6 +91,18 @@ class SummaryCard(ctk.CTkFrame):
     def _mode_labels(self) -> dict[str, str]:
         return {MODE_TASK: t("summary.card.mode_task"), MODE_DAILY: t("summary.card.mode_daily")}
 
+    def _channel_labels(self) -> dict[str, str]:
+        return {
+            channel: t(f"summary.card.channel.{channel}")
+            for channel in (CHANNEL_OFF, CHANNEL_SAVED, CHANNEL_BOT, CHANNEL_BOTH)
+        }
+
+    def _current_channel(self) -> str:
+        for key, label in self._channel_labels().items():
+            if label == self.channel_var.get():
+                return key
+        return CHANNEL_OFF
+
     def _current_mode(self) -> str:
         for key, label in self._mode_labels().items():
             if label == self.mode_var.get():
@@ -83,8 +117,13 @@ class SummaryCard(ctk.CTkFrame):
 
     def retranslate(self) -> None:
         mode = self._current_mode() if self.mode_var.get() else MODE_TASK
+        channel = self._current_channel() if self.channel_var.get() else CHANNEL_OFF
         self.title_label.configure(text=t("summary.card.title"))
-        self.enable_check.configure(text=t("summary.card.enable"))
+        self.channel_caption.configure(text=t("summary.card.channel"))
+        self.bot_button.configure(text=t("summary.card.bot_button"))
+        labels_ch = self._channel_labels()
+        self.channel_menu.configure(values=list(labels_ch.values()))
+        self.channel_var.set(labels_ch[channel])
         self.hint_label.configure(text=t("summary.card.hint"))
         self.mode_caption.configure(text=t("summary.card.mode"))
         self.account_caption.configure(text=t("summary.card.account"))
@@ -108,7 +147,16 @@ class SummaryCard(ctk.CTkFrame):
         db = self.get_db()
 
         async def read():
-            values = await db.get_settings_map([SUMMARY_ENABLED_KEY, SUMMARY_MODE_KEY, SUMMARY_ACCOUNT_KEY])
+            values = await db.get_settings_map(
+                [
+                    SUMMARY_ENABLED_KEY,
+                    SUMMARY_MODE_KEY,
+                    SUMMARY_ACCOUNT_KEY,
+                    NOTIFY_CHANNEL_KEY,
+                    NOTIFY_TOKEN_KEY,
+                    NOTIFY_CHAT_ID_KEY,
+                ]
+            )
             return values, await db.get_enabled_accounts()
 
         future = self.run_coro(read())
@@ -126,7 +174,12 @@ class SummaryCard(ctk.CTkFrame):
                 except ValueError:
                     selected = 0
                 self._loading = True
-                self.enabled_var.set(values.get(SUMMARY_ENABLED_KEY) == "1")
+                if values.get(NOTIFY_CHANNEL_KEY) is None:  # settings from before bot notifications
+                    channel = CHANNEL_SAVED if values.get(SUMMARY_ENABLED_KEY) == "1" else CHANNEL_OFF
+                else:
+                    channel = normalize_channel(values.get(NOTIFY_CHANNEL_KEY))
+                self.channel_var.set(self._channel_labels()[channel])
+                self._bot_ready = bool(values.get(NOTIFY_TOKEN_KEY)) and bool(values.get(NOTIFY_CHAT_ID_KEY))
                 self.mode_var.set(self._mode_labels()[normalize_mode(values.get(SUMMARY_MODE_KEY))])
                 self.set_accounts(accounts, selected)
                 self._loading = False
@@ -141,23 +194,34 @@ class SummaryCard(ctk.CTkFrame):
     def _save(self) -> None:
         if self._loading:
             return
-        enabled = self.enabled_var.get()
+        channel = self._current_channel()
         account_id = self._selected_account_id()
-        if enabled and not account_id:
-            self.enabled_var.set(False)
+        if uses_saved(channel) and not account_id:
+            self.channel_var.set(self._channel_labels()[CHANNEL_OFF])
+            channel = CHANNEL_OFF
             self._say(t("summary.card.pick"), error=True)
             return
         mode = self._current_mode()
         db = self.get_db()
 
         async def write():
-            await db.set_setting(SUMMARY_ENABLED_KEY, "1" if enabled else "0")
+            await db.set_setting(NOTIFY_CHANNEL_KEY, channel)
+            await db.set_setting(SUMMARY_ENABLED_KEY, "0" if channel == CHANNEL_OFF else "1")  # legacy flag
             await db.set_setting(SUMMARY_MODE_KEY, mode)
             if account_id:
                 await db.set_setting(SUMMARY_ACCOUNT_KEY, str(account_id))
 
         self.run_coro(write())
-        self._say(t("summary.card.saved"))
+        if uses_bot(channel) and not self._bot_ready:
+            self._say(t("summary.card.bot_missing"), error=True)
+        else:
+            self._say(t("summary.card.saved"))
+
+    def _open_bot_dialog(self) -> None:
+        if self._bot_dialog is not None and self._bot_dialog.winfo_exists():
+            self._bot_dialog.lift()
+            return
+        self._bot_dialog = BotNotifyDialog(self, self.get_db, self.run_coro, on_saved=self.load)
 
     def _send_sample(self) -> None:
         account_id = self._selected_account_id()

@@ -2744,6 +2744,17 @@ async def init_db() -> None:
                     encoded = protect(value)
                     if encoded != value:
                         await db.execute(f"UPDATE {table} SET {field} = ? WHERE id = ?", (encoded, row[0]))
+        # Bot notifications: protect a plaintext token and map the legacy opt-in flag to the new channel setting.
+        row = await (await db.execute("SELECT value FROM settings WHERE key = 'notify_bot_token'")).fetchone()
+        if row and row[0]:
+            encoded = protect(row[0])
+            if encoded != row[0]:
+                await db.execute("UPDATE settings SET value = ? WHERE key = 'notify_bot_token'", (encoded,))
+        await db.execute(
+            "INSERT INTO settings(key, value) "
+            "SELECT 'notify_channel', CASE WHEN value = '1' THEN 'saved' ELSE 'off' END "
+            "FROM settings WHERE key = 'summary_enabled' ON CONFLICT(key) DO NOTHING"
+        )
         await db.execute("UPDATE warmup_sessions SET status = 'paused' WHERE status = 'running'")
         await db.execute("UPDATE accounts SET warmup_status = 'paused' WHERE warmup_status = 'warming'")
         await db.execute(

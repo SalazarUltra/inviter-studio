@@ -120,7 +120,8 @@ class TaskTab(ctk.CTkFrame):
         sections = ctk.CTkFrame(self, fg_color="transparent")
         sections.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 8))
         CampaignBar(sections).pack(fill="x", pady=(0, 6))
-        QueuePicker(sections).pack(fill="x", pady=(0, 6))
+        self.queue_picker = QueuePicker(sections)
+        self.queue_picker.pack(fill="x", pady=(0, 6))
         section_links = ctk.CTkFrame(sections, fg_color="transparent")
         section_links.pack(fill="x")
         for index, title_key in enumerate(SECTION_KEYS):
@@ -410,13 +411,13 @@ class TaskTab(ctk.CTkFrame):
         try:
             split = normalize_split(self.ab_split_entry.get())
         except ValueError as exc:
-            return ["", "A/B-тест: " + str(exc)]
-        lines = ["", f"A/B-тест текста: {split_label(split)}. Текст выше — вариант A."]
+            return ["", t("ab.review.error", error=str(exc))]
+        lines = ["", t("ab.review.header", split=split_label(split))]
         pending = [row["username"] for row in (self.recipients.expected or []) if row.get("username")]
         if pending:
             counts = planned_split(pending, split, salt=str(self.db.campaign_id))
-            lines.append(f"Из {len(pending)} в очереди: вариант A — {counts['A']}, вариант B — {counts['B']}")
-        lines.extend(["", "Вариант B:", self.ab_box.get("1.0", "end-1c") or "Не заполнено"])
+            lines.append(t("ab.review.counts", total=len(pending), a=counts["A"], b=counts["B"]))
+        lines.extend(["", t("ab.review.variant_b"), self.ab_box.get("1.0", "end-1c") or t("ab.review.empty")])
         return lines
 
     def _used_today(self, account: dict) -> int:
@@ -602,26 +603,21 @@ class TaskTab(ctk.CTkFrame):
         self.ab_enabled = ctk.BooleanVar(value=False)
         self.ab_switch = ctk.CTkSwitch(
             self.message_frame,
-            text="A/B-тест: второй вариант первого сообщения",
+            text=t("ab.switch"),
             variable=self.ab_enabled,
             command=self.toggle_ab,
         )
         self.ab_switch.pack(anchor="w", padx=16, pady=(4, 8))
-        tip(
-            self.ab_switch,
-            "Каждый получатель стабильно попадает в вариант A или B (по хэшу никнейма). "
-            "Какой текст ушёл, сохраняется в журнале отправок; сравнение — на вкладке «Аудитория».",
-        )
+        tip(self.ab_switch, t("ab.switch_tip"))
         self.ab_frame = ctk.CTkFrame(self.message_frame, fg_color="transparent")
         ab_header = ctk.CTkFrame(self.ab_frame, fg_color="transparent")
         ab_header.pack(fill="x", padx=16)
-        ctk.CTkLabel(ab_header, text="Текст B (текст A — поле «Первое сообщение» выше)", font=FONTS["small"]).pack(
-            side="left"
-        )
+        self.ab_text_b_label = ctk.CTkLabel(ab_header, text=t("ab.text_b"), font=FONTS["small"])
+        self.ab_text_b_label.pack(side="left")
         self.ab_counter = ctk.CTkLabel(ab_header, text="0 / 4096", font=FONTS["small"])
         self.ab_counter.pack(side="left", padx=8)
         self.paste_ab_btn = ctk.CTkButton(
-            ab_header, text="Вставить", width=100, height=28, command=lambda: paste_text(self.ab_box)
+            ab_header, text=t("ab.paste"), width=100, height=28, command=lambda: paste_text(self.ab_box)
         )
         apply_button_role(self.paste_ab_btn, "secondary")
         self.paste_ab_btn.pack(side="right")
@@ -630,7 +626,8 @@ class TaskTab(ctk.CTkFrame):
         self.ab_box.bind("<<Modified>>", self._message_modified, add="+")
         ab_split_row = ctk.CTkFrame(self.ab_frame, fg_color="transparent")
         ab_split_row.pack(fill="x", padx=16, pady=(0, 4))
-        ctk.CTkLabel(ab_split_row, text="Доля варианта A, %", font=FONTS["body"]).pack(side="left")
+        self.ab_split_caption = ctk.CTkLabel(ab_split_row, text=t("ab.split"), font=FONTS["body"])
+        self.ab_split_caption.pack(side="left")
         self.ab_split_entry = ctk.CTkEntry(ab_split_row, width=70, height=32)
         setup_entry(self.ab_split_entry)
         self.ab_split_entry.insert(0, str(DEFAULT_SPLIT_A))
@@ -638,11 +635,7 @@ class TaskTab(ctk.CTkFrame):
         self.ab_split_entry.bind("<KeyRelease>", self._ab_split_changed, add="+")
         self.ab_split_label = ctk.CTkLabel(ab_split_row, text="", font=FONTS["small"], text_color=COLORS["muted"])
         self.ab_split_label.pack(side="left")
-        hint(
-            self.ab_frame,
-            "1–99. Остальным уходит вариант B. Подстановки {имя} и {а|б} работают в обоих текстах. "
-            "Если включить второе сообщение, ответы считаются отдельно для A и B.",
-        )
+        self.ab_hint_label = hint(self.ab_frame, t("ab.split_hint"))
         self.followup_enabled = ctk.BooleanVar(value=False)
         self.followup_switch = ctk.CTkSwitch(
             self.message_frame,
@@ -1727,7 +1720,7 @@ class TaskTab(ctk.CTkFrame):
         try:
             self.ab_split_label.configure(text=split_label(normalize_split(self.ab_split_entry.get())))
         except ValueError:
-            self.ab_split_label.configure(text="Введите 1–99")
+            self.ab_split_label.configure(text=t("ab.split_invalid"))
         if not self._loading_campaign and not self.app._closing:
             self.update_readiness()
 
@@ -1884,7 +1877,9 @@ class TaskTab(ctk.CTkFrame):
                     text += "\n\nТекст сообщения:\n" + settings["message_text"]
                     if settings["ab_enabled"] == "1":
                         text += (
-                            f"\n\nA/B-тест: {split_label(int(settings['ab_split_a']))}. Вариант B:\n"
+                            "\n\n"
+                            + t("ab.diag", split=split_label(int(settings["ab_split_a"])))
+                            + "\n"
                             + settings["message_text_b"]
                         )
                     if settings["followup_enabled"] == "1":
@@ -2094,4 +2089,15 @@ class TaskTab(ctk.CTkFrame):
             button.configure(text=t(f"pace.{key}"))
             tip(button, t(f"task.pace_{key}_tip"))
         self._refresh_pace()
+        self._retranslate_ab()
+        self.queue_picker.retranslate()
         self._update_buttons_state()
+
+    def _retranslate_ab(self) -> None:
+        self.ab_switch.configure(text=t("ab.switch"))
+        tip(self.ab_switch, t("ab.switch_tip"))
+        self.ab_text_b_label.configure(text=t("ab.text_b"))
+        self.paste_ab_btn.configure(text=t("ab.paste"))
+        self.ab_split_caption.configure(text=t("ab.split"))
+        self.ab_hint_label.configure(text=t("ab.split_hint"))
+        self._ab_split_changed()

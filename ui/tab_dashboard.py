@@ -10,7 +10,16 @@ from ui.conversion_panel import ConversionPanel
 from ui.dispatch import post_ui
 from ui.icons import icon
 from ui.tab_logs import display_log_message
-from ui.theme import COLORS, FONTS, apply_button_role, get_density_preset, init_fonts, style_card, style_tree
+from ui.theme import (
+    COLORS,
+    FONTS,
+    apply_button_role,
+    bind_text_tags,
+    get_density_preset,
+    init_fonts,
+    style_card,
+    style_tree,
+)
 
 
 class TabDashboard(ctk.CTkFrame):
@@ -46,7 +55,9 @@ class TabDashboard(ctk.CTkFrame):
         apply_button_role(self.support_button, "secondary")
         self.support_button.pack(side="right", padx=(0, 12))
         self._update_clock()
-        hero = ctk.CTkFrame(content, fg_color="#191F19", corner_radius=18, border_width=1, border_color="#343C26")
+        hero = ctk.CTkFrame(
+            content, fg_color=COLORS["hero_bg"], corner_radius=18, border_width=1, border_color=COLORS["hero_border"]
+        )
         hero._studio_styled = True
         hero.pack(fill="x", padx=18, pady=(0, 20))
         hero.grid_columnconfigure(0, weight=1)
@@ -62,7 +73,7 @@ class TabDashboard(ctk.CTkFrame):
             copy,
             text="1. Подключите свой Telegram-аккаунт.\n2. Вставьте список людей в «Аудитории».\n3. Выберите режим и настройте «Задачу».",
             font=FONTS["body"],
-            text_color="#BAC1B1",
+            text_color=COLORS["hero_text"],
             justify="left",
         ).pack(anchor="w")
         cta = ctk.CTkButton(
@@ -169,14 +180,16 @@ class TabDashboard(ctk.CTkFrame):
         self.recent_log = ctk.CTkTextbox(right_block, fg_color=COLORS["input"], font=FONTS["mono"], height=170)
         self.recent_log.pack(fill="both", expand=True, padx=18, pady=(0, 16))
         self.recent_log.configure(state="disabled")
-        for tag, color in (
-            ("SUCCESS", COLORS["success"]),
-            ("ERROR", COLORS["error"]),
-            ("WARN", COLORS["warning"]),
-            ("INFO", COLORS["muted"]),
-            ("TIME", COLORS["subtle"]),
-        ):
-            self.recent_log.tag_config(tag, foreground=color)
+        bind_text_tags(
+            self.recent_log,
+            {
+                "SUCCESS": COLORS["success"],
+                "ERROR": COLORS["error"],
+                "WARN": COLORS["warning"],
+                "INFO": COLORS["muted"],
+                "TIME": COLORS["subtle"],
+            },
+        )
 
         self.conversion = ConversionPanel(content, self.app)
         self.conversion.pack(fill="x", padx=18, pady=(0, 20))
@@ -581,6 +594,10 @@ class TabDashboard(ctk.CTkFrame):
                 pass
             self._refresh_job = None
         super().destroy()
+
+    def retranslate(self) -> None:
+        """Relabel the translated dashboard sections after a language switch."""
+        self.conversion.retranslate()
 
     def on_density_change(self, mode: str) -> None:
         self._density_mode = "compact" if mode == "compact" else "normal"
