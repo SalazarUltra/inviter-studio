@@ -3,12 +3,24 @@ venv/
 __pycache__/
 *.py[cod]
 *.session*
+*.session-journal
+*.session-wal
+*.session-shm
+
+# Local runtime / portable user profile — never publish.
 data/
 sessions/
-.audit/
+profile/
+backups/
+*.db
+*.db-wal
+*.db-shm
+restore-pending.db
 .env
 .env.*
 !.env.example
+
+.audit/
 .pytest_cache/
 .ruff_cache/
 dist/

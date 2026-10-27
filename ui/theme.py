@@ -12,7 +12,7 @@ COLORS = {
     "accent": "#D4FF00",
     "accent_hover": "#BEDF12",
     "accent_soft": "#2B3417",
-    "success": "#D4FF00",
+    "success": "#6FCF97",
     "warning": "#E8C76B",
     "error": "#FF7D92",
     "danger_bg": "#352129",

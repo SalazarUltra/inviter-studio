@@ -116,6 +116,11 @@ def prepare_portable_handoff(root: Path, package: Path) -> Path:
     with tempfile.TemporaryDirectory(prefix="portable-", dir=build_root) as temporary_root:
         staging = Path(temporary_root) / portable_name
         shutil.copytree(package, staging)
+        # Never ship a developer/user profile inside the public portable ZIP.
+        for forbidden in ("profile", "data", "sessions", "backups"):
+            leftover = staging / forbidden
+            if leftover.exists():
+                raise RuntimeError(f"В portable-сборке нельзя оставлять «{forbidden}»")
         (staging / "start.bat").write_text(_portable_launcher(), encoding="utf-8")
         (staging / "update.bat").write_text(_portable_updater(), encoding="utf-8")
         (staging / "ПРОЧТИ_ПЕРЕД_ЗАПУСКОМ.txt").write_text(
@@ -126,11 +131,13 @@ def prepare_portable_handoff(root: Path, package: Path) -> Path:
             "3. Если программа всё же не запустилась: щёлкните правой кнопкой по\n"
             "   InviterStudio.exe, выберите Свойства, внизу вкладки «Общие» отметьте\n"
             "   «Разблокировать», нажмите ОК и снова start.bat.\n"
-            "4. Папку profile рядом с приложением удалять не нужно — в ней хранятся\n"
-            "   локальная база, аккаунты и Telegram-сессии portable-версии.\n"
+            "4. После первого запуска появится папка profile — это ВАШИ личные данные\n"
+            "   (база, аккаунты, Telegram-сессии). Не удаляйте её и никому не отправляйте.\n"
+            "   В ZIP из GitHub этой папки нет: у каждого пользователя свой пустой профиль.\n"
             "5. Python и библиотеки уже встроены. Интернет нужен для Telegram и AI-функций.\n\n"
             "Для обновления закройте программу и запустите update.bat. Архив берётся\n"
-            "только из официального GitHub-релиза и проверяется по SHA-256.\n\n"
+            "только из официального GitHub-релиза и проверяется по SHA-256.\n"
+            "update.bat не трогает папку profile — аккаунты и история сохраняются.\n\n"
             "Portable-версия не обходит Smart App Control. Если Windows блокирует\n"
             "неподписанный InviterStudio.exe, нужен доверенный сертификат издателя.\n"
             "Не отключайте защиту Windows ради запуска неизвестного файла.\n",
@@ -139,15 +146,20 @@ def prepare_portable_handoff(root: Path, package: Path) -> Path:
         with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
             for path in sorted(staging.rglob("*")):
                 if path.is_file():
+                    if any(part.lower() in {"profile", "data", "sessions", "backups"} for part in path.parts):
+                        raise RuntimeError(f"Попытка упаковать пользовательские данные: {path}")
+                    if ".session" in path.name.lower() or path.suffix.lower() in {".db", ".sqlite", ".sqlite3"}:
+                        raise RuntimeError(f"Попытка упаковать секретный файл: {path}")
                     archive.write(path, path.relative_to(staging).as_posix())
     os.replace(temporary, target)
     digest = hashlib.sha256(target.read_bytes()).hexdigest()
     (folder / "SHA256.txt").write_text(f"{digest}  {target.name}\n", encoding="ascii")
     (folder / "ПЕРЕДАЙТЕ_ПОЛЬЗОВАТЕЛЮ.txt").write_text(
         f"INVITER STUDIO {VERSION} — ПЕРЕДАЧА ПОЛЬЗОВАТЕЛЮ\n\n"
-        "Для работы программы достаточно одного файла InviterStudioPortable.zip.\n"
-        "SHA256.txt прилагается для проверки файла; передавать исходники, окружения\n"
-        "и папки data/sessions не нужно.\n\n"
+        "Публикуйте только InviterStudioPortable.zip и SHA256.txt из этой папки.\n"
+        "Не публикуйте и не пересылайте: profile, data, sessions, backups, *.session,\n"
+        "inviter.db, исходники с вашим профилем, venv и содержимое репозитория с\n"
+        "локальными данными — в них доступы к вашим Telegram-аккаунтам.\n\n"
         "Получатель: распакуйте ZIP целиком в обычную папку и запустите start.bat.\n"
         "Если Windows блокирует запуск — Свойства InviterStudio.exe → «Разблокировать».\n"
         "Обновление: закрыть программу и запустить update.bat рядом с start.bat.\n",

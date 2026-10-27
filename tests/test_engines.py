@@ -54,8 +54,7 @@ class EngineTests(DatabaseCase):
         engine = self.engine()
         await self.db.set_setting("schedule_enabled", "1")
         await self.db.set_setting("schedule_from", "99:99")
-        with self.assertRaises(ValueError):
-            await engine._is_within_schedule()
+        self.assertFalse(await engine._is_within_schedule())
 
     async def test_overnight_schedule(self):
         engine = self.engine()

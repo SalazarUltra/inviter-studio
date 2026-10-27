@@ -328,8 +328,9 @@ class CampaignBar(ctk.CTkFrame):
         ctk.CTkLabel(
             dialog,
             text="Копия базы: кампании, аккаунты, настройки, история.\n"
-            "Telegram-сессии остаются в папке sessions.\n"
+            "Telegram-сессии остаются в папке sessions / profile.\n"
             "Зашифрованные ключи доступны исходному пользователю Windows.\n"
+            "Не отправляйте .db и папку profile другим людям — это доступ к аккаунтам.\n"
             "При запуске сохраняются последние 7 автоматических копий.",
             justify="left",
             wraplength=500,
@@ -342,6 +343,13 @@ class CampaignBar(ctk.CTkFrame):
         dialog.after(50, dialog.lift)
 
     def backup(self):
+        if not messagebox.askyesno(
+            "Личные данные",
+            "Файл копии содержит аккаунты и ключи API (в зашифрованном виде).\n"
+            "Не публикуйте его в GitHub и не передавайте посторонним.\n\n"
+            "Сохранить копию только для себя?",
+        ):
+            return
         path = filedialog.asksaveasfilename(
             title="Сохранить резервную копию", defaultextension=".db", filetypes=[("SQLite", "*.db")]
         )

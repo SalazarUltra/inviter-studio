@@ -360,8 +360,17 @@ class InviterEngine:
         to_str = settings["schedule_to"] or "23:59"
         now = datetime.now()
 
-        start = time_minutes(str(from_str))
-        end = time_minutes(str(to_str))
+        try:
+            start = time_minutes(str(from_str))
+            end = time_minutes(str(to_str))
+        except ValueError:
+            # Corrupt/legacy values must not crash a running task, but also must
+            # not silently allow work outside an intended window.
+            self.log_callback(
+                "WARN",
+                f"Некорректное расписание «{from_str}–{to_str}». Задача на паузе до исправления настроек.",
+            )
+            return False
 
         now_min = now.hour * 60 + now.minute
         if start == end:

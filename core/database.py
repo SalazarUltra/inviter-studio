@@ -20,6 +20,7 @@ DB_PATH = str(DATA_DIR / "inviter.db")
 async def _connect():
     async with aiosqlite.connect(DB_PATH, timeout=15) as db:
         await db.execute("PRAGMA busy_timeout = 15000")
+        await db.execute("PRAGMA foreign_keys = ON")
         yield db
 
 

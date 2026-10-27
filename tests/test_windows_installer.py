@@ -26,6 +26,8 @@ class InstallerBuildTests(unittest.TestCase):
             for name in (
                 "data/users.txt",
                 "sessions/session_1.session",
+                "profile/data/inviter.db",
+                "backups/auto.db",
                 "backup.db",
                 ".env.local",
                 "_internal/data.sqlite3",
@@ -67,7 +69,10 @@ class InstallerBuildTests(unittest.TestCase):
                 self.assertIn("update.bat", names)
                 self.assertNotIn("update.ps1", names)
                 self.assertIn("ПРОЧТИ_ПЕРЕД_ЗАПУСКОМ.txt", names)
-                self.assertNotIn("profile/", names)
+                self.assertTrue(all("profile" not in name and "sessions" not in name for name in names))
+                guide = archive.read("ПРОЧТИ_ПЕРЕД_ЗАПУСКОМ.txt").decode("utf-8-sig")
+                self.assertIn("profile", guide)
+                self.assertIn("никому не отправляйте", guide)
                 launcher = archive.read("start.bat").decode("utf-8")
                 self.assertIn("_internal", launcher)
                 self.assertIn("Unblock-File", launcher)
