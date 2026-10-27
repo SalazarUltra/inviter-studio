@@ -10,21 +10,29 @@ from telethon.errors import (
     ChatAdminRequiredError,
     ChatWriteForbiddenError,
     FloodWaitError,
+    InputUserDeactivatedError,
     PeerFloodError,
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
     RPCError,
     SessionPasswordNeededError,
     UserAlreadyParticipantError,
+    UserBannedInChannelError,
+    UserBotError,
+    UserChannelsTooMuchError,
+    UserDeactivatedError,
+    UserIdInvalidError,
     UserIsBlockedError,
+    UserKickedError,
     UsernameInvalidError,
     UsernameNotOccupiedError,
+    UserNotMutualContactError,
     UserNotParticipantError,
     UserPrivacyRestrictedError,
     YouBlockedUserError,
 )
 from telethon.tl.functions.channels import InviteToChannelRequest
-from telethon.tl.functions.messages import AddChatUserRequest, SendMessageRequest
+from telethon.tl.functions.messages import AddChatUserRequest, ExportChatInviteRequest, SendMessageRequest
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.types import Channel, Chat, InputPeerUser, InputUser, PeerUser, UpdateMessageID, User
 
@@ -76,6 +84,23 @@ class AccountManager:
         self.client: TelegramClient | None = None
         self.db = db
         self._owned_path: str | None = None
+        # Chat entities resolved during one run; avoids get_entity(chat) per invite.
+        self._chat_cache: dict[str, Any] = {}
+
+    async def get_chat_entity(self, chat: str, *, refresh: bool = False):
+        """Resolve the target chat once per connection and reuse it for later invites."""
+        key = str(chat)
+        if not refresh and key in self._chat_cache:
+            return self._chat_cache[key]
+        entity = await asyncio.wait_for(self.client.get_entity(chat), timeout=30)
+        self._chat_cache[key] = entity
+        return entity
+
+    def invalidate_chat_cache(self, chat: str | None = None) -> None:
+        if chat is None:
+            self._chat_cache.clear()
+        else:
+            self._chat_cache.pop(str(chat), None)
 
     def _build_proxy(self) -> tuple[Any, ...] | None:
         validate_proxy(self.account)
@@ -195,18 +220,27 @@ class AccountManager:
         except PhoneCodeExpiredError:
             return {"status": "code_expired"}
 
-    async def add_user_to_chat(self, chat: str, username: str) -> dict[str, Any]:
+    async def add_user_to_chat(self, chat: str, username: str, user_id: int | None = None) -> dict[str, Any]:
         if not self.client:
             return {"success": False, "error": "not_connected", "flood_seconds": None}
 
         resolving_user = True
         try:
             clean_username = normalize_username(username)
-            user_entity = await asyncio.wait_for(self.client.get_entity(clean_username), timeout=30)
+            user_entity = None
+            if user_id:
+                # A parsed Telegram id is exact; it only resolves when this account has seen the user,
+                # so fall back to the username otherwise.
+                try:
+                    user_entity = await asyncio.wait_for(self.client.get_entity(PeerUser(int(user_id))), timeout=30)
+                except (ValueError, TypeError):
+                    user_entity = None
+            if user_entity is None:
+                user_entity = await asyncio.wait_for(self.client.get_entity(clean_username), timeout=30)
             if not isinstance(user_entity, User):
                 return {"success": False, "error": "not_found", "message": "Никнейм принадлежит каналу или группе"}
             resolving_user = False
-            chat_entity = await asyncio.wait_for(self.client.get_entity(chat), timeout=30)
+            chat_entity = await self.get_chat_entity(chat)
             try:
                 permissions = await asyncio.wait_for(self.client.get_permissions(chat_entity, user_entity), timeout=30)
                 if permissions and not permissions.has_left and not permissions.is_banned:
@@ -247,17 +281,74 @@ class AccountManager:
                 "message": explain_error(exc),
             }
         except UserPrivacyRestrictedError:
-            return {"success": False, "error": "private"}
+            return {
+                "success": False,
+                "error": "private",
+                "message": "Настройки приватности пользователя не разрешают добавление в чат",
+            }
+        except UserNotMutualContactError:
+            return {
+                "success": False,
+                "error": "private",
+                "message": "Пользователя можно добавить только из взаимных контактов",
+            }
         except UserAlreadyParticipantError:
             return {"success": False, "error": "already_in"}
+        except UserChannelsTooMuchError:
+            return {
+                "success": False,
+                "error": "skip",
+                "message": "Пользователь состоит в слишком большом числе чатов и каналов",
+            }
+        except UserKickedError:
+            return {
+                "success": False,
+                "error": "skip",
+                "message": "Пользователь был удалён из этого чата; повторное добавление запрещено",
+            }
+        except UserBotError:
+            return {
+                "success": False,
+                "error": "skip",
+                "message": "Это бот: ботов нельзя добавлять приглашением",
+            }
+        except (InputUserDeactivatedError, UserDeactivatedError, UserIdInvalidError):
+            return {
+                "success": False,
+                "error": "skip",
+                "message": "Аккаунт получателя удалён или недоступен",
+            }
+        except UserBannedInChannelError:
+            # Telegram reports a restriction of the *inviting* account, not of the recipient.
+            return {
+                "success": False,
+                "error": "account_banned",
+                "message": "Аккаунту запрещено писать и приглашать в группы; проверьте ограничения в @SpamBot",
+            }
+        except ChatWriteForbiddenError:
+            return {
+                "success": False,
+                "error": "need_admin",
+                "message": "Аккаунту запрещено действовать в целевом чате",
+            }
         except ChatAdminRequiredError:
-            return {"success": False, "error": "need_admin"}
+            return {
+                "success": False,
+                "error": "need_admin",
+                "message": "Для приглашения нужны права администратора в чате",
+            }
         except asyncio.TimeoutError:
             # The invite request may have reached Telegram; the outcome is unknown.
             return {
                 "success": False,
                 "error": "uncertain",
                 "message": "Превышено время ожидания Telegram; результат неизвестен, проверьте вручную",
+            }
+        except (ConnectionError, OSError):
+            return {
+                "success": False,
+                "error": "network",
+                "message": "Сбой соединения с Telegram; попытка будет повторена",
             }
         except Exception as exc:
             return {"success": False, "error": "unknown", "message": explain_error(exc)}
@@ -335,6 +426,7 @@ class AccountManager:
                 await self.client.disconnect()
         finally:
             self.client = None
+            self._chat_cache.clear()
             if self._owned_path and self._session_owners.get(self._owned_path) is self:
                 del self._session_owners[self._owned_path]
             self._owned_path = None
@@ -375,6 +467,8 @@ class AccountManager:
             return {"ok": False, "reason": "Клиент не подключён"}
         try:
             entity = await self.client.get_entity(chat)
+            # The invite loop reuses this entity instead of resolving the chat per user.
+            self._chat_cache[str(chat)] = entity
             permissions = await self.client.get_permissions(entity, "me")
             if permissions and permissions.is_creator:
                 return {"ok": True, "reason": "Создатель чата"}
@@ -383,3 +477,14 @@ class AccountManager:
             return {"ok": False, "reason": "Нет прав администратора с правом приглашения"}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "reason": "Проверка не удалась: " + explain_error(exc)}
+
+    async def export_invite_link(self, chat: str) -> str:
+        """Create/export an invite link for the chat (needs the invite-users admin right)."""
+        if not self.client:
+            raise RuntimeError("Клиент не подключён")
+        entity = await self.get_chat_entity(chat)
+        exported = await asyncio.wait_for(self.client(ExportChatInviteRequest(peer=entity)), timeout=30)
+        link = getattr(exported, "link", None)
+        if not link:
+            raise RuntimeError("Telegram не вернул ссылку-приглашение")
+        return str(link)

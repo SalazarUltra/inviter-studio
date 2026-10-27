@@ -15,6 +15,7 @@ from ui.campaigns import CampaignBar
 from ui.components import empty_state, page_intro
 from ui.dispatch import post_ui
 from ui.hints import tip
+from ui.private_bridge_dialog import PrivateBridgeDialog
 from ui.recipient_editor import RecipientEditor
 from ui.theme import COLORS, FONTS, apply_button_role, get_density_preset, init_fonts, style_card, style_tree
 
@@ -43,6 +44,58 @@ FILTER_MAP = {
     "Повтор отключён": "already_sent",
     "Требует проверки": "uncertain",
 }
+
+
+# (status, label, checked by default): private / not_found stay final unless the user ticks them.
+RETRY_STATUS_CHOICES = (
+    ("error", "Ошибки", True),
+    ("uncertain", "Требует проверки", True),
+    ("private", "Закрытый (запрет получателя)", False),
+    ("not_found", "Не найден", False),
+)
+
+
+def ask_retry_statuses(parent) -> tuple[str, ...] | None:
+    """Modal checkbox dialog; returns chosen statuses, or None when cancelled."""
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title("Повторить получателей")
+    dialog.resizable(False, False)
+    dialog.transient(parent.winfo_toplevel())
+    outcome: dict[str, tuple[str, ...] | None] = {"value": None}
+    ctk.CTkLabel(
+        dialog,
+        text="Какие результаты вернуть в очередь?",
+        font=FONTS["subhead"],
+        anchor="w",
+    ).pack(fill="x", padx=20, pady=(16, 8))
+    variables = {}
+    for status, label, default in RETRY_STATUS_CHOICES:
+        variables[status] = ctk.BooleanVar(value=default)
+        ctk.CTkCheckBox(dialog, text=label, variable=variables[status]).pack(anchor="w", padx=24, pady=3)
+    ctk.CTkLabel(
+        dialog,
+        text="Закрытые и не найденные обычно не изменятся при повторе.",
+        font=FONTS["small"],
+        text_color=COLORS["muted"],
+        anchor="w",
+    ).pack(fill="x", padx=20, pady=(6, 0))
+
+    def accept():
+        outcome["value"] = tuple(status for status, var in variables.items() if var.get())
+        dialog.destroy()
+
+    row = ctk.CTkFrame(dialog, fg_color="transparent")
+    row.pack(fill="x", padx=20, pady=16)
+    ok = ctk.CTkButton(row, text="Вернуть в очередь", command=accept, width=150)
+    apply_button_role(ok, "primary")
+    ok.pack(side="left")
+    cancel = ctk.CTkButton(row, text="Отмена", command=dialog.destroy, width=100)
+    apply_button_role(cancel, "secondary")
+    cancel.pack(side="left", padx=(10, 0))
+    dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+    dialog.after(50, lambda: (dialog.winfo_exists() and dialog.grab_set()))
+    parent.wait_window(dialog)
+    return outcome["value"]
 
 
 def parse_txt(filepath: str) -> list[str]:
@@ -202,6 +255,21 @@ class TargetsTab(ctk.CTkFrame):
         )
         apply_button_role(self.status_help_button, "ghost")
         self.status_help_button.grid(row=1, column=3, columnspan=2, padx=8, pady=(0, 8), sticky="e")
+        self.private_dm_button = ctk.CTkButton(
+            top,
+            text="Написать закрытым со ссылкой",
+            command=self.write_private_with_link,
+            corner_radius=12,
+            height=34,
+            font=FONTS["subhead"],
+        )
+        apply_button_role(self.private_dm_button, "accent-line")
+        self.private_dm_button.grid(row=2, column=0, columnspan=5, sticky="ew", padx=5, pady=(0, 8))
+        tip(
+            self.private_dm_button,
+            "Получателям со статусом «Закрытый» нельзя добавить людей в чат напрямую. "
+            "Создаётся кампания личных сообщений с вашей ссылкой на группу; отправка начнётся только после запуска.",
+        )
 
         search_row = ctk.CTkFrame(self, fg_color="transparent")
         search_row.pack(fill="x", padx=16, pady=(0, 6))
@@ -437,12 +505,61 @@ class TargetsTab(ctk.CTkFrame):
         if self.winfo_toplevel().scheduler.is_running() or self.winfo_toplevel().task_tab._starting:
             messagebox.showwarning("Задача выполняется", "Остановите задачу перед возвратом получателей в очередь")
             return
-        fut = self.run_coro(self.db.reset_failed_targets())
-        fut.add_done_callback(
-            lambda result: self._safe_after(
-                lambda: self.finish_operation(result, "Получатели с ошибками возвращены в очередь")
+        statuses = ask_retry_statuses(self)
+        if statuses is None:
+            return
+        if not statuses:
+            messagebox.showinfo("Повтор", "Выберите хотя бы один статус для повторной попытки")
+            return
+        fut = self.run_coro(self.db.reset_failed_targets(statuses))
+
+        def done(result):
+            count = None if result.cancelled() or result.exception() else result.result()
+            text = "Выбранные получатели возвращены в очередь"
+            if count is not None:
+                text += f": {count}"
+            self._safe_after(lambda: self.finish_operation(result, text))
+
+        fut.add_done_callback(done)
+
+    def write_private_with_link(self) -> None:
+        if not self._ensure_task_stopped("написать закрытым получателям"):
+            return
+        task = self.winfo_toplevel().task_tab
+        if task.operation_mode() != "invite":
+            messagebox.showinfo(
+                "Закрытые получатели",
+                "Кнопка работает в кампании приглашений: откройте её в выборе кампании.",
             )
-        )
+            return
+        db = self.db
+
+        async def count():
+            return await db.get_campaign_kind(), await db.count_targets("private")
+
+        future = self.run_coro(count())
+
+        def done(result):
+            def render():
+                if self.db is not db or result.cancelled():
+                    return
+                if result.exception():
+                    messagebox.showerror("Закрытые получатели", explain_error(result.exception()))
+                    return
+                kind, total = result.result()
+                if kind != "invite":
+                    messagebox.showinfo("Закрытые получатели", "Кнопка работает в кампании приглашений.")
+                elif not total:
+                    messagebox.showinfo(
+                        "Закрытые получатели",
+                        "Нет получателей со статусом «Закрытый». Они появятся после запуска приглашений.",
+                    )
+                else:
+                    PrivateBridgeDialog(self, total)
+
+            self._safe_after(render)
+
+        future.add_done_callback(done)
 
     def shuffle_targets(self) -> None:
         if not self._ensure_task_stopped("перемешать список"):

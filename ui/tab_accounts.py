@@ -617,6 +617,8 @@ class AccountsTab(ctk.CTkFrame):
                 return "Ожидание Telegram"
             if not seconds:
                 return "Пауза истекла · готов к проверке"
+            if seconds >= 3600:
+                return f"Пауза Telegram ({seconds // 3600} ч {seconds % 3600 // 60} мин)"
             return f"Ожидание ({(seconds + 59) // 60} мин)"
         mapping = {
             "active": "Готов",

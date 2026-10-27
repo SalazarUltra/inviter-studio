@@ -69,6 +69,7 @@ class App(ctk.CTk):
             status_callback=self.on_status,
             fatal_callback=self.on_fatal,
             complete_callback=self.on_complete,
+            details_callback=self.on_details,
         )
         self.logs_tab = LogsTab(self.page_frames["logs"], db=self.db, run_coro=self.run_coro)
         self.dashboard_tab = TabDashboard(self.page_frames["dashboard"], app=self)
@@ -461,6 +462,9 @@ class App(ctk.CTk):
             self._safe_after(self._schedule_targets_refresh)
         if self.current_tab_key == "accounts":
             self._safe_after(self._schedule_accounts_refresh)
+
+    def on_details(self, details: dict) -> None:
+        self._safe_after(lambda: self.task_tab.set_details(details))
 
     def _schedule_targets_refresh(self) -> None:
         if self._targets_refresh_job:

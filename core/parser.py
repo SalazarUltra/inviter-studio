@@ -1,6 +1,7 @@
 """Read only the participant lists Telegram makes available to the selected account."""
 
 import asyncio
+import json
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
@@ -22,6 +23,7 @@ from telethon.tl.types import (
     ChannelParticipantAdmin,
     ChannelParticipantCreator,
     ChannelParticipantsRecent,
+    ChannelParticipantsSearch,
     Chat,
     ChatParticipantAdmin,
     ChatParticipantCreator,
@@ -42,6 +44,11 @@ from core.validation import normalize_username
 MAX_SOURCES = 10
 MAX_PER_SOURCE = 5000
 MAX_RUN_RECORDS = 20000
+# Telegram caps the plain participant list on big groups; searching by first letters/digits reaches the rest.
+SEARCH_QUERIES = tuple("abcdefghijklmnopqrstuvwxyz") + tuple("абвгдеёжзийклмнопрстуфхцчшщыэюя") + tuple("0123456789")
+PAGE_DELAY = 0.5
+SEARCH_DELAY = 1.5
+SEARCH_STALL_PAGES = 3
 ACTIVITY_LABELS = {
     "online": "Онлайн",
     "recently": "Недавно",
@@ -75,6 +82,29 @@ def parse_sources(text):
             result.append(reference)
     if not 1 <= len(result) <= MAX_SOURCES:
         raise ValueError(f"Укажите от 1 до {MAX_SOURCES} групп, по одной на строку")
+    return result
+
+
+def pending_sources(run, source_rows):
+    """References of a saved member run that still need requesting (not completed, not exhausted)."""
+    try:
+        references = json.loads(run.get("sources") or "[]")
+    except (TypeError, ValueError):
+        return []
+    limit = run.get("limit_per_source")
+    saved = {str(row["reference"]): row for row in source_rows}
+    result = []
+    for reference in references:
+        row = saved.get(str(reference))
+        if row is not None:
+            if row["status"] == "completed":
+                continue
+            exhausted = (limit and (row.get("fetched") or 0) >= limit) or (row.get("search_pos") or 0) >= len(
+                SEARCH_QUERIES
+            )
+            if row["status"] == "partial" and exhausted:
+                continue
+        result.append(reference)
     return result
 
 
@@ -117,6 +147,10 @@ def member_row(user, participant, source_id):
         "is_deleted": bool(user.deleted),
         "is_premium": bool(user.premium),
         "has_photo": isinstance(user.photo, UserProfilePhoto),
+        "scam": bool(getattr(user, "scam", False)),
+        "fake": bool(getattr(user, "fake", False)),
+        "restricted": bool(getattr(user, "restricted", False)),
+        "contact_require_premium": bool(getattr(user, "contact_require_premium", False)),
         "activity": activity,
         "last_seen": last_seen,
     }
@@ -129,6 +163,9 @@ def filter_members(
     only_username=True,
     exclude_bots=True,
     exclude_deleted=True,
+    exclude_scam=True,
+    exclude_fake=True,
+    exclude_restricted=True,
     premium=False,
     photo=False,
     role="all",
@@ -148,6 +185,12 @@ def filter_members(
             and row["is_bot"]
             or exclude_deleted
             and row["is_deleted"]
+            or exclude_scam
+            and row.get("scam")
+            or exclude_fake
+            and row.get("fake")
+            or exclude_restricted
+            and row.get("restricted")
         ):
             continue
         if premium and not row["is_premium"] or photo and not row["has_photo"]:
@@ -175,10 +218,61 @@ def filter_members(
                     continue
             elif row["activity"] != activity:
                 continue
-        if query not in f"{row['username']} {row['first_name']} {row['last_name']} {row['user_id']}".casefold():
+        if (
+            query
+            and query not in f"{row['username']} {row['first_name']} {row['last_name']} {row['user_id']}".casefold()
+        ):
             continue
-        result.append(dict(row))
+        result.append(row)  # no per-row copy: callers build new dicts via unique_members
     return result
+
+
+def audience_usernames(rows, *, include_admins=False):
+    """Usernames safe to import as an audience; returns (names, skipped counts by reason)."""
+    names, skipped = [], {"admins": 0, "bots": 0, "deleted": 0, "no_username": 0, "invalid": 0}
+    for row in rows:
+        roles = set(row.get("roles") or ()) | {row.get("role")}
+        if not include_admins and roles & {"creator", "admin"}:
+            skipped["admins"] += 1
+        elif row.get("is_bot"):
+            skipped["bots"] += 1
+        elif row.get("is_deleted"):
+            skipped["deleted"] += 1
+        elif not row.get("username"):
+            skipped["no_username"] += 1
+        else:
+            try:
+                names.append(normalize_username(row["username"]))
+            except ValueError:
+                skipped["invalid"] += 1
+    return list(dict.fromkeys(names)), skipped
+
+
+def audience_members(rows, *, include_admins=False):
+    """Like audience_usernames, but keeps Telegram identity (id, activity, source) for the audience table."""
+    names, skipped = audience_usernames(rows, include_admins=include_admins)
+    allowed = set(names)
+    members, seen = [], set()
+    for row in rows:
+        try:
+            username = normalize_username(row["username"]) if row.get("username") else ""
+        except ValueError:
+            continue
+        if username not in allowed or username in seen:
+            continue
+        seen.add(username)
+        members.append(
+            {
+                "username": username,
+                "user_id": row.get("user_id"),
+                "activity": row.get("activity"),
+                "source": " | ".join(row.get("sources") or [])[:200] or None,
+                "last_seen": row.get("last_seen"),
+                "last_message_at": row.get("last_message_at"),
+                "parse_seq": row.get("parse_seq"),
+            }
+        )
+    return members, skipped
 
 
 def source_label(row):
@@ -204,6 +298,8 @@ def unique_members(rows):
         for field in ("username", "first_name", "last_name"):
             if not person.get(field):
                 person[field] = row.get(field, "")
+        if row.get("parse_seq") is not None:
+            person["parse_seq"] = min(person.get("parse_seq", row["parse_seq"]), row["parse_seq"])
         if row["source_id"] not in person["source_ids"]:
             person["source_ids"].append(row["source_id"])
             person["sources"].append(source_label(row))
@@ -345,15 +441,170 @@ class ParserEngine:
         finally:
             await manager.disconnect()
 
+    @staticmethod
+    def _rows(response, participants, seen, source_id):
+        users = {user.id: user for user in response.users if isinstance(user, User)}
+        batch = []
+        for participant in participants:
+            user_id = getattr(participant, "user_id", None)
+            if user_id is None or user_id in seen:
+                continue
+            seen.add(user_id)
+            row = member_row(users.get(user_id), participant, source_id)
+            if row is not None:
+                batch.append(row)
+        return batch
+
+    async def _read_pass(
+        self,
+        client,
+        entity,
+        participants_filter,
+        cap,
+        seen,
+        source_id,
+        save,
+        *,
+        offset=0,
+        stall_pages=1,
+        stop_short=False,
+    ):
+        """One paginated participants query. A pass stops on an empty page, after `stall_pages` pages with
+        nothing new, or (for searches) on a short page. `save(batch, new_count)` commits every page."""
+        stalled = 0
+        while len(seen) < cap:
+            limit = min(200, cap - len(seen))
+            response = await asyncio.wait_for(
+                client(GetParticipantsRequest(entity, participants_filter, offset, limit, 0)), 30
+            )
+            participants = response.participants
+            if not participants:
+                break
+            previous = len(seen)
+            batch = self._rows(response, participants, seen, source_id)
+            await save(batch, len(seen) - previous)
+            offset += len(participants)
+            if len(seen) == previous:
+                stalled += 1
+                if stalled >= stall_pages:
+                    break
+            else:
+                stalled = 0
+            if stop_short and len(participants) < limit:
+                break
+            await asyncio.sleep(PAGE_DELAY)
+
+    async def _read_source(
+        self, client, entity, info, basic, *, cap, seen, source_id, save, search_pos=0, on_search=None
+    ):
+        """Recent list first; when it stalls below the advertised size, sweep search queries (letters, digits)."""
+        if basic is not None:
+            participants = basic.full_chat.participants.participants[:cap]
+            if len(seen) < cap and participants:
+                previous = len(seen)
+                batch = self._rows(basic, participants, seen, source_id)
+                await save(batch, len(seen) - previous)
+            return
+        await self._read_pass(client, entity, ChannelParticipantsRecent(), cap, seen, source_id, save, offset=len(seen))
+        hint = info["count_hint"]
+        if not hint:
+            return
+        for position in range(search_pos, len(SEARCH_QUERIES)):
+            if len(seen) >= cap or len(seen) >= hint:
+                break
+            query = SEARCH_QUERIES[position]
+            await asyncio.sleep(SEARCH_DELAY)
+            self.progress(f"{info['title']}: поиск «{query}», получено {len(seen)} из ~{hint}")
+            await self._read_pass(
+                client,
+                entity,
+                ChannelParticipantsSearch(query),
+                cap,
+                seen,
+                source_id,
+                save,
+                stall_pages=SEARCH_STALL_PAGES,
+                stop_short=True,
+            )
+            if on_search is not None:
+                await on_search(position + 1)
+
+    async def collect_member_keys(self, account, reference, limit=MAX_RUN_RECORDS):
+        """Read-only participant scan of one chat (nothing is stored) for excluding people already inside."""
+        if isinstance(reference, str) and reference.strip().lstrip("-").isdigit():
+            reference = int(reference.strip())
+        manager = AccountManager(account, self.db)
+        try:
+            await manager.connect()
+            entity, info, basic = await self.open_source(manager.client, reference)
+            seen, usernames = set(), set()
+
+            async def save(batch, new_count):
+                usernames.update(row["username"] for row in batch if row["username"])
+
+            await self._read_source(
+                manager.client,
+                entity,
+                info,
+                basic,
+                cap=limit,
+                seen=seen,
+                source_id=info["source_id"],
+                save=save,
+            )
+            hint = info["count_hint"]
+            return {
+                "title": info["title"],
+                "user_ids": seen,
+                "usernames": usernames,
+                "count": len(seen),
+                "partial": bool(hint and len(seen) < hint) or len(seen) >= limit,
+            }
+        except FloodWaitError as exc:
+            await self.db.set_flood_wait(account["id"], exc.seconds)
+            raise
+        finally:
+            await manager.disconnect()
+
     async def start(self, account, sources, limit):
         if not 1 <= limit <= MAX_PER_SOURCE or not 1 <= len(sources) <= MAX_SOURCES:
             raise ValueError("Некорректное число групп или лимит участников")
+        return await self._run(account, sources, limit)
+
+    async def resume(self, account, run_id):
+        """Continue an interrupted member run: only sources that are not complete are requested again."""
+        run = await self.db.get_parse_run(run_id)
+        if run is None or run["mode"] != "members":
+            raise ValueError("Продолжить можно только сохранённое получение участников")
+        if run["status"] == "running":
+            raise ValueError("Этот запуск уже выполняется")
+        pending = pending_sources(run, await self.db.get_parse_sources(run_id))
+        if not pending:
+            raise ValueError("Все источники этого запуска уже получены")
+        limit = min(max(int(run.get("limit_per_source") or 500), 1), MAX_PER_SOURCE)
+        return await self._run(account, pending, limit, run_id=run_id)
+
+    async def _run(self, account, sources, limit, run_id=None):
         self._task = asyncio.current_task()
+        self.run_id = None
         manager = AccountManager(account, self.db)
         outcome, detail, budget, successful, collected = "completed", "", MAX_RUN_RECORDS, 0, 0
         seen_sources = set()
+        resumed = run_id is not None
         try:
-            self.run_id = await self.db.create_parse_run(account["id"], sources)
+            if resumed:
+                await self.db.reopen_parse_run(run_id, account["id"])
+                self.run_id = run_id
+                budget = max(0, MAX_RUN_RECORDS - await self.db.count_parsed_members(run_id))
+                saved_sources = {str(row["reference"]): row for row in await self.db.get_parse_sources(run_id)}
+                seen_sources = {
+                    row["source_id"]
+                    for row in saved_sources.values()
+                    if row["source_id"] is not None and row["status"] == "completed"
+                }
+            else:
+                saved_sources = {}
+                self.run_id = await self.db.create_parse_run(account["id"], sources, limit_per_source=limit)
             await manager.connect()
             for reference in sources:
                 source_id = None
@@ -363,48 +614,38 @@ class ParserEngine:
                     if source_id in seen_sources:
                         continue
                     seen_sources.add(source_id)
-                    await self.db.save_parse_source(self.run_id, str(reference), info, "running", "")
+                    seen = await self.db.get_parse_resume_state(self.run_id, source_id) if resumed else set()
+                    search_pos = int((saved_sources.get(str(reference)) or {}).get("search_pos") or 0)
+                    await self.db.save_parse_source(self.run_id, str(reference), info, "running", "", len(seen))
                     self.progress(f"Получение участников: {info['title']}")
-                    count, offset, seen = 0, 0, set()
-                    cap = min(limit, budget)
-                    while count < cap:
-                        if basic is not None:
-                            response, participants = basic, basic.full_chat.participants.participants[:cap]
-                        else:
-                            response = await asyncio.wait_for(
-                                manager.client(
-                                    GetParticipantsRequest(
-                                        entity, ChannelParticipantsRecent(), offset, min(200, cap - count), 0
-                                    )
-                                ),
-                                30,
-                            )
-                            participants = response.participants
-                        if not participants:
-                            break
-                        users = {user.id: user for user in response.users if isinstance(user, User)}
-                        batch = []
-                        previous = len(seen)
-                        for participant in participants:
-                            user_id = getattr(participant, "user_id", None)
-                            if user_id is None or user_id in seen:
-                                continue
-                            seen.add(user_id)
-                            row = member_row(users.get(user_id), participant, source_id)
-                            if row is not None:
-                                batch.append(row)
+                    cap = min(limit, budget + len(seen))
+
+                    async def save(batch, new_count, reference=reference, info=info, seen=seen):
+                        nonlocal collected, budget
                         await self.db.save_parsed_members(self.run_id, batch)
                         collected += len(batch)
-                        count = len(seen)
-                        budget -= count - previous
+                        budget -= new_count
                         await self.db.save_parse_source(
-                            self.run_id, str(reference), info, "running", "Получение доступного списка", count
+                            self.run_id, str(reference), info, "running", "Получение доступного списка", len(seen)
                         )
-                        offset += len(participants)
-                        self.progress(f"{info['title']}: получено {count}; результаты сохраняются")
-                        if basic is not None or len(seen) == previous:
-                            break
-                        await asyncio.sleep(0.5)
+                        self.progress(f"{info['title']}: получено {len(seen)}; результаты сохраняются")
+
+                    async def remember_search(position, reference=reference):
+                        await self.db.set_parse_search_pos(self.run_id, str(reference), position)
+
+                    await self._read_source(
+                        manager.client,
+                        entity,
+                        info,
+                        basic,
+                        cap=cap,
+                        seen=seen,
+                        source_id=source_id,
+                        save=save,
+                        search_pos=search_pos,
+                        on_search=remember_search,
+                    )
+                    count = len(seen)
                     partial = info["count_hint"] is None or count < info["count_hint"] or basic is None and count >= cap
                     source_detail = (
                         "Получена доступная часть списка. Полнота не гарантируется."
@@ -450,11 +691,15 @@ class ParserEngine:
                     )
                     break
             if not successful and not collected and outcome != "stopped":
-                outcome = "failed"
+                outcome = "partial" if resumed else "failed"
+            if resumed and outcome == "completed":
+                rows = await self.db.get_parse_sources(self.run_id)
+                if any(row["status"] != "completed" for row in rows):
+                    outcome = "partial"
         except asyncio.CancelledError:
             outcome, detail = "stopped", "Остановлено. Уже полученные записи сохранены."
         except Exception as exc:
-            outcome, detail = "partial" if collected else "failed", access_error(exc)
+            outcome, detail = "partial" if collected or resumed else "failed", access_error(exc)
         finally:
             try:
                 await manager.disconnect()

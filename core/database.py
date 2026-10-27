@@ -3,7 +3,7 @@ import secrets
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import aiosqlite
 
@@ -14,6 +14,11 @@ from core.secrets import protect, reveal_row
 from core.validation import normalize_username, validate_account, validate_message
 
 DB_PATH = str(DATA_DIR / "inviter.db")
+
+# Target statuses the user may return to the queue; the default excludes final
+# outcomes (private, not_found, already_in) that retrying would not change.
+RESETTABLE_TARGET_STATUSES = ("error", "uncertain", "not_found", "private", "already_in")
+DEFAULT_RESET_STATUSES = ("error", "uncertain")
 
 
 @asynccontextmanager
@@ -103,7 +108,70 @@ CAMPAIGN_SETTINGS = {
     "message_text",
     "followup_enabled",
     "followup_text",
+    "invite_order",
 }
+
+INVITE_ORDERS = ("shuffle", "as_is")
+ACTIVITY_RANK = {"online": 0, "recently": 1, "week": 2, "offline": 3, "month": 4, "unknown": 5}
+
+
+def chat_key(chat) -> str:
+    """Stable ledger key for a chat reference: @name / t.me link / numeric id all collapse to one form."""
+    value = str(chat or "").strip()
+    if not value:
+        return ""
+    lowered = value.lower()
+    for prefix in ("https://", "http://"):
+        if lowered.startswith(prefix):
+            lowered = lowered[len(prefix) :]
+    for prefix in ("t.me/", "telegram.me/"):
+        if lowered.startswith(prefix):
+            lowered = lowered[len(prefix) :]
+    lowered = lowered.split("?", 1)[0].strip("/@ ")
+    if lowered.lstrip("-").isdigit():
+        digits = lowered.lstrip("-")
+        if digits.startswith("100") and len(digits) >= 13:
+            digits = digits[3:]
+        return "id:" + digits
+    return lowered
+
+
+def user_keys(username=None, user_id=None) -> list[str]:
+    keys = []
+    if user_id:
+        keys.append(f"id:{int(user_id)}")
+    name = str(username or "").strip().lstrip("@").lower()
+    if name:
+        keys.append("u:" + name)
+    return keys
+
+
+def order_audience(members, order="imported"):
+    """Return members in the requested order without mutating the input."""
+    items = list(members)
+    if order == "shuffle":
+        import random
+
+        random.shuffle(items)
+    elif order == "activity":
+
+        def key(item):
+            seen = item.get("last_seen") or item.get("last_message_at") or ""
+            return (
+                ACTIVITY_RANK.get(item.get("activity") or "unknown", 5),
+                _negate_text(seen),
+                item.get("parse_seq") or 0,
+            )
+
+        items.sort(key=key)
+    else:
+        items.sort(key=lambda item: item.get("parse_seq") if item.get("parse_seq") is not None else 0)
+    return items
+
+
+def _negate_text(value: str):
+    # Newest ISO timestamp first inside the same activity bucket; empty values sort last.
+    return tuple(-ord(char) for char in value) + (1,) if value else (1,)
 
 
 class Database(FollowupStore):
@@ -116,14 +184,76 @@ class Database(FollowupStore):
     def _setting_key(self, key):
         return f"campaign:{self.campaign_id}:{key}" if key in CAMPAIGN_SETTINGS else key
 
-    async def create_parse_run(self, account_id, sources, *, mode="members", since=None, until=None, scan_limit=None):
+    async def create_parse_run(
+        self, account_id, sources, *, mode="members", since=None, until=None, scan_limit=None, limit_per_source=None
+    ):
         async with _connect() as db:
             cursor = await db.execute(
-                "INSERT INTO parse_runs(account_id,sources,status,started_at,mode,since,until,scan_limit) VALUES (?,?,'running',?,?,?,?,?)",
-                (account_id, json.dumps(sources, ensure_ascii=False), _now_iso(), mode, since, until, scan_limit),
+                "INSERT INTO parse_runs(account_id,sources,status,started_at,mode,since,until,scan_limit,limit_per_source) VALUES (?,?,'running',?,?,?,?,?,?)",
+                (
+                    account_id,
+                    json.dumps(sources, ensure_ascii=False),
+                    _now_iso(),
+                    mode,
+                    since,
+                    until,
+                    scan_limit,
+                    limit_per_source,
+                ),
             )
             await db.commit()
             return int(cursor.lastrowid)
+
+    async def get_parse_run(self, run_id):
+        async with _connect() as db:
+            db.row_factory = aiosqlite.Row
+            row = await (await db.execute("SELECT * FROM parse_runs WHERE id=?", (run_id,))).fetchone()
+            return dict(row) if row else None
+
+    async def reopen_parse_run(self, run_id, account_id=None):
+        """Mark an interrupted member run as running again; refuses runs that are already active."""
+        async with _connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            row = await (await db.execute("SELECT status,mode FROM parse_runs WHERE id=?", (run_id,))).fetchone()
+            if row is None:
+                raise ValueError("Запуск не найден")
+            if row[0] == "running":
+                raise ValueError("Этот запуск уже выполняется")
+            if row[1] != "members":
+                raise ValueError("Продолжение доступно только для получения участников")
+            await db.execute(
+                "UPDATE parse_runs SET status='running',finished_at=NULL,detail='Продолжение прерванного получения',"
+                "account_id=COALESCE(?,account_id) WHERE id=?",
+                (account_id, run_id),
+            )
+            await db.commit()
+
+    async def get_parse_sources(self, run_id):
+        async with _connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM parse_sources WHERE run_id=? ORDER BY id", (run_id,))
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def set_parse_search_pos(self, run_id, reference, position):
+        async with _connect() as db:
+            await db.execute(
+                "UPDATE parse_sources SET search_pos=? WHERE run_id=? AND reference=?",
+                (int(position), run_id, reference),
+            )
+            await db.commit()
+
+    async def get_parse_resume_state(self, run_id, source_id):
+        """User ids already saved for one source of a run, to continue paging without duplicates."""
+        async with _connect() as db:
+            cursor = await db.execute(
+                "SELECT user_id FROM parsed_members WHERE run_id=? AND source_id=?", (run_id, source_id)
+            )
+            return {int(row[0]) for row in await cursor.fetchall()}
+
+    async def count_parsed_members(self, run_id):
+        async with _connect() as db:
+            row = await (await db.execute("SELECT COUNT(*) FROM parsed_members WHERE run_id=?", (run_id,))).fetchone()
+            return int(row[0])
 
     async def save_parse_source(self, run_id, reference, info, status, detail, fetched=0):
         async with _connect() as db:
@@ -158,6 +288,10 @@ class Database(FollowupStore):
             "is_deleted",
             "is_premium",
             "has_photo",
+            "scam",
+            "fake",
+            "restricted",
+            "contact_require_premium",
             "activity",
             "last_seen",
             "message_count",
@@ -204,6 +338,10 @@ class Database(FollowupStore):
             "is_deleted",
             "is_premium",
             "has_photo",
+            "scam",
+            "fake",
+            "restricted",
+            "contact_require_premium",
             "activity",
             "last_seen",
         )
@@ -244,7 +382,7 @@ class Database(FollowupStore):
             cursor = await db.execute("SELECT * FROM parse_sources WHERE run_id=? ORDER BY id", (run_id,))
             sources = [dict(row) for row in await cursor.fetchall()]
             cursor = await db.execute(
-                "SELECT m.*,s.title AS source_title FROM parsed_members m LEFT JOIN parse_sources s ON s.run_id=m.run_id AND s.source_id=m.source_id WHERE m.run_id=? ORDER BY m.user_id,m.source_id",
+                "SELECT m.*,m.rowid AS parse_seq,s.title AS source_title FROM parsed_members m LEFT JOIN parse_sources s ON s.run_id=m.run_id AND s.source_id=m.source_id WHERE m.run_id=? ORDER BY m.user_id,m.source_id",
                 (run_id,),
             )
             return [dict(row) for row in await cursor.fetchall()], sources
@@ -339,6 +477,8 @@ class Database(FollowupStore):
     async def save_campaign_settings(self, settings):
         if not set(settings) <= CAMPAIGN_SETTINGS:
             raise ValueError("Неизвестная настройка кампании")
+        if settings.get("invite_order", "shuffle") not in INVITE_ORDERS:
+            raise ValueError("Неизвестный порядок приглашений")
         async with _connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             await _require_active_campaign(db, self.campaign_id)
@@ -938,14 +1078,47 @@ class Database(FollowupStore):
             )
             await db.commit()
 
-    async def bulk_insert_targets(self, usernames: list[str]) -> int:
-        if not usernames:
-            return 0
+    @staticmethod
+    def _audience_item(item) -> dict:
+        if isinstance(item, dict):
+            user_id = item.get("user_id")
+            return {
+                "username": normalize_username(item.get("username") or ""),
+                "user_id": int(user_id) if user_id else None,
+                "activity": item.get("activity") or None,
+                "source": (str(item.get("source")) if item.get("source") else None),
+            }
+        return {"username": normalize_username(item), "user_id": None, "activity": None, "source": None}
+
+    async def bulk_insert_targets(self, usernames: list, *, preserve_order: bool = False) -> int:
+        """Add usernames (or dicts with user_id/activity/source); returns how many rows were inserted."""
+        return (await self.import_audience(usernames, preserve_order=preserve_order))["inserted"]
+
+    async def import_audience(
+        self,
+        items: list,
+        *,
+        preserve_order: bool = False,
+        chat=None,
+        skip_invited: bool = False,
+        exclude_user_ids=(),
+        exclude_usernames=(),
+    ) -> dict[str, int]:
+        """Insert recipients keeping Telegram identity; optionally drop chat members and already invited people."""
+        result = {"inserted": 0, "duplicates": 0, "excluded": 0, "skipped_invited": 0, "total": 0}
+        if not items:
+            return result
+        prepared: dict[str, dict] = {}
+        for raw in items:
+            item = self._audience_item(raw)
+            known = prepared.setdefault(item["username"], item)
+            for field in ("user_id", "activity", "source"):
+                if known[field] is None and item[field] is not None:
+                    known[field] = item[field]
+        result["total"] = len(prepared)
+        excluded_ids = {int(value) for value in exclude_user_ids or ()}
+        excluded_names = {str(value).lstrip("@").lower() for value in exclude_usernames or () if value}
         now = _now_iso()
-        data = [
-            (username, now, self.campaign_id)
-            for username in dict.fromkeys(normalize_username(item) for item in usernames)
-        ]
         async with _connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             await _require_active_campaign(db, self.campaign_id)
@@ -955,25 +1128,112 @@ class Database(FollowupStore):
             ).fetchone()
             if status and status[0] in {"running", "paused"}:
                 raise RuntimeError("Сначала остановите задачу, затем добавьте получателей в список")
+            messages = bool(kind and kind[0] == "messages")
+            ledger_chat = chat_key(chat) if skip_invited and chat and not messages else ""
+            invited = set()
+            if ledger_chat:
+                cursor = await db.execute("SELECT user_key FROM invited_ledger WHERE chat_key=?", (ledger_chat,))
+                invited = {row[0] for row in await cursor.fetchall()}
+            kept = []
+            for item in prepared.values():
+                if (item["user_id"] and item["user_id"] in excluded_ids) or item["username"] in excluded_names:
+                    result["excluded"] += 1
+                elif invited and any(key in invited for key in user_keys(item["username"], item["user_id"])):
+                    result["skipped_invited"] += 1
+                else:
+                    kept.append(item)
+            base = 0
+            if preserve_order:
+                row = await (
+                    await db.execute(
+                        "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM targets WHERE campaign_id=?", (self.campaign_id,)
+                    )
+                ).fetchone()
+                base = int(row[0])
             before = db.total_changes
-            if kind and kind[0] == "messages":
+            if messages:
                 await db.executemany(
-                    "INSERT OR IGNORE INTO targets(username,status,error_message,created_at,campaign_id) "
+                    "INSERT OR IGNORE INTO targets(username,status,error_message,created_at,campaign_id,sort_order,user_id,activity,source) "
                     "VALUES (?,CASE (SELECT state FROM message_deliveries WHERE username=?) "
                     "WHEN 'sent' THEN 'already_sent' WHEN 'uncertain' THEN 'uncertain' "
                     "WHEN 'reserved' THEN 'uncertain' WHEN 'blocked' THEN 'private' ELSE 'pending' END,"
                     "CASE WHEN EXISTS(SELECT 1 FROM message_deliveries WHERE username=?) "
-                    "THEN 'Повтор отключён: получатель уже есть в общем журнале отправок' ELSE NULL END,?,?)",
-                    [(name, name, name, created, campaign_id) for name, created, campaign_id in data],
+                    "THEN 'Повтор отключён: получатель уже есть в общем журнале отправок' ELSE NULL END,?,?,?,?,?,?)",
+                    [
+                        (
+                            item["username"],
+                            item["username"],
+                            item["username"],
+                            now,
+                            self.campaign_id,
+                            base + order,
+                            item["user_id"],
+                            item["activity"],
+                            item["source"],
+                        )
+                        for order, item in enumerate(kept)
+                    ],
                 )
             else:
                 await db.executemany(
-                    "INSERT OR IGNORE INTO targets (username, status, created_at, campaign_id) VALUES (?, 'pending', ?, ?)",
-                    data,
+                    "INSERT OR IGNORE INTO targets (username, status, created_at, campaign_id, sort_order, user_id, activity, source) "
+                    "VALUES (?, 'pending', ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            item["username"],
+                            now,
+                            self.campaign_id,
+                            base + order,
+                            item["user_id"],
+                            item["activity"],
+                            item["source"],
+                        )
+                        for order, item in enumerate(kept)
+                    ],
                 )
-            inserted = db.total_changes - before
+            result["inserted"] = db.total_changes - before
+            result["duplicates"] = len(kept) - result["inserted"]
+            # Rows that already existed as plain usernames gain the Telegram id for safer resolving.
+            await db.executemany(
+                "UPDATE targets SET user_id=? WHERE campaign_id=? AND username=? AND user_id IS NULL",
+                [(item["user_id"], self.campaign_id, item["username"]) for item in kept if item["user_id"]],
+            )
             await db.commit()
-            return inserted
+            return result
+
+    async def get_invited_keys(self, chat) -> set[str]:
+        key = chat_key(chat)
+        if not key:
+            return set()
+        async with _connect() as db:
+            cursor = await db.execute("SELECT user_key FROM invited_ledger WHERE chat_key=?", (key,))
+            return {row[0] for row in await cursor.fetchall()}
+
+    async def count_invited(self, chat) -> int:
+        key = chat_key(chat)
+        if not key:
+            return 0
+        async with _connect() as db:
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM invited_ledger WHERE chat_key=? AND user_key LIKE 'id:%'", (key,)
+            )
+            by_id = (await cursor.fetchone())[0]
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM invited_ledger WHERE chat_key=? AND user_key LIKE 'u:%'", (key,)
+            )
+            return max(by_id, (await cursor.fetchone())[0])
+
+    async def record_invite(self, chat, username=None, user_id=None, account_id=None) -> None:
+        key = chat_key(chat)
+        keys = user_keys(username, user_id)
+        if not key or not keys:
+            return
+        async with _connect() as db:
+            await db.executemany(
+                "INSERT OR IGNORE INTO invited_ledger(chat_key,user_key,invited_at,account_id) VALUES (?,?,?,?)",
+                [(key, user_key, _now_iso(), account_id) for user_key in keys],
+            )
+            await db.commit()
 
     async def get_pending_list(self) -> list[dict]:
         async with _connect() as db:
@@ -1127,7 +1387,7 @@ class Database(FollowupStore):
             )
             await db.commit()
 
-    async def record_success(self, target_id: int, account_id: int) -> None:
+    async def record_success(self, target_id: int, account_id: int, chat=None) -> None:
         """Commit queue outcome and counters together, including rollover at midnight."""
         today = _today_iso()
         async with _connect() as db:
@@ -1145,6 +1405,16 @@ class Database(FollowupStore):
                 "consecutive_adds = COALESCE(consecutive_adds, 0) + 1 WHERE id = ?",
                 (today, today, account_id),
             )
+            ledger = chat_key(chat) if chat else ""
+            if ledger:
+                person = await (
+                    await db.execute("SELECT username,user_id FROM targets WHERE id=?", (target_id,))
+                ).fetchone()
+                if person:
+                    await db.executemany(
+                        "INSERT OR IGNORE INTO invited_ledger(chat_key,user_key,invited_at,account_id) VALUES (?,?,?,?)",
+                        [(ledger, key, _now_iso(), account_id) for key in user_keys(person[0], person[1])],
+                    )
             await db.commit()
 
     async def record_ai_send(self, account_id: int, chat_key: str) -> None:
@@ -1195,20 +1465,33 @@ class Database(FollowupStore):
             await db.execute("DELETE FROM targets WHERE campaign_id=?", (self.campaign_id,))
             await db.commit()
 
-    async def reset_failed_targets(self) -> None:
+    async def reset_failed_targets(self, statuses: Iterable[str] | None = None) -> int:
+        """Return selected finished targets to the queue; returns how many were reset.
+
+        By default only transient outcomes (error, uncertain) are reset: private and
+        not_found recipients stay final unless the caller lists them explicitly.
+        """
+        chosen = tuple(dict.fromkeys(DEFAULT_RESET_STATUSES if statuses is None else statuses))
+        unknown = [status for status in chosen if status not in RESETTABLE_TARGET_STATUSES]
+        if unknown:
+            raise ValueError("Недопустимый статус для повторной попытки: " + ", ".join(map(str, unknown)))
+        if not chosen:
+            return 0
+        placeholders = ",".join("?" for _ in chosen)
         async with _connect() as db:
-            await db.execute(
-                """
+            cursor = await db.execute(
+                f"""
                 UPDATE targets
                 SET status = 'pending',
                     added_by_account_id = NULL,
                     error_message = NULL,
                     processed_at = NULL
-                WHERE status IN ('not_found', 'error', 'private') AND campaign_id=?
+                WHERE status IN ({placeholders}) AND campaign_id=?
                 """,
-                (self.campaign_id,),
+                (*chosen, self.campaign_id),
             )
             await db.commit()
+            return cursor.rowcount
 
     async def get_targets(
         self, status: str | None = None, limit: int | None = 500, search: str = "", offset: int = 0
@@ -1901,6 +2184,8 @@ async def init_db() -> None:
                 run_id INTEGER NOT NULL,source_id INTEGER NOT NULL,user_id INTEGER NOT NULL,
                 username TEXT,first_name TEXT,last_name TEXT,role TEXT,is_bot INTEGER,is_deleted INTEGER,
                 is_premium INTEGER,has_photo INTEGER,activity TEXT,last_seen TEXT,
+                scam INTEGER DEFAULT 0,fake INTEGER DEFAULT 0,restricted INTEGER DEFAULT 0,
+                contact_require_premium INTEGER DEFAULT 0,
                 PRIMARY KEY(run_id,source_id,user_id)
             );
 
@@ -1990,6 +2275,14 @@ async def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_ai_send_events_account_created
                 ON ai_send_events(account_id, created_at);
 
+            CREATE TABLE IF NOT EXISTS invited_ledger (
+                chat_key TEXT NOT NULL,
+                user_key TEXT NOT NULL,
+                invited_at TEXT NOT NULL,
+                account_id INTEGER,
+                PRIMARY KEY(chat_key, user_key)
+            );
+
             """
         )
         migrations = {
@@ -1998,9 +2291,14 @@ async def init_db() -> None:
                 "since": "TEXT",
                 "until": "TEXT",
                 "scan_limit": "INTEGER",
+                "limit_per_source": "INTEGER",
             },
             "parsed_members": {
                 "message_count": "INTEGER NOT NULL DEFAULT 0",
+                "scam": "INTEGER DEFAULT 0",
+                "fake": "INTEGER DEFAULT 0",
+                "restricted": "INTEGER DEFAULT 0",
+                "contact_require_premium": "INTEGER DEFAULT 0",
                 "first_message_at": "TEXT",
                 "last_message_at": "TEXT",
             },
@@ -2017,7 +2315,13 @@ async def init_db() -> None:
                 "sort_order": "INTEGER DEFAULT 0",
                 "warmup_status": "TEXT DEFAULT 'cold'",
             },
-            "targets": {"sort_order": "INTEGER DEFAULT 0"},
+            "targets": {
+                "sort_order": "INTEGER DEFAULT 0",
+                "user_id": "INTEGER",
+                "activity": "TEXT",
+                "source": "TEXT",
+            },
+            "parse_sources": {"search_pos": "INTEGER NOT NULL DEFAULT 0"},
             "logs": {"campaign_id": "INTEGER NOT NULL DEFAULT 1"},
             "warmup_sessions": {"daily_action_limit": "INTEGER DEFAULT 0"},
             "warmup_channels": {"members_count": "INTEGER DEFAULT 0", "synced_at": "TEXT"},
@@ -2042,10 +2346,10 @@ async def init_db() -> None:
         if "campaign_id" not in {row[1] for row in await cur.fetchall()}:
             # Rebuild the legacy UNIQUE(username) constraint without changing row ids or outcomes.
             await db.execute(
-                "CREATE TABLE targets_new(id INTEGER PRIMARY KEY, username TEXT, status TEXT DEFAULT 'pending', added_by_account_id INTEGER, error_message TEXT, processed_at TEXT, created_at TEXT, sort_order INTEGER DEFAULT 0, campaign_id INTEGER NOT NULL DEFAULT 1, UNIQUE(campaign_id, username))"
+                "CREATE TABLE targets_new(id INTEGER PRIMARY KEY, username TEXT, status TEXT DEFAULT 'pending', added_by_account_id INTEGER, error_message TEXT, processed_at TEXT, created_at TEXT, sort_order INTEGER DEFAULT 0, campaign_id INTEGER NOT NULL DEFAULT 1, user_id INTEGER, activity TEXT, source TEXT, UNIQUE(campaign_id, username))"
             )
             await db.execute(
-                "INSERT INTO targets_new SELECT id, username, status, added_by_account_id, error_message, processed_at, created_at, sort_order, 1 FROM targets"
+                "INSERT INTO targets_new SELECT id, username, status, added_by_account_id, error_message, processed_at, created_at, sort_order, 1, user_id, activity, source FROM targets"
             )
             await db.execute("DROP TABLE targets")
             await db.execute("ALTER TABLE targets_new RENAME TO targets")

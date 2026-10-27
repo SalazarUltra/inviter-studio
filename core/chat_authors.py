@@ -192,7 +192,16 @@ class ChatAuthorsEngine(ParserEngine):
                             for field in ("username", "first_name", "last_name"):
                                 if not person[field]:
                                     person[field] = profile[field]
-                            for field in ("is_bot", "is_deleted", "is_premium", "has_photo"):
+                            for field in (
+                                "is_bot",
+                                "is_deleted",
+                                "is_premium",
+                                "has_photo",
+                                "scam",
+                                "fake",
+                                "restricted",
+                                "contact_require_premium",
+                            ):
                                 person[field] = person[field] or profile[field]
                             if profile["activity"] != "unknown":
                                 person["activity"], person["last_seen"] = profile["activity"], profile["last_seen"]

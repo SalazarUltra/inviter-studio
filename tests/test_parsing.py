@@ -15,6 +15,7 @@ from telethon.tl.types import (
     Channel,
     ChannelParticipant,
     ChannelParticipantsRecent,
+    ChannelParticipantsSearch,
     Chat,
     ChatParticipant,
     ChatParticipantCreator,
@@ -70,6 +71,7 @@ class FakeClient:
         failure=None,
         repeat=False,
         block_offset=None,
+        recent_cap=None,
     ):
         self.entity = entity or channel()
         self.users = users if users is not None else [User(id=1, username="alice"), User(id=2, username="bobby")]
@@ -77,6 +79,7 @@ class FakeClient:
         self.count = len(self.users) if count is None else count
         self.fail_offset, self.failure = fail_offset, failure
         self.repeat, self.block_offset = repeat, block_offset
+        self.recent_cap, self.searches = recent_cap, []
         self.requests, self.references = [], []
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
@@ -106,8 +109,17 @@ class FakeClient:
             )
         if not isinstance(request, GetParticipantsRequest):
             raise AssertionError(f"Unexpected Telegram request: {type(request).__name__}")
-        assert isinstance(request.filter, ChannelParticipantsRecent)
+        assert isinstance(request.filter, (ChannelParticipantsRecent, ChannelParticipantsSearch))
         assert 1 <= request.limit <= 200 and request.hash == 0
+        if isinstance(request.filter, ChannelParticipantsSearch):
+            self.searches.append(request.filter.q)
+            pool = [user for user in self.users if request.filter.q in (user.username or "").lower()]
+            users = pool[request.offset : request.offset + request.limit]
+            return SimpleNamespace(participants=[ChannelParticipant(user.id, NOW) for user in users], users=users)
+        if self.recent_cap is not None:
+            visible = self.users[: self.recent_cap]
+            users = visible[request.offset : request.offset + request.limit]
+            return SimpleNamespace(participants=[ChannelParticipant(user.id, NOW) for user in users], users=users)
         if request.offset == self.block_offset:
             self.entered.set()
             await self.release.wait()
@@ -285,6 +297,10 @@ class ParsingEngineTests(DatabaseCase):
         await super().asyncSetUp()
         self.account = await self.add_account()
         self.engine = ParserEngine(self.db)
+        for name in ("PAGE_DELAY", "SEARCH_DELAY"):
+            patcher = patch(f"core.parser.{name}", 0)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     async def collect(self, client, sources=None, limit=500):
         manager = AsyncMock()
@@ -364,7 +380,12 @@ class ParsingEngineTests(DatabaseCase):
         client = FakeClient(users=[User(id=i, username=f"person_{i}") for i in range(1, 201)], count=1000, repeat=True)
         result, (rows, _) = await self.collect(client)
         self.assertEqual((result["status"], len(rows)), ("partial", 200))
-        self.assertEqual(len([item for item in client.requests if isinstance(item, GetParticipantsRequest)]), 2)
+        recent = [
+            item
+            for item in client.requests
+            if isinstance(item, GetParticipantsRequest) and isinstance(item.filter, ChannelParticipantsRecent)
+        ]
+        self.assertEqual(len(recent), 2)
 
     async def test_source_error_allows_other_sources_and_records_partial(self):
         result, (rows, sources) = await self.collect(FakeClient(), ["missing_group", "group_one"])

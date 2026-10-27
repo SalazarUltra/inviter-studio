@@ -310,12 +310,18 @@ class CampaignBar(ctk.CTkFrame):
             )
             for row in runs:
                 summary = json.loads(row["summary"] or "{}")
-                blocks.append(
+                block = (
                     f"{row['started_at']} · {row['chat']} · {labels.get(row['outcome'], row['outcome'])}\n"
                     f"Добавлено: {summary.get('added', 0)}; первых сообщений: {summary.get('sent', 0)}; "
                     f"вторых после ответа: {summary.get('followup_sent', 0)}; пропущено: {summary.get('skipped', 0)}; "
                     f"ошибок: {summary.get('errors', 0)}; время: {summary.get('duration', '—')}"
                 )
+                per_account = summary.get("accounts") or []
+                if per_account:
+                    block += "\nПо аккаунтам: " + "; ".join(
+                        f"{item.get('phone', '?')} +{item.get('added', 0)}" for item in per_account
+                    )
+                blocks.append(block)
             post_ui(self, lambda: show_report(self, "История кампании", "\n\n".join(blocks) or "Запусков пока нет"))
 
         future.add_done_callback(done)

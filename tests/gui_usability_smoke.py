@@ -215,18 +215,24 @@ def main():
                 app.accounts_tab.search_var.set("")
                 app._switch_tab("logs")
                 app.logs_tab.filter_var.set("Пропуски")
-                app.after(500, filtered_logs)
+                app.after(500, lambda: filtered_logs(40))
 
-            def filtered_logs():
+            def filtered_logs(retries=0):
                 value = app.logs_tab.log_box.get("1.0", "end")
+                if retries and not ("@alice" in value and "@bobby" not in value):
+                    app.after(250, lambda: filtered_logs(retries - 1))
+                    return
                 assert "@alice" in value and "@bobby" not in value
                 assert str(app.logs_tab.log_box._textbox.cget("state")) == "disabled"
                 app.logs_tab.search_var.set("bobby")
                 app.logs_tab.filter_var.set("Все события")
-                app.after(500, searched_logs)
+                app.after(500, lambda: searched_logs(40))
 
-            def searched_logs():
+            def searched_logs(retries=0):
                 value = app.logs_tab.log_box.get("1.0", "end")
+                if retries and not ("@bobby" in value and "@alice" not in value):
+                    app.after(250, lambda: searched_logs(retries - 1))
+                    return
                 assert "@bobby" in value and "@alice" not in value
                 capture("journal-filter.png")
                 app._switch_tab("warmup")

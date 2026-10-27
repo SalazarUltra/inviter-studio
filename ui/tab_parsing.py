@@ -1,13 +1,16 @@
 """Participant collection with explicit access checks, saved runs and local segments."""
 
 import asyncio
+import json
 import os
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import customtkinter as ctk
+from telethon.errors import FloodWaitError
 
+from core import account_manager as account_core
 from core.account_manager import AccountManager
 from core.chat_authors import (
     MAX_HISTORY_MESSAGES,
@@ -16,16 +19,19 @@ from core.chat_authors import (
     filter_author_stats,
     history_period,
 )
-from core.database import is_flood_blocking
+from core.database import is_flood_blocking, order_audience
 from core.export import write_parsed
 from core.parser import (
+    ACCOUNT_ERRORS,
     ACTIVITY_LABELS,
     MAX_PER_SOURCE,
     ParserEngine,
     access_error,
+    audience_members,
     filter_members,
     group_members,
     parse_sources,
+    pending_sources,
     unique_members,
 )
 from core.user_feedback import explain_error
@@ -44,6 +50,12 @@ RUN_LABELS = {
     "failed": "Ошибка",
     "stopped": "Остановлено",
     "interrupted": "Прервано",
+}
+RESUMABLE_STATUSES = {"partial", "failed", "interrupted", "stopped"}
+AUDIENCE_ORDERS = {
+    "Как получено (свежие первыми)": "imported",
+    "По активности": "activity",
+    "Перемешать": "shuffle",
 }
 ROLE_CHOICES = {"Все роли": "all", "Создатели и админы": "admins", "Обычные участники": "members"}
 ACTIVITY_CHOICES = {
@@ -82,7 +94,25 @@ LAST_POST = {
     "Писал за 30 дней": 30,
     "Писал за 90 дней": 90,
 }
-EXPORT_FORMATS = {"CSV · таблица / Excel": "csv", "TXT · никнеймы": "txt", "JSON · данные": "json"}
+EXPORT_FORMATS = {
+    "XLSX · Excel": "xlsx",
+    "CSV · таблица": "csv",
+    "TXT · никнеймы": "txt",
+    "JSON · данные": "json",
+}
+FILTER_KEYS = (
+    "only_username",
+    "exclude_bots",
+    "exclude_deleted",
+    "exclude_scam",
+    "exclude_fake",
+    "exclude_restricted",
+    "premium",
+    "photo",
+)
+FILTER_DEFAULTS = set(FILTER_KEYS) - {"premium", "photo"}
+FILTER_PREFS_SETTING = "parser_filter_prefs"
+FILTER_DEBOUNCE_MS = 280
 
 
 class ParsingTab(ctk.CTkFrame):
@@ -98,6 +128,7 @@ class ParsingTab(ctk.CTkFrame):
         self.runs = {}
         self.rows = []
         self.filtered = []
+        self._resume_pending = []
         self.selected_run = None
         self.page = 0
         self._query_generation = 0
@@ -110,6 +141,7 @@ class ParsingTab(ctk.CTkFrame):
         self._export_path_generation = 0
         self.last_export_path = None
         self.export_buttons = {}
+        self._filter_job = None
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(2, weight=1)
         intro = page_intro(
@@ -270,6 +302,14 @@ class ParsingTab(ctk.CTkFrame):
         results = self.card("Сохранённые результаты")
         self.history_menu = ctk.CTkOptionMenu(results, values=["Запусков пока нет"], command=self.choose_run)
         self.history_menu.pack(fill="x", padx=16, pady=(0, 8))
+        self.resume_button = ctk.CTkButton(
+            results, text="Продолжить", width=190, height=30, state="disabled", command=self.resume_run
+        )
+        self.resume_button.pack(anchor="w", padx=16, pady=(0, 8))
+        tip(
+            self.resume_button,
+            "Дополучает группы, которые не были завершены (ошибка, остановка, закрытие программы). Уже сохранённые люди не дублируются.",
+        )
         self.result_hint = hint(
             results, "Выберите сохранённый результат. Участники и авторы сообщений — разные режимы."
         )
@@ -291,10 +331,7 @@ class ParsingTab(ctk.CTkFrame):
         self.segment_label = hint(results, "Пока нет результатов. Получите список на экране «Настройка парсинга».")
         filters = self.card("Фильтры и группировка")
         self.filters_card = filters
-        self.filter_vars = {
-            key: ctk.BooleanVar(value=key in {"only_username", "exclude_bots", "exclude_deleted"})
-            for key in ("only_username", "exclude_bots", "exclude_deleted", "premium", "photo")
-        }
+        self.filter_vars = {key: ctk.BooleanVar(value=key in FILTER_DEFAULTS) for key in FILTER_KEYS}
         checks = ctk.CTkFrame(filters, fg_color="transparent")
         checks.pack(fill="x", padx=16, pady=(0, 8))
         for index, (key, text) in enumerate(
@@ -302,11 +339,14 @@ class ParsingTab(ctk.CTkFrame):
                 ("only_username", "С никнеймом"),
                 ("exclude_bots", "Без ботов"),
                 ("exclude_deleted", "Без удалённых"),
+                ("exclude_scam", "Без скама"),
+                ("exclude_fake", "Без фейков"),
+                ("exclude_restricted", "Без ограниченных"),
                 ("premium", "Premium отмечен"),
                 ("photo", "Фото видно"),
             )
         ):
-            ctk.CTkCheckBox(checks, text=text, variable=self.filter_vars[key], command=self.apply_filters).grid(
+            ctk.CTkCheckBox(checks, text=text, variable=self.filter_vars[key], command=self.filter_toggled).grid(
                 row=index // 3, column=index % 3, sticky="w", padx=(0, 16), pady=5
             )
         options = ctk.CTkFrame(filters, fg_color="transparent")
@@ -408,23 +448,48 @@ class ParsingTab(ctk.CTkFrame):
         CampaignBar(export).pack(fill="x", padx=16, pady=(0, 8))
         exports = ctk.CTkFrame(export, fg_color="transparent")
         exports.pack(fill="x", padx=16, pady=(0, 8))
-        for format_name in ("csv", "json", "txt"):
+        for format_name in ("xlsx", "csv", "json", "txt"):
             button = ctk.CTkButton(
                 exports,
                 text=f"Экспорт {format_name.upper()}",
-                width=130,
+                width=120,
                 command=lambda value=format_name: self.export(value),
             )
             button.pack(side="left", padx=(0, 8))
             self.export_buttons[format_name] = button
         self.import_button = ctk.CTkButton(exports, text="В аудиторию…", width=150, command=self.to_audience)
         self.import_button.pack(side="left")
+        self.include_admins_var = ctk.BooleanVar(value=False)
+        self.include_admins_check = ctk.CTkCheckBox(
+            exports, text="Включая админов", variable=self.include_admins_var, width=140
+        )
+        self.include_admins_check.pack(side="left", padx=(12, 0))
+        tip(
+            self.include_admins_check,
+            "По умолчанию создатели и администраторы групп в аудиторию не попадают. Боты, удалённые и люди без никнейма пропускаются всегда.",
+        )
+        audience = ctk.CTkFrame(export, fg_color="transparent")
+        audience.pack(fill="x", padx=16, pady=(0, 8))
+        audience.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(audience, text="Порядок:", font=FONTS["small"]).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.audience_order_menu = ctk.CTkOptionMenu(audience, values=list(AUDIENCE_ORDERS), width=260)
+        self.audience_order_menu.grid(row=0, column=1, sticky="w", pady=(0, 6))
+        self.skip_invited_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            audience, text="Пропустить уже приглашённых в чат кампании", variable=self.skip_invited_var
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        self.exclude_chat_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            audience, text="Исключить участников чата (нужен аккаунт)", variable=self.exclude_chat_var
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        self.exclude_chat_entry = ctk.CTkEntry(audience, placeholder_text="@чат; пусто — чат из настроек кампании")
+        self.exclude_chat_entry.grid(row=3, column=0, columnspan=2, sticky="ew")
         self.delete_button = ctk.CTkButton(export, text="Удалить этот запуск", width=170, command=self.delete_run)
         apply_button_role(self.delete_button, "danger")
         self.delete_button.pack(anchor="w", padx=16, pady=(0, 8))
         hint(
             export,
-            "Выгружается весь отфильтрованный сегмент, независимо от страницы. CSV/JSON сохраняют ID и источники; TXT — никнеймы. Один Telegram ID — одна строка. Получение списка не означает согласия людей на сообщения.",
+            "Выгружается весь отфильтрованный сегмент, независимо от страницы. XLSX/CSV/JSON сохраняют ID и источники; TXT — никнеймы. Один Telegram ID — одна строка. Получение списка не означает согласия людей на сообщения.",
         )
         footer = ctk.CTkFrame(self, fg_color="transparent")
         footer.grid(row=3, column=0, sticky="ew", padx=16, pady=8)
@@ -457,12 +522,14 @@ class ParsingTab(ctk.CTkFrame):
             self.save_file_button,
             self.open_folder_button,
             self.import_button,
+            self.resume_button,
             *self.export_buttons.values(),
         ):
             apply_button_role(button, "secondary")
-        self.search_var.trace_add("write", lambda *_: self.apply_filters())
+        self.search_var.trace_add("write", lambda *_: self.schedule_filters())
         self.mode_changed()
         self.refresh_accounts()
+        self.restore_filter_prefs()
         self.refresh_history()
         self.restore_export_path()
         self.toggle_filters()
@@ -585,6 +652,41 @@ class ParsingTab(ctk.CTkFrame):
             self.date_to.configure(state="disabled")
         else:
             self.period_changed()
+        self.update_resume_button(busy)
+
+    def update_resume_button(self, busy=None):
+        busy = self.busy() if busy is None else busy
+        count = len(self._resume_pending)
+        self.resume_button.configure(
+            text=f"Продолжить ({count})" if count else "Продолжить",
+            state="normal" if count and not busy else "disabled",
+        )
+
+    def resume_run(self):
+        run = next((row for row in self.runs.values() if row["id"] == self.selected_run), None)
+        if run is None or not self._resume_pending:
+            return
+        run_id = run["id"]
+        original = next((key for key, row in self.accounts.items() if row["id"] == run.get("account_id")), None)
+        if original and original != self.account_menu.get():
+            answer = messagebox.askyesnocancel(
+                "Продолжить получение",
+                f"Исходный запуск шёл с аккаунтом {original}.\nПродолжить с ним? «Нет» — взять выбранный сейчас аккаунт.",
+            )
+            if answer is None:
+                return
+            if answer:
+                self.account_menu.set(original)
+                self.account_changed(original)
+
+        async def collect():
+            account = await self.selected_account()
+            self.engine = ParserEngine(
+                self.db, progress=lambda text: self._safe_after(lambda: self.status.configure(text=text))
+            )
+            return await self.engine.resume(account, run_id)
+
+        self.operate(collect(), self._run_finished, activity="Продолжаем получение...")
 
     def refresh_accounts(self):
         future = self.app.run_coro(self.db.get_enabled_accounts())
@@ -627,15 +729,32 @@ class ParsingTab(ctk.CTkFrame):
             raise ValueError("Аккаунт ожидает окончания паузы Telegram. Повторите позже")
         return account
 
+    def account_conflict(self):
+        """Why the selected parse account cannot be used right now (None if it is free).
+
+        Tasks and warm-up on OTHER accounts do not block parsing.
+        """
+        if self.busy():
+            return "Дождитесь завершения текущей проверки или остановите парсинг"
+        account_id = self._selected_account_id
+        task_tab = self.app.task_tab
+        if self.app.scheduler.is_running() or task_tab._starting:
+            selected = {key for key, var in task_tab.account_vars.items() if var.get()}
+            if account_id in selected:
+                return "Этот аккаунт участвует в запущенной задаче. Выберите другой аккаунт или остановите задачу"
+        warmup = self.app.warmup_tab
+        if warmup.warmup_future and not warmup.warmup_future.done() and warmup.current_account_id == account_id:
+            return "Этот аккаунт сейчас на прогреве. Выберите другой аккаунт или остановите прогрев"
+        account = next((row for row in self.accounts.values() if row["id"] == account_id), None)
+        if account and account_core.AccountManager.is_session_busy(account["phone"], account.get("session_name")):
+            return "Этот аккаунт уже используется другой операцией. Дождитесь её завершения или выберите другой"
+        return None
+
     def operate(self, coroutine, callback, activity="Проверяем доступ..."):
-        if (
-            self.busy()
-            or self.app.scheduler.is_running()
-            or self.app.task_tab._starting
-            or (self.app.warmup_tab.warmup_future and not self.app.warmup_tab.warmup_future.done())
-        ):
+        conflict = self.account_conflict()
+        if conflict:
             coroutine.close()
-            messagebox.showwarning("Аккаунт занят", "Остановите текущую задачу или дождитесь завершения проверки")
+            messagebox.showwarning("Аккаунт занят", conflict)
             return
         self.set_busy(True, activity)
         self.status.configure(text="Подключение и чтение данных Telegram…")
@@ -696,7 +815,7 @@ class ParsingTab(ctk.CTkFrame):
     def check_access(self):
         authors = MODE_CHOICES[self.mode_menu.get()] == "authors"
         try:
-            source = self.sources()[0]
+            sources = self.sources()
         except ValueError as exc:
             self.status.configure(text=explain_error(exc), text_color=COLORS["error"])
             return
@@ -704,19 +823,52 @@ class ParsingTab(ctk.CTkFrame):
         async def check():
             account = await self.selected_account()
             engine = ChatAuthorsEngine(self.db) if authors else ParserEngine(self.db)
-            return await engine.check(account, source)
+            results = []
+            for index, source in enumerate(sources):
+                try:
+                    results.append((source, await engine.check(account, source), ""))
+                except Exception as exc:
+                    results.append((source, None, access_error(exc)))
+                    if isinstance(exc, (FloodWaitError, *ACCOUNT_ERRORS)):
+                        # The account itself is limited: the remaining sources would fail for the same reason.
+                        for rest in sources[index + 1 :]:
+                            results.append((rest, None, "Не проверено: проверка остановлена"))
+                        break
+            return results
 
-        def show(info):
-            self.status.configure(
-                text=f"{info['title']}: {'история доступна' if authors else 'список доступен'} этому аккаунту. "
-                + (
-                    "Вступление для этого запроса не потребовалось."
-                    if info["membership"] == "not_joined"
-                    else "Аккаунт уже состоит в чате."
+        def show(results):
+            ok = [item for item in results if item[1] is not None]
+            lines = [
+                f"✓ OK · {info['title']} ({'уже в чате' if info['membership'] == 'joined' else 'без вступления'})"
+                if info is not None
+                else f"✗ FAIL · {source} · {error}"
+                for source, info, error in results
+            ]
+            report = f"Проверка доступа: доступно {len(ok)} из {len(results)}\n" + "\n".join(lines)
+            self.source_report.configure(state="normal")
+            self.source_report.delete("1.0", "end")
+            self.source_report.insert("1.0", report)
+            self.source_report.configure(state="disabled")
+            self.details_var.set(True)
+            self.toggle_details()
+            what = "история доступна" if authors else "список доступен"
+            if len(ok) == len(results):
+                text = (
+                    f"{ok[0][1]['title']}: {what} этому аккаунту. "
+                    if len(results) == 1
+                    else f"Проверено источников: {len(results)}. Везде {what} этому аккаунту. "
+                ) + "Вступление для проверки не потребовалось."
+            else:
+                failed = [line for line in lines if line.startswith("✗")]
+                text = (
+                    f"Проверено источников: {len(results)} · {what}: {len(ok)} · недоступно: {len(failed)}.\n"
+                    + "\n".join(failed[:3])
+                    + ("\n…" if len(failed) > 3 else "")
                 )
-                + " Проверен первый указанный источник.",
-                text_color=COLORS["success"],
-            )
+            if len(results) > 1 or len(ok) != len(results):
+                text += "\nПодробный отчёт: «Результаты и сохранение» → «Отчёт об источниках»."
+            color = COLORS["success"] if len(ok) == len(results) else COLORS["error"]
+            self.status.configure(text=text, text_color=color)
 
         self.operate(check(), show)
 
@@ -747,26 +899,28 @@ class ParsingTab(ctk.CTkFrame):
                 return await self.engine.start(account, sources, limit, since=since, until=until)
             return await self.engine.start(account, sources, limit)
 
-        def finished(result):
-            self.status.configure(
-                text=RUN_LABELS.get(result["status"], result["status"])
-                + ": "
-                + (result["detail"] or "Результаты сохранены. Полнота списка зависит от Telegram."),
-                text_color=COLORS["muted"],
-            )
-            self._results_loading = True
-            self.rows = []
-            self.apply_filters()
-            self.refresh_history(result["run_id"])
-            self.show_view("results")
-            self.results_body._parent_canvas.yview_moveto(0)
-            self.app.notify(
-                "Парсинг: " + RUN_LABELS.get(result["status"], "завершён"),
-                "Откройте «Парсинг → Результаты и сохранение». Список можно сохранить на ПК.",
-                warning=result["status"] in {"failed", "partial", "interrupted"},
-            )
+        self.operate(
+            collect(), self._run_finished, activity="Получаем сообщения..." if authors else "Получаем участников..."
+        )
 
-        self.operate(collect(), finished, activity="Получаем сообщения..." if authors else "Получаем участников...")
+    def _run_finished(self, result):
+        self.status.configure(
+            text=RUN_LABELS.get(result["status"], result["status"])
+            + ": "
+            + (result["detail"] or "Результаты сохранены. Полнота списка зависит от Telegram."),
+            text_color=COLORS["muted"],
+        )
+        self._results_loading = True
+        self.rows = []
+        self.apply_filters()
+        self.refresh_history(result["run_id"])
+        self.show_view("results")
+        self.results_body._parent_canvas.yview_moveto(0)
+        self.app.notify(
+            "Парсинг: " + RUN_LABELS.get(result["status"], "завершён"),
+            "Откройте «Парсинг → Результаты и сохранение». Список можно сохранить на ПК.",
+            warning=result["status"] in {"failed", "partial", "interrupted"},
+        )
 
     def stop(self):
         if self.engine and self.engine._task:
@@ -801,6 +955,8 @@ class ParsingTab(ctk.CTkFrame):
                 else:
                     self._query_generation += 1
                     self.selected_run, self.rows = None, []
+                    self._resume_pending = []
+                    self.update_resume_button()
                     self._results_loading = False
                     self.set_result_mode("members")
                     self.result_hint.configure(
@@ -825,6 +981,8 @@ class ParsingTab(ctk.CTkFrame):
         self.selected_run = row["id"]
         self._results_loading = True
         self.rows = []
+        self._resume_pending = []
+        self.update_resume_button()
         self.apply_filters()
         self._query_generation += 1
         generation = self._query_generation
@@ -840,6 +998,12 @@ class ParsingTab(ctk.CTkFrame):
                     self.update_export_controls()
                     return
                 self.rows, sources = result.result()
+                self._resume_pending = (
+                    pending_sources(row, sources)
+                    if row["mode"] == "members" and row["status"] in RESUMABLE_STATUSES
+                    else []
+                )
+                self.update_resume_button()
                 self.set_result_mode(row["mode"])
                 self.result_hint.configure(
                     text=(
@@ -883,9 +1047,58 @@ class ParsingTab(ctk.CTkFrame):
             menu.configure(state="normal" if mode == "authors" else "disabled")
         self.role_menu.configure(state="disabled" if mode == "authors" else "normal")
 
+    def destroy(self):
+        if self._filter_job is not None:
+            try:
+                self.after_cancel(self._filter_job)
+            except Exception:
+                pass
+            self._filter_job = None
+        super().destroy()
+
+    def schedule_filters(self):
+        """Debounce typing in the search box: recompute once after the user pauses."""
+        if self._filter_job is not None:
+            self.after_cancel(self._filter_job)
+        self._filter_job = self.after(FILTER_DEBOUNCE_MS, self.apply_filters)
+
+    def filter_toggled(self):
+        self.apply_filters()
+        self.save_filter_prefs()
+
+    def save_filter_prefs(self):
+        prefs = json.dumps({key: bool(var.get()) for key, var in self.filter_vars.items()})
+        future = self.app.run_coro(self.db.set_setting(FILTER_PREFS_SETTING, prefs))
+        future.add_done_callback(lambda result: result.cancelled() or result.exception())
+
+    def restore_filter_prefs(self):
+        future = self.app.run_coro(self.db.get_setting(FILTER_PREFS_SETTING, ""))
+
+        def done(result):
+            def render():
+                if result.cancelled() or result.exception() or not result.result():
+                    return
+                try:
+                    prefs = json.loads(result.result())
+                except (TypeError, ValueError):
+                    return
+                if not isinstance(prefs, dict):
+                    return
+                for key, var in self.filter_vars.items():
+                    if isinstance(prefs.get(key), bool):
+                        var.set(prefs[key])
+                self.apply_filters()
+
+            self._safe_after(render)
+
+        future.add_done_callback(done)
+
     def apply_filters(self):
         if not hasattr(self, "table"):
             return
+        if self._filter_job is not None:
+            self.after_cancel(self._filter_job)
+            self._filter_job = None
         options = {key: var.get() for key, var in self.filter_vars.items()}
         options.update(
             query=self.search_var.get(),
@@ -1034,7 +1247,9 @@ class ParsingTab(ctk.CTkFrame):
             self.status.configure(text="Выберите сохранённый результат. Если фильтры скрыли всех людей, измените их.")
             return
         if format_name == "txt" and not any(row["username"] for row in self.filtered):
-            self.status.configure(text="TXT содержит только никнеймы. В этом сегменте их нет; выберите CSV или JSON")
+            self.status.configure(
+                text="TXT содержит только никнеймы. В этом сегменте их нет; выберите XLSX, CSV или JSON"
+            )
             return
         initial_folder = self.last_export_path.parent if self.last_export_path else Path.home() / "Downloads"
         if not initial_folder.is_dir():
@@ -1049,7 +1264,7 @@ class ParsingTab(ctk.CTkFrame):
         )
         if not path:
             return
-        rows = [dict(row) for row in self.filtered]
+        rows = list(self.filtered)  # filtered is rebuilt, never mutated: a shallow snapshot is enough
         path = Path(path).resolve()
         self._exporting = True
         self._export_path_generation += 1
@@ -1094,41 +1309,101 @@ class ParsingTab(ctk.CTkFrame):
         if self.app.scheduler.is_running() or self.app.task_tab._starting:
             messagebox.showwarning("Задача выполняется", "Остановите задачу перед добавлением получателей")
             return
-        names = []
-        for row in self.filtered:
-            if row["is_bot"] or row["is_deleted"] or not row["username"]:
-                continue
-            try:
-                names.append(normalize_username(row["username"]))
-            except ValueError:
-                continue
-        names = list(dict.fromkeys(names))
-        if not names:
-            self.status.configure(text="В сегменте нет подходящих никнеймов людей для аудитории")
+        members, skipped = audience_members(self.filtered, include_admins=bool(self.include_admins_var.get()))
+        if not members:
+            self.status.configure(
+                text="В сегменте нет подходящих никнеймов людей для аудитории"
+                + (f" (админов пропущено: {skipped['admins']})" if skipped["admins"] else "")
+            )
             return
         db = self.app.db
+        order = AUDIENCE_ORDERS[self.audience_order_menu.get()]
+        skip_invited = bool(self.skip_invited_var.get())
+        exclude = bool(self.exclude_chat_var.get())
+        entry_chat = self.exclude_chat_entry.get().strip()
+        if exclude:
+            conflict = self.account_conflict()
+            if conflict:
+                messagebox.showwarning("Аккаунт занят", conflict)
+                return
+        ordered = order_audience(members, order)
+        admins_note = f"\nСоздатели и админы пропущены: {skipped['admins']}." if skipped["admins"] else ""
+        extras = (
+            "\nУчастники чата будут исключены: аккаунту потребуется прочитать список чата." if exclude else ""
+        ) + ("\nУже приглашённые в чат кампании будут пропущены." if skip_invited else "")
         if not messagebox.askyesno(
             "В аудиторию",
-            f"Добавить {len(names)} никнеймов в кампанию №{db.campaign_id}?\nЭто не запускает отправку. Используйте список для общения с людьми, которые ожидают ваше сообщение.",
+            f"Добавить {len(ordered)} никнеймов в кампанию №{db.campaign_id}?{admins_note}{extras}\nЭто не запускает отправку. Используйте список для общения с людьми, которые ожидают ваше сообщение.",
         ):
             return
         targets_tab = self.app.targets_tab
+
+        async def work():
+            chat = entry_chat or (await db.get_setting("target_chat", "") or "")
+            found = None
+            if exclude:
+                if not chat:
+                    raise ValueError("Укажите чат для исключения участников или задайте чат в настройках кампании")
+                reference = chat.strip().lstrip("@")
+                reference = int(reference) if reference.lstrip("-").isdigit() else normalize_username(reference)
+                account = await self.selected_account()
+                self.engine = ParserEngine(
+                    db, progress=lambda text: self._safe_after(lambda: self.status.configure(text=text))
+                )
+                found = await self.engine.collect_member_keys(account, reference)
+            stats = await db.import_audience(
+                ordered,
+                preserve_order=True,
+                chat=chat,
+                skip_invited=skip_invited,
+                exclude_user_ids=found["user_ids"] if found else (),
+                exclude_usernames=found["usernames"] if found else (),
+            )
+            if stats["inserted"]:
+                # Parsed order is meaningful (recent first), so the engine must not reshuffle it.
+                await db.set_setting("invite_order", "shuffle" if order == "shuffle" else "as_is")
+            return stats, found, order
+
         targets_tab.begin_audience_import()
+        if exclude:
+            self.set_busy(True, "Сверяем чат...")
+            self.status.configure(text="Читаем участников чата, чтобы не приглашать тех, кто уже внутри…")
         try:
-            future = self.app.run_coro(db.bulk_insert_targets(names))
+            future = self.app.run_coro(work())
         except Exception:
+            if exclude:
+                self.set_busy(False)
             targets_tab.finish_audience_import()
             raise
+        if exclude:
+            self.future = future
 
         def done(result):
             def render():
                 try:
-                    if result.cancelled() or result.exception():
+                    if exclude:
+                        self.set_busy(False)
+                    if result.cancelled():
                         self.status.configure(text="Не удалось добавить аудиторию")
                         return
-                    self.status.configure(
-                        text=f"Кампания №{db.campaign_id}: добавлено {result.result()}, повторов в очереди {len(names) - result.result()}"
-                    )
+                    if result.exception():
+                        self.status.configure(
+                            text="Не удалось добавить аудиторию: " + access_error(result.exception()),
+                            text_color=COLORS["error"],
+                        )
+                        return
+                    stats, found, used_order = result.result()
+                    text = f"Кампания №{db.campaign_id}: добавлено {stats['inserted']}, повторов в очереди {stats['duplicates']}"
+                    if stats["skipped_invited"]:
+                        text += f", уже приглашены ранее: {stats['skipped_invited']}"
+                    if found is not None:
+                        text += f", уже в чате «{found['title']}»: {stats['excluded']}"
+                        if found["partial"]:
+                            text += " (список чата получен не полностью)"
+                    if stats["inserted"]:
+                        text += ". Порядок приглашений: " + ("случайный" if used_order == "shuffle" else "как в списке")
+                        self.app.task_tab.set_invite_order("shuffle" if used_order == "shuffle" else "as_is")
+                    self.status.configure(text=text, text_color=COLORS["muted"])
                     self.app.targets_tab.refresh_table()
                     self.app.targets_tab.refresh_stats()
                 finally:

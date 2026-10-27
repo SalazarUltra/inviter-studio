@@ -8,6 +8,7 @@ import customtkinter as ctk
 
 from core.database import Database
 from core.diagnostics import format_report, preflight
+from core.inviter import describe_next_available
 from core.scheduler import TaskScheduler
 from core.user_feedback import explain_error
 from core.validation import normalize_username, time_minutes, validate_message
@@ -19,6 +20,8 @@ from ui.hints import hint, tip, wrap_label
 from ui.task_recipients import TaskRecipients
 from ui.template_dialog import TemplateDialog
 from ui.theme import COLORS, FONTS, UI, apply_button_role, init_fonts, style_card, style_tree
+
+INVITE_ORDER_CHOICES = {"Перемешивать": "shuffle", "Как в списке": "as_is"}
 
 
 def normalize_chat(value: str) -> str:
@@ -181,6 +184,9 @@ class TaskTab(ctk.CTkFrame):
         )
         self.status_label.configure(font=FONTS["small"], height=20)
         self.status_label.pack(anchor="w", pady=(2, 0))
+        # Live invite details (next free account, per-account results); shown only while running.
+        self.next_label = ctk.CTkLabel(footer, text="", text_color=COLORS["muted"], anchor="w", justify="left")
+        self.next_label.configure(font=FONTS["small"])
         self._build_protection_accounts()
         self.review_card = self._block("04  /  Проверьте перед запуском")
         hint(
@@ -509,6 +515,11 @@ class TaskTab(ctk.CTkFrame):
             "В режиме приглашений ночью и поздним вечером пауза может автоматически увеличиваться. "
             "Время определяется по системным часам компьютера (не по московскому времени).",
         )
+        hint(
+            interval_block,
+            "В приглашениях пауза считается отдельно для каждого аккаунта: пока один отдыхает, остальные работают. "
+            "Первые действия каждого аккаунта идут с удвоенной паузой (тёплый старт).",
+        )
         tip(
             self.interval_min_entry,
             "Нижняя граница паузы в секундах. В личных сообщениях интервал общий для всех аккаунтов.",
@@ -568,6 +579,16 @@ class TaskTab(ctk.CTkFrame):
         self.break_max_entry.pack(side="left", padx=6)
         hint(
             protection_block, "Перерыв для аккаунта после указанного числа успешных действий. Длительность — в минутах."
+        )
+        order_row = ctk.CTkFrame(protection_block, fg_color="transparent")
+        order_row.pack(fill="x", padx=UI["space_4"], pady=(0, UI["space_3"]))
+        ctk.CTkLabel(order_row, text="Порядок приглашений", font=FONTS["body"]).pack(side="left")
+        self.order_menu = ctk.CTkOptionMenu(order_row, values=list(INVITE_ORDER_CHOICES), width=200)
+        self.order_menu.set(next(iter(INVITE_ORDER_CHOICES)))
+        self.order_menu.pack(side="left", padx=8)
+        hint(
+            protection_block,
+            "«Как в списке» сохраняет порядок импорта из парсинга (сначала недавно активные). «Перемешивать» — случайный порядок при каждом запуске.",
         )
 
         accounts_block = self._block("03  /  Аккаунты для задачи")
@@ -636,7 +657,10 @@ class TaskTab(ctk.CTkFrame):
                     self.progress_top.configure(
                         text=f"Успешно: {stats['added'] + stats.get('sent', 0)} из {stats['total']}"
                     )
-                    self.progress_bottom.configure(text=f"Ошибок: {stats['errors']} | Осталось: {stats['pending']}")
+                    self.progress_bottom.configure(
+                        text=f"Пропущено: {stats.get('skipped', 0)} | Ошибок: {stats['errors']} | "
+                        f"Осталось: {stats['pending']}"
+                    )
 
                 self._safe_after(render)
             except Exception:
@@ -813,6 +837,33 @@ class TaskTab(ctk.CTkFrame):
     def set_progress(self, added: int, total: int) -> None:
         self.progress_top.configure(text=f"Успешно: {added} из {total}")
 
+    def set_details(self, details: dict) -> None:
+        """Richer live progress from the invite engine (pending/skipped/errors + next free account)."""
+        if not self.scheduler.is_running():
+            self._hide_details()
+            return
+        self.progress_top.configure(text=f"Успешно: {details.get('success', 0)} из {details.get('total', 0)}")
+        self.progress_bottom.configure(
+            text=f"Пропущено: {details.get('skipped', 0)} | Ошибок: {details.get('errors', 0)} | "
+            f"Осталось: {details.get('pending', 0)}"
+        )
+        line = describe_next_available(details)
+        per_account = [
+            f"{item['phone']}: +{item['added']}" for item in details.get("accounts", []) if item.get("added")
+        ]
+        if per_account:
+            line = (line + "\n" if line else "") + "Добавлено по аккаунтам: " + ", ".join(per_account)
+        if not line:
+            self._hide_details()
+            return
+        self.next_label.configure(text=line)
+        if not self.next_label.winfo_manager():
+            self.next_label.pack(anchor="w", pady=(0, 2))
+
+    def _hide_details(self) -> None:
+        if hasattr(self, "next_label") and self.next_label.winfo_manager():
+            self.next_label.pack_forget()
+
     def set_status(self, text: str) -> None:
         self.status_label.configure(text=text)
 
@@ -837,6 +888,7 @@ class TaskTab(ctk.CTkFrame):
             self.consecutive_entry,
             self.break_min_entry,
             self.break_max_entry,
+            self.order_menu,
             *getattr(self, "_task_action_buttons", []),
             *getattr(self, "account_checkboxes", []),
         ):
@@ -890,11 +942,19 @@ class TaskTab(ctk.CTkFrame):
             self._progress_frame.pack_forget()
             if running:
                 self._progress_frame.pack(fill="x", before=self.status_label)
+            else:
+                self._hide_details()
         tip(
             self.start_btn,
             "Начать реальные сообщения или приглашения после проверки подключения."
             if self._step == 3
             else "Перейти к следующему шагу. Сообщения и приглашения не отправляются.",
+        )
+
+    def set_invite_order(self, key: str) -> None:
+        """Mirror a stored invite order into the menu so a later save does not overwrite it."""
+        self.order_menu.set(
+            next((title for title, value in INVITE_ORDER_CHOICES.items() if value == key), "Перемешивать")
         )
 
     def operation_mode(self):
@@ -955,6 +1015,7 @@ class TaskTab(ctk.CTkFrame):
             "protection_consecutive": self.consecutive_entry.get().strip() or "5",
             "protection_break_min": self.break_min_entry.get().strip() or "5",
             "protection_break_max": self.break_max_entry.get().strip() or "15",
+            "invite_order": INVITE_ORDER_CHOICES.get(self.order_menu.get(), "shuffle"),
         }
         if settings["schedule_enabled"] == "1":
             time_minutes(settings["schedule_from"])
@@ -991,6 +1052,7 @@ class TaskTab(ctk.CTkFrame):
             "protection_consecutive": "5",
             "protection_break_min": "5",
             "protection_break_max": "15",
+            "invite_order": "shuffle",
         }
 
         async def load():
@@ -1041,6 +1103,12 @@ class TaskTab(ctk.CTkFrame):
                 ):
                     entry.delete(0, "end")
                     entry.insert(0, values[key])
+                self.order_menu.set(
+                    next(
+                        (title for title, key in INVITE_ORDER_CHOICES.items() if key == values["invite_order"]),
+                        "Перемешивать",
+                    )
+                )
                 selected = json.loads(values["selected_accounts"] or "[]")
                 self._saved_account_ids = selected
                 for key, var in self.account_vars.items():
@@ -1334,6 +1402,12 @@ class TaskTab(ctk.CTkFrame):
             f"Ошибок: {stats.get('errors', 0)}\n"
             f"Время работы: {stats.get('duration', '00:00:00')}"
         )
+        accounts = stats.get("accounts") or []
+        if accounts:
+            msg += "\n\nПо аккаунтам:\n" + "\n".join(
+                f"{item['phone']}: добавлено {item['added']}, пропущено {item['skipped']}, ошибок {item['errors']}"
+                for item in accounts
+            )
         outcome = stats.get("outcome", "completed")
         title = {"completed": "Итог", "stopped": "Остановлено", "failed": "Ошибка задачи"}.get(outcome, "Итог")
         msg = msg.replace("Задача завершена", title, 1)

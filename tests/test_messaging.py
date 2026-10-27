@@ -5,7 +5,13 @@ from datetime import date
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from telethon.errors import FloodWaitError, PeerFloodError, RPCError, UsernameNotOccupiedError, UserPrivacyRestrictedError
+from telethon.errors import (
+    FloodWaitError,
+    PeerFloodError,
+    RPCError,
+    UsernameNotOccupiedError,
+    UserPrivacyRestrictedError,
+)
 from telethon.tl.functions.messages import SendMessageRequest
 from telethon.tl.types import User
 
@@ -317,7 +323,7 @@ class MessagingTests(DatabaseCase):
         self.assertEqual(await self.db.delivery_exists("alice"), "uncertain")
         rows = {row["username"]: row["status"] for row in await self.db.get_targets()}
         self.assertEqual(rows, {"alice": "uncertain", "bobby": "pending"})
-        await self.db.reset_failed_targets()
+        await self.db.reset_failed_targets(["error"])
         self.assertEqual((await self.db.get_targets(status="uncertain"))[0]["username"], "alice")
         self.assertEqual(self.reports[0]["outcome"], "failed")
         self.assertTrue(any(row["action"] == "MESSAGE_UNCERTAIN" for row in await self.db.get_logs()))
@@ -405,7 +411,7 @@ class MessagingTests(DatabaseCase):
         manager.send_direct_message.return_value = {"success": False, "error": "private"}
         with patch("core.messenger.AccountManager", return_value=manager):
             await engine.start([account], "Hello", 10, 10)
-            await self.db.reset_failed_targets()
+            await self.db.reset_failed_targets(["private"])
             await engine.start([account], "Hello", 10, 10)
         manager.send_direct_message.assert_awaited_once()
         self.assertEqual(await self.db.delivery_exists("alice"), "blocked")

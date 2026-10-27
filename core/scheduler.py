@@ -18,6 +18,7 @@ class TaskScheduler:
         status_callback: Callable[[str], None] | None = None,
         fatal_callback: Callable[[str], None] | None = None,
         complete_callback: Callable[[dict], None] | None = None,
+        details_callback: Callable[[dict], None] | None = None,
     ):
         self.loop = loop
         self.db = db
@@ -27,6 +28,7 @@ class TaskScheduler:
             status_callback=status_callback,
             fatal_callback=fatal_callback,
             complete_callback=complete_callback,
+            details_callback=details_callback,
         )
         self.engine = InviterEngine(db=db, **self.callbacks)
         self.future: Future | None = None

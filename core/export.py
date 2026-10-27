@@ -3,6 +3,7 @@
 import csv
 import json
 import os
+import re
 import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
@@ -10,6 +11,8 @@ from pathlib import Path
 from typing import Callable
 
 from core.validation import csv_cell
+
+_XML_ILLEGAL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
 
 
 def write_targets_csv(path: str, rows: list[dict]) -> None:
@@ -132,7 +135,7 @@ def write_xlsx_book(path: str, sheet_name: str, rows: list[tuple], widths: tuple
         inline = ET.SubElement(element, f"{{{spreadsheet}}}is")
         text = ET.SubElement(inline, f"{{{spreadsheet}}}t")
         text.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-        text.text = str(value or "")
+        text.text = _XML_ILLEGAL.sub("", str(value or ""))
         if header:
             element.set("s", "1")
         return element
@@ -147,14 +150,14 @@ def write_xlsx_book(path: str, sheet_name: str, rows: list[tuple], widths: tuple
             for column, value in enumerate(values):
                 reference = f"{chr(65 + column)}{row_number}"
                 row_element.append(cell(reference, value, header=row_number == 1))
-        widths = ET.SubElement(sheet, f"{{{spreadsheet}}}cols")
+        columns = ET.SubElement(sheet, f"{{{spreadsheet}}}cols")
         for index, width in enumerate(widths, start=1):
             ET.SubElement(
-                widths,
+                columns,
                 f"{{{spreadsheet}}}col",
                 {"min": str(index), "max": str(index), "width": str(width), "customWidth": "1"},
             )
-        sheet.insert(0, widths)
+        sheet.insert(0, columns)
         sheet_xml = ET.tostring(sheet, encoding="utf-8", xml_declaration=True)
 
         with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as workbook:
@@ -210,7 +213,69 @@ def write_xlsx_book(path: str, sheet_name: str, rows: list[tuple], widths: tuple
             temporary.unlink()
 
 
+def write_parsed_xlsx(path, rows):
+    """Parsed people as a native Excel sheet (labels in Russian, one row per Telegram ID)."""
+    from core.parser import ACTIVITY_LABELS, ROLE_LABELS
+
+    def flag(value):
+        return "Да" if value else "Нет"
+
+    def number(value):
+        return str(value) if value else ""
+
+    book_rows = [
+        (
+            "Telegram ID",
+            "Никнейм",
+            "Имя",
+            "Фамилия",
+            "Группы",
+            "Роли",
+            "Активность",
+            "Последний визит",
+            "Сообщений",
+            "Первое сообщение",
+            "Последнее сообщение",
+            "Premium",
+            "Фото видно",
+            "Бот",
+            "Удалён",
+            "Скам",
+            "Фейк",
+            "Ограничен",
+        )
+    ]
+    for row in rows:
+        roles = row.get("roles") or ([row["role"]] if row.get("role") else [])
+        book_rows.append(
+            (
+                str(row.get("user_id") or ""),
+                "@" + row["username"] if row.get("username") else "",
+                row.get("first_name") or "",
+                row.get("last_name") or "",
+                " | ".join(map(str, row.get("sources") or ())),
+                " | ".join(ROLE_LABELS.get(role, str(role)) for role in roles),
+                ACTIVITY_LABELS.get(row.get("activity"), row.get("activity") or ""),
+                row.get("last_seen") or "",
+                number(row.get("message_count")),
+                row.get("first_message_at") or "",
+                row.get("last_message_at") or "",
+                flag(row.get("is_premium")),
+                flag(row.get("has_photo")),
+                flag(row.get("is_bot")),
+                flag(row.get("is_deleted")),
+                flag(row.get("scam")),
+                flag(row.get("fake")),
+                flag(row.get("restricted")),
+            )
+        )
+    write_xlsx_book(path, "Участники", book_rows, (14, 22, 18, 18, 40, 22, 18, 22, 11, 22, 22, 10, 11, 8, 9, 8, 8, 11))
+
+
 def write_parsed(path, rows, format_name):
+    if format_name == "xlsx":
+        write_parsed_xlsx(path, rows)
+        return
     destination = Path(path)
     temporary = None
     try:
@@ -246,6 +311,9 @@ def write_parsed(path, rows, format_name):
                     "has_photo",
                     "is_bot",
                     "is_deleted",
+                    "scam",
+                    "fake",
+                    "restricted",
                 )
                 writer = csv.writer(handle)
                 writer.writerow(fields)
@@ -259,7 +327,7 @@ def write_parsed(path, rows, format_name):
                         for key in fields
                     )
             else:
-                raise ValueError("Выберите CSV, JSON или TXT")
+                raise ValueError("Выберите XLSX, CSV, JSON или TXT")
         os.replace(temporary, destination)
     finally:
         if temporary and temporary.exists():

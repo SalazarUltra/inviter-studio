@@ -5,9 +5,24 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from telethon.errors import FloodWaitError
+from telethon.errors import (
+    ChatAdminRequiredError,
+    ChatWriteForbiddenError,
+    FloodWaitError,
+    InputUserDeactivatedError,
+    PeerFloodError,
+    UserBannedInChannelError,
+    UserBotError,
+    UserChannelsTooMuchError,
+    UserKickedError,
+    UserNotMutualContactError,
+    UserNotParticipantError,
+    UserPrivacyRestrictedError,
+)
+from telethon.tl.types import Channel, User
 
-from core.inviter import InviterEngine
+from core.account_manager import AccountManager
+from core.inviter import ACCOUNT_FAILURE_LIMIT, MAX_TRANSIENT_RETRIES, InviterEngine
 from core.warmup_actions import WarmupActions
 from core.warmup_engine import MAX_CONSECUTIVE_FAILURES, WarmupEngine
 from tests.support import DatabaseCase, account_payload
@@ -148,20 +163,221 @@ class EngineTests(DatabaseCase):
         self.assertEqual((await self.db.get_targets_stats())["added"], 1)
         self.assertEqual(self.reports[0]["outcome"], "completed")
 
-    async def test_peer_flood_preserves_target_and_restricts_account(self):
-        account = await self.add_account()
-        await self.db.bulk_insert_targets(["alice"])
+    def manager_for(self, account, *results):
         manager = AsyncMock()
         manager.account = account
         manager.check_admin_rights.return_value = {"ok": True}
-        manager.add_user_to_chat.return_value = {"success": False, "error": "peer_flood"}
+        manager.add_user_to_chat.side_effect = list(results) if len(results) > 1 else None
+        if len(results) == 1:
+            manager.add_user_to_chat.return_value = results[0]
+        return manager
+
+    async def run_engine(self, accounts, managers, **kwargs):
         engine = self.engine()
         engine._wait = AsyncMock()
-        with patch("core.inviter.AccountManager", return_value=manager):
-            await asyncio.wait_for(engine.start([account], "group", 10, 10), 3)
+        engine._schedule_account_next = lambda *args, **kwargs: 0  # no per-account interval in unit tests
+        with patch("core.inviter.AccountManager", side_effect=managers):
+            await asyncio.wait_for(engine.start(accounts, "group", 10, 10), 5)
+        return engine
+
+    async def test_peer_flood_sets_timed_cooldown_not_permanent_restriction(self):
+        account = await self.add_account()
+        await self.db.bulk_insert_targets(["alice"])
+        manager = self.manager_for(account, {"success": False, "error": "peer_flood"})
+        await self.run_engine([account], [manager])
         self.assertEqual((await self.db.get_targets_stats())["pending"], 1)
-        self.assertEqual((await self.db.get_account(account["id"]))["status"], "restricted")
+        stored = await self.db.get_account(account["id"])
+        self.assertEqual(stored["status"], "flood")
+        remaining = datetime.fromisoformat(stored["flood_until"]) - datetime.now()
+        self.assertGreater(remaining, timedelta(hours=23))
         self.assertEqual(self.reports[0]["outcome"], "failed")
+        self.assertTrue(any("длительной паузе" in str(args[1]) for args in self.events))
+        self.assertIsNone(await self.engine_pick(stored))
+
+    async def engine_pick(self, account):
+        engine = self.engine()
+        engine.account_managers[account["id"]] = SimpleNamespace()
+        return await engine._pick_available_account([account])
+
+    async def test_need_admin_on_one_account_drops_it_and_continues(self):
+        bad, good = await self.add_account(1), await self.add_account(2)
+        await self.db.bulk_insert_targets(["alice"])
+        no_rights = self.manager_for(bad, {"success": False, "error": "need_admin", "message": "нет прав"})
+        working = self.manager_for(good, {"success": True})
+        engine = await self.run_engine([bad, good], [no_rights, working])
+        self.assertEqual(self.reports[0]["outcome"], "completed")
+        self.assertEqual((await self.db.get_targets_stats())["added"], 1)
+        no_rights.disconnect.assert_awaited_once()
+        working.add_user_to_chat.assert_awaited_once_with("group", "alice")
+        self.assertTrue(any(level == "WARN" and "исключён из ротации" in text for level, text in self.events))
+        self.assertFalse(engine.account_managers)
+
+    async def test_need_admin_on_all_accounts_fails_task(self):
+        account = await self.add_account()
+        await self.db.bulk_insert_targets(["alice"])
+        manager = self.manager_for(account, {"success": False, "error": "need_admin"})
+        await self.run_engine([account], [manager])
+        self.assertEqual(self.reports[0]["outcome"], "failed")
+        self.assertEqual((await self.db.get_targets_stats())["pending"], 1)
+
+    async def test_flood_wait_clears_claimed_target(self):
+        account = await self.add_account()
+        await self.db.bulk_insert_targets(["alice"])
+        manager = self.manager_for(
+            account,
+            {"success": False, "error": "flood", "flood_seconds": 7200},
+        )
+        await self.run_engine([account], [manager])
+        self.assertEqual((await self.db.get_targets())[0]["status"], "pending")
+        self.assertFalse(any("Незавершённая цель" in str(args[1]) for args in self.events))
+
+    async def test_transient_error_is_requeued_then_succeeds(self):
+        account = await self.add_account()
+        await self.db.bulk_insert_targets(["alice"])
+        manager = self.manager_for(
+            account,
+            {"success": False, "error": "network", "message": "Сбой"},
+            {"success": False, "error": "uncertain"},
+            {"success": True},
+        )
+        await self.run_engine([account], [manager])
+        self.assertEqual(manager.add_user_to_chat.await_count, 3)
+        self.assertEqual((await self.db.get_targets())[0]["status"], "added")
+        self.assertEqual(self.reports[0]["errors"], 0)
+
+    async def test_transient_error_marked_error_after_retry_limit(self):
+        account = await self.add_account()
+        await self.db.bulk_insert_targets(["alice"])
+        fail = {"success": False, "error": "not_connected"}
+        manager = self.manager_for(account, *([fail] * (MAX_TRANSIENT_RETRIES + 1)))
+        await self.run_engine([account], [manager])
+        self.assertEqual(manager.add_user_to_chat.await_count, MAX_TRANSIENT_RETRIES + 1)
+        target = (await self.db.get_targets())[0]
+        self.assertEqual(target["status"], "error")
+        self.assertIn("Попытки исчерпаны", target["error_message"])
+        self.assertEqual(self.reports[0]["errors"], 1)
+
+    async def test_recipient_skip_is_final_and_not_retried(self):
+        account = await self.add_account()
+        await self.db.bulk_insert_targets(["alice", "bobby"])
+        manager = self.manager_for(account, {"success": True})
+        outcomes = {
+            "alice": {"success": False, "error": "skip", "message": "Это бот"},
+            "bobby": {"success": False, "error": "private", "message": "Только контакты"},
+        }
+        manager.add_user_to_chat.side_effect = lambda chat, username, **kw: outcomes[username]  # queue is shuffled
+        await self.run_engine([account], [manager])
+        rows = {row["username"]: row for row in await self.db.get_targets()}
+        self.assertEqual({name: row["status"] for name, row in rows.items()}, {"alice": "not_found", "bobby": "private"})
+        self.assertEqual(manager.add_user_to_chat.await_count, 2)
+        self.assertEqual(self.reports[0]["skipped"], 2)
+        self.assertEqual(self.reports[0]["errors"], 0)
+
+    async def test_add_user_to_chat_maps_telegram_errors(self):
+        cases = [
+            (UserPrivacyRestrictedError(None), "private"),
+            (UserNotMutualContactError(None), "private"),
+            (UserChannelsTooMuchError(None), "skip"),
+            (UserKickedError(None), "skip"),
+            (UserBotError(None), "skip"),
+            (InputUserDeactivatedError(None), "skip"),
+            (UserBannedInChannelError(None), "account_banned"),
+            (ChatWriteForbiddenError(None), "need_admin"),
+            (ChatAdminRequiredError(None), "need_admin"),
+            (PeerFloodError(None), "peer_flood"),
+            (ConnectionError("reset"), "network"),
+            (OSError("down"), "network"),
+            (asyncio.TimeoutError(), "uncertain"),
+        ]
+        for exc, expected in cases:
+            with self.subTest(error=type(exc).__name__):
+                manager = AccountManager(account_payload())
+                user = User(id=5, access_hash=1, first_name="A")
+                chat = Channel(id=7, title="Chat", photo=None, date=None, access_hash=1, megagroup=True)
+                client = AsyncMock()
+                client.get_entity.side_effect = [user, chat]
+                client.get_permissions.side_effect = UserNotParticipantError(None)
+                client.side_effect = exc
+                manager.client = client
+                result = await manager.add_user_to_chat("group", "alice")
+                self.assertFalse(result["success"])
+                self.assertEqual(result["error"], expected)
+                self.assertFalse(result.get("flood_seconds"))
+                if expected not in {"peer_flood"}:
+                    self.assertTrue(result.get("message"))
+                    self.assertRegex(result["message"], "[А-Яа-я]")
+
+    async def test_account_banned_uses_cooldown_and_requeues(self):
+        account = await self.add_account()
+        await self.db.bulk_insert_targets(["alice"])
+        manager = self.manager_for(account, {"success": False, "error": "account_banned", "message": "бан"})
+        await self.run_engine([account], [manager])
+        self.assertEqual((await self.db.get_targets())[0]["status"], "pending")
+        self.assertEqual((await self.db.get_account(account["id"]))["status"], "flood")
+
+    async def test_consecutive_failures_trigger_account_break(self):
+        account = await self.add_account()
+        names = [f"user{i}" for i in range(ACCOUNT_FAILURE_LIMIT + 1)]
+        await self.db.bulk_insert_targets(names)
+        failures = [{"success": False, "error": "unknown", "message": "сбой"}] * ACCOUNT_FAILURE_LIMIT
+        manager = self.manager_for(account, *failures, {"success": True})
+        engine = self.engine()
+        engine._wait = AsyncMock()
+        engine._schedule_account_next = lambda *args, **kwargs: 0
+
+        calls = 0
+        original = engine._pick_available_account
+
+        async def pick(accounts):
+            nonlocal calls
+            calls += 1
+            if calls > ACCOUNT_FAILURE_LIMIT + 1:
+                engine.stop()
+                return None
+            return await original(accounts)
+
+        engine._pick_available_account = pick
+        with patch("core.inviter.AccountManager", return_value=manager):
+            await asyncio.wait_for(engine.start([account], "group", 10, 10), 5)
+        stored = await self.db.get_account(account["id"])
+        self.assertIsNotNone(stored["rotation_break_until"])
+        self.assertGreater(datetime.fromisoformat(stored["rotation_break_until"]), datetime.now())
+        self.assertEqual(manager.add_user_to_chat.await_count, ACCOUNT_FAILURE_LIMIT)
+        self.assertTrue(any(level == "WARN" and "неудач подряд" in text for level, text in self.events))
+
+    async def test_success_resets_failure_streak(self):
+        account = await self.add_account()
+        await self.db.bulk_insert_targets([f"user{i}" for i in range(2 * ACCOUNT_FAILURE_LIMIT - 1)])
+        fail = {"success": False, "error": "unknown", "message": "сбой"}
+        results = [fail] * (ACCOUNT_FAILURE_LIMIT - 1) + [{"success": True}] + [fail] * (ACCOUNT_FAILURE_LIMIT - 1)
+        manager = self.manager_for(account, *results)
+        await self.run_engine([account], [manager])
+        self.assertEqual(manager.add_user_to_chat.await_count, len(results))
+        self.assertIsNone((await self.db.get_account(account["id"]))["rotation_break_until"])
+
+    async def test_reset_failed_targets_is_selective(self):
+        await self.db.bulk_insert_targets(["aaa1", "bbb2", "ccc3", "ddd4", "eee5"])
+        for username, status in (
+            ("aaa1", "error"),
+            ("bbb2", "uncertain"),
+            ("ccc3", "private"),
+            ("ddd4", "not_found"),
+            ("eee5", "added"),
+        ):
+            target = next(row for row in await self.db.get_targets() if row["username"] == username)
+            await self.db.mark_target(target["id"], status, None, "msg")
+        self.assertEqual(await self.db.reset_failed_targets(), 2)
+        statuses = {row["username"]: row["status"] for row in await self.db.get_targets()}
+        self.assertEqual(
+            statuses, {"aaa1": "pending", "bbb2": "pending", "ccc3": "private", "ddd4": "not_found", "eee5": "added"}
+        )
+        self.assertEqual(await self.db.reset_failed_targets(["private"]), 1)
+        self.assertEqual(await self.db.reset_failed_targets([]), 0)
+        with self.assertRaises(ValueError):
+            await self.db.reset_failed_targets(["added"])
+        statuses = {row["username"]: row["status"] for row in await self.db.get_targets()}
+        self.assertEqual(statuses["ccc3"], "pending")
+        self.assertEqual(statuses["ddd4"], "not_found")
 
     async def test_warmup_no_selection_fails_without_default_actions(self):
         account = await self.add_account()
