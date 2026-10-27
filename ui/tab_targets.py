@@ -105,7 +105,7 @@ def ask_retry_statuses(parent, messages: bool = False) -> tuple[str, ...] | None
     apply_button_role(cancel, "secondary")
     cancel.pack(side="left", padx=(10, 0))
     dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
-    dialog.after(50, lambda: (dialog.winfo_exists() and dialog.grab_set()))
+    dialog.after(50, lambda: dialog.winfo_exists() and dialog.grab_set())
     parent.wait_window(dialog)
     return outcome["value"]
 
@@ -525,9 +525,11 @@ class TargetsTab(ctk.CTkFrame):
                 future = self.run_coro(db.resolve_uncertain_deliveries(names, delivered))
                 future.add_done_callback(
                     lambda outcome: self._safe_after(
-                        lambda: self.finish_operation(outcome, f"Отмечено вручную ({answer}): {outcome.result()}")
-                        if not outcome.cancelled() and not outcome.exception()
-                        else self.finish_operation(outcome, "")
+                        lambda: (
+                            self.finish_operation(outcome, f"Отмечено вручную ({answer}): {outcome.result()}")
+                            if not outcome.cancelled() and not outcome.exception()
+                            else self.finish_operation(outcome, "")
+                        )
                     )
                 )
 

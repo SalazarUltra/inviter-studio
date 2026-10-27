@@ -79,10 +79,7 @@ def validate_package(package):
     for path in package.rglob("*"):
         relative = path.relative_to(package)
         if (
-            any(
-                part.lower() in {"data", "sessions", "profile", "backups", ".audit", ".git"}
-                for part in relative.parts
-            )
+            any(part.lower() in {"data", "sessions", "profile", "backups", ".audit", ".git"} for part in relative.parts)
             or path.is_file()
             and (
                 path.name.lower().startswith(".env")

@@ -70,9 +70,7 @@ class ParsingFilterTests(unittest.TestCase):
         rights = ChatAdminRights()
         creator = ChannelParticipantCreator(user_id=9, admin_rights=rights)
         self.assertEqual(member_row(user, creator, -1)["role"], "creator")
-        admin = ChannelParticipantAdmin(
-            user_id=9, promoted_by=1, date=datetime.now(timezone.utc), admin_rights=rights
-        )
+        admin = ChannelParticipantAdmin(user_id=9, promoted_by=1, date=datetime.now(timezone.utc), admin_rights=rights)
         self.assertEqual(member_row(user, admin, -1)["role"], "admin")
 
 

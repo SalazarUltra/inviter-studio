@@ -234,9 +234,7 @@ class MessagingTests(DatabaseCase):
         # Earlier targets exhaust their own retries (marked error); the global streak counts
         # distinct failing targets and stops the run at the MAX_TRANSIENT_FAILURES-th one.
         given_up = engine.MAX_TRANSIENT_FAILURES - 1
-        self.assertEqual(
-            manager.resolve_recipient.await_count, given_up * engine.MAX_RESOLVE_RETRIES + 1
-        )
+        self.assertEqual(manager.resolve_recipient.await_count, given_up * engine.MAX_RESOLVE_RETRIES + 1)
         manager.send_direct_message.assert_not_awaited()
         stats = await self.db.get_targets_stats()
         self.assertEqual(stats["pending"], 7 - given_up)
@@ -258,9 +256,7 @@ class MessagingTests(DatabaseCase):
             await asyncio.wait_for(engine.start([account], "Hello", 10, 10), 15)
         rows = {row["username"]: row["status"] for row in await self.db.get_targets()}
         self.assertEqual(rows, {"alice": "error", "bobby": "sent"})
-        alice_attempts = [
-            call for call in manager.resolve_recipient.await_args_list if call.args[0] == "alice"
-        ]
+        alice_attempts = [call for call in manager.resolve_recipient.await_args_list if call.args[0] == "alice"]
         self.assertEqual(len(alice_attempts), engine.MAX_RESOLVE_RETRIES)
         self.assertEqual(self.reports[0]["outcome"], "completed")
         self.assertEqual(self.reports[0]["errors"], 1)
@@ -533,7 +529,10 @@ class MessagingTests(DatabaseCase):
         self.assertEqual(self.reports[0]["outcome"], "completed")
         self.assertEqual(self.reports[0]["errors"], 1)
         self.assertTrue(
-            any(row["action"] == "MESSAGE_ERROR" and "SOME_REJECTION" in row["message"] for row in await self.db.get_logs())
+            any(
+                row["action"] == "MESSAGE_ERROR" and "SOME_REJECTION" in row["message"]
+                for row in await self.db.get_logs()
+            )
         )
         self.assertEqual(await self.db.reset_failed_targets(["error"]), 1)
 

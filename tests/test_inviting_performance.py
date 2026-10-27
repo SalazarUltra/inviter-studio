@@ -39,9 +39,7 @@ class ChatEntityCacheTests(DatabaseCase):
 
         manager.client.get_entity.side_effect = get_entity
         manager.client.return_value = SimpleNamespace(missing_invitees=[])
-        manager.client.get_permissions.side_effect = __import__("telethon").errors.UserNotParticipantError(
-            request=None
-        )
+        manager.client.get_permissions.side_effect = __import__("telethon").errors.UserNotParticipantError(request=None)
         return manager
 
     async def test_chat_is_resolved_once_for_many_invites(self):
@@ -55,9 +53,7 @@ class ChatEntityCacheTests(DatabaseCase):
         manager.client.get_permissions.side_effect = None
         manager.client.get_permissions.return_value = SimpleNamespace(is_creator=True)
         self.assertTrue((await manager.check_admin_rights("group"))["ok"])
-        manager.client.get_permissions.side_effect = __import__("telethon").errors.UserNotParticipantError(
-            request=None
-        )
+        manager.client.get_permissions.side_effect = __import__("telethon").errors.UserNotParticipantError(request=None)
         self.assertTrue((await manager.add_user_to_chat("group", "alice"))["success"])
         self.assertEqual(self.chat_lookups, 1)
 
@@ -149,9 +145,10 @@ class PerAccountPacingTests(DatabaseCase):
             await real_wait(0)
 
         engine._wait = record_wait
-        with patch(
-            "core.inviter.AccountManager", side_effect=[fake_manager(first), fake_manager(second)]
-        ), patch("core.inviter.MIN_ACTION_GAP", 2.0):
+        with (
+            patch("core.inviter.AccountManager", side_effect=[fake_manager(first), fake_manager(second)]),
+            patch("core.inviter.MIN_ACTION_GAP", 2.0),
+        ):
             await asyncio.wait_for(engine.start([first, second], "group", 10, 10), 8)
         self.assertEqual(self.reports[0]["outcome"], "completed")
         self.assertTrue(any(0 < gap <= 2.0 for gap in gaps))
@@ -182,7 +179,10 @@ class PerAccountPacingTests(DatabaseCase):
     async def test_build_details_reports_next_available_account(self):
         first, second = await self.add_account(1), await self.add_account(2)
         engine = self.engine()
-        engine.account_managers = {first["id"]: SimpleNamespace(account=first), second["id"]: SimpleNamespace(account=second)}
+        engine.account_managers = {
+            first["id"]: SimpleNamespace(account=first),
+            second["id"]: SimpleNamespace(account=second),
+        }
         now = datetime.now()
         engine._next_allowed = {
             first["id"]: now + timedelta(seconds=90),
@@ -194,7 +194,9 @@ class PerAccountPacingTests(DatabaseCase):
         text = describe_next_available(details)
         self.assertIn(second["phone"], text)
         self.assertIn("сек", text)
-        self.assertEqual(describe_next_available({"next_account": "+1", "next_in": 0}), "Ближайший аккаунт: +1 — готов сейчас")
+        self.assertEqual(
+            describe_next_available({"next_account": "+1", "next_in": 0}), "Ближайший аккаунт: +1 — готов сейчас"
+        )
         self.assertEqual(describe_next_available({}), "")
 
     async def test_details_callback_failure_does_not_stop_run(self):
@@ -202,8 +204,9 @@ class PerAccountPacingTests(DatabaseCase):
         await self.db.bulk_insert_targets(["alice"])
         engine = self.engine()
         engine.details_callback = lambda _details: 1 / 0
-        with patch("core.inviter.AccountManager", return_value=fake_manager(account)), patch(
-            "core.inviter.MIN_ACTION_GAP", 0
+        with (
+            patch("core.inviter.AccountManager", return_value=fake_manager(account)),
+            patch("core.inviter.MIN_ACTION_GAP", 0),
         ):
             await asyncio.wait_for(engine.start([account], "group", 10, 10), 5)
         self.assertEqual(self.reports[0]["outcome"], "completed")
@@ -230,9 +233,7 @@ class PrivateBridgeTests(DatabaseCase):
             "Здравствуйте! Приглашаю вас в нашу группу: https://t.me/mygroup",
         )
         self.assertEqual(build_message("Заходи", "@mygroup"), "Заходи\nhttps://t.me/mygroup")
-        self.assertEqual(
-            build_message("Тут https://t.me/mygroup", "@mygroup"), "Тут https://t.me/mygroup"
-        )
+        self.assertEqual(build_message("Тут https://t.me/mygroup", "@mygroup"), "Тут https://t.me/mygroup")
         with self.assertRaises(ValueError):
             build_message(DEFAULT_TEMPLATE, "")
 

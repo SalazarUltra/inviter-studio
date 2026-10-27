@@ -45,7 +45,9 @@ class TemplateRenderingTests(unittest.TestCase):
         self.assertIn("b d x!", results)
 
     def test_name_inside_option_and_name_is_never_interpreted(self):
-        self.assertEqual(render_message("{Привет, {имя}|Здравствуйте, {имя}}", "Ли", rng=random.Random(1)).count("Ли"), 1)
+        self.assertEqual(
+            render_message("{Привет, {имя}|Здравствуйте, {имя}}", "Ли", rng=random.Random(1)).count("Ли"), 1
+        )
         # A hostile first name must not become a template of its own.
         self.assertEqual(render_message("Привет, {имя}", "{a|b}"), "Привет, {a|b}")
         self.assertEqual(render_message("{имя}", "x\ny\x00z"), "x y z")
@@ -167,9 +169,7 @@ class EngineRenderingTests(DatabaseCase):
         manager = AsyncMock()
         manager.account = account
         names = {"alice": "Алиса", "bobby": None}
-        manager.resolve_recipient.side_effect = lambda name: User(
-            id=sum(map(ord, name)), first_name=names[name]
-        )
+        manager.resolve_recipient.side_effect = lambda name: User(id=sum(map(ord, name)), first_name=names[name])
 
         async def send(user, text, random_id):
             sent.append(text)

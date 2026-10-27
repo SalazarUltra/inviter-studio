@@ -687,6 +687,7 @@ class FollowupReliabilityTests(FollowupFixtures):
         self.assertEqual(clamp_wait_hours("9999"), 168)
         self.assertEqual(clamp_wait_hours("bad"), 24)
 
+
 class FollowupProtocolTests(DatabaseCase):
     async def test_peer_check_prevents_known_block_or_privacy_restriction(self):
         manager = AccountManager(account_payload())

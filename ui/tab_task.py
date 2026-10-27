@@ -358,7 +358,9 @@ class TaskTab(ctk.CTkFrame):
     def _eta_line(self, pending: int) -> str:
         """Approximate days and today's remaining capacity for the selected accounts (messages mode)."""
         selected = [
-            self._accounts_info[key] for key, var in self.account_vars.items() if var.get() and key in self._accounts_info
+            self._accounts_info[key]
+            for key, var in self.account_vars.items()
+            if var.get() and key in self._accounts_info
         ]
         if not selected:
             return ""
@@ -1172,9 +1174,7 @@ class TaskTab(ctk.CTkFrame):
                 except ValueError as exc:
                     raise ValueError("Второе сообщение: " + str(exc)) from None
         followup_wait_hours = self.followup_wait_entry.get().strip() or "24"
-        if self.followup_enabled.get() and not (
-            followup_wait_hours.isdigit() and 1 <= int(followup_wait_hours) <= 168
-        ):
+        if self.followup_enabled.get() and not (followup_wait_hours.isdigit() and 1 <= int(followup_wait_hours) <= 168):
             raise ValueError("«Ждать ответ, часов»: целое число от 1 до 168")
         try:
             interval_min = int(self.interval_min_entry.get().strip())

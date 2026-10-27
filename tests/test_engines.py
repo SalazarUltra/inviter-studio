@@ -268,7 +268,9 @@ class EngineTests(DatabaseCase):
         manager.add_user_to_chat.side_effect = lambda chat, username, **kw: outcomes[username]  # queue is shuffled
         await self.run_engine([account], [manager])
         rows = {row["username"]: row for row in await self.db.get_targets()}
-        self.assertEqual({name: row["status"] for name, row in rows.items()}, {"alice": "not_found", "bobby": "private"})
+        self.assertEqual(
+            {name: row["status"] for name, row in rows.items()}, {"alice": "not_found", "bobby": "private"}
+        )
         self.assertEqual(manager.add_user_to_chat.await_count, 2)
         self.assertEqual(self.reports[0]["skipped"], 2)
         self.assertEqual(self.reports[0]["errors"], 0)

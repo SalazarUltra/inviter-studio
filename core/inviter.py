@@ -298,9 +298,7 @@ class InviterEngine:
                     await self.db.mark_target(target["id"], "pending")
                     claimed_target = None
                     await self.db.set_flood_wait(account["id"], PEER_FLOOD_COOLDOWN_SECONDS)
-                    reason = str(
-                        result.get("message") or "Telegram ограничил приглашения с этого аккаунта"
-                    )
+                    reason = str(result.get("message") or "Telegram ограничил приглашения с этого аккаунта")
                     await self.db.add_log(account["phone"], username, "PEER_FLOOD", reason)
                     self.log_callback(
                         "WARN",
@@ -326,9 +324,7 @@ class InviterEngine:
                 else:
                     self._session_counts["errors"] += 1
                     self._transient_retries.pop(target["id"], None)
-                    message = str(
-                        result.get("message") or "Telegram отклонил действие; проверьте аккаунт и получателя"
-                    )
+                    message = str(result.get("message") or "Telegram отклонил действие; проверьте аккаунт и получателя")
                     await self.db.mark_target(target["id"], "error", None, message)
                     await self.db.add_log(account["phone"], username, "ADD_ERROR", message)
                     self.log_callback("ERROR", f"@{username}: действие не выполнено; подробности в журнале")

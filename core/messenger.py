@@ -298,7 +298,9 @@ class MessageEngine(InviterEngine):
                     rendered = validate_message(render_message(text, getattr(user, "first_name", None)))
                 except ValueError as exc:
                     await self.db.mark_target(
-                        claimed, "error", error_message=f"Текст после подстановки {{имя}} и вариантов не подходит: {exc}"
+                        claimed,
+                        "error",
+                        error_message=f"Текст после подстановки {{имя}} и вариантов не подходит: {exc}",
                     )
                     claimed = None
                     self._session_counts["errors"] += 1

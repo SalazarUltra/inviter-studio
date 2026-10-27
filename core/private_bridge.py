@@ -51,7 +51,9 @@ def conservative_settings(settings: dict) -> dict:
     low = max(CONSERVATIVE_INTERVAL_MIN, number("interval_min", CONSERVATIVE_INTERVAL_MIN))
     high = max(CONSERVATIVE_INTERVAL_MAX, number("interval_max", CONSERVATIVE_INTERVAL_MAX), low)
     result["interval_min"], result["interval_max"] = str(low), str(high)
-    result["protection_consecutive"] = str(max(1, min(CONSERVATIVE_MAX_CONSECUTIVE, number("protection_consecutive", 3))))
+    result["protection_consecutive"] = str(
+        max(1, min(CONSERVATIVE_MAX_CONSECUTIVE, number("protection_consecutive", 3)))
+    )
     break_min = max(1, number("protection_break_min", 5))
     result["protection_break_min"] = str(break_min)
     result["protection_break_max"] = str(max(break_min, number("protection_break_max", 15)))
