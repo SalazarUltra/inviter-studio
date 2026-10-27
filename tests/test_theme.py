@@ -131,7 +131,7 @@ class IconTests(unittest.TestCase):
                 if picture.getpixel((x, y))[3] == 255
             )
 
-        self.assertEqual(ink(light), (0x52, 0x6F, 0x00))
+        self.assertEqual(ink(light), (0x3F, 0x5A, 0x00))
         self.assertEqual(ink(dark), (0xD4, 0xFF, 0x00))
         self.assertEqual(icon("support", "#112233").cget("light_image").size, (96, 96))
 

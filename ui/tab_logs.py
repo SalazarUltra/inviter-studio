@@ -13,8 +13,8 @@ from core.export import write_logs, write_logs_xlsx
 from core.user_feedback import explain_error
 from ui.campaigns import CampaignBar
 from ui.components import page_intro, set_page_intro
-from ui.i18n import t
 from ui.dispatch import post_ui
+from ui.i18n import t
 from ui.theme import COLORS, FONTS, bind_text_tags, init_fonts, style_card
 
 LOG_COLORS = {

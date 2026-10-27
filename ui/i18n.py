@@ -246,8 +246,7 @@ STRINGS: dict[str, dict[str, str]] = {
         ),
         "parsing.resume_title": "Продолжить получение",
         "parsing.resume_ask": (
-            "Исходный запуск шёл с аккаунтом {account}.\n"
-            "Продолжить с ним? «Нет» — взять выбранный сейчас аккаунт."
+            "Исходный запуск шёл с аккаунтом {account}.\nПродолжить с ним? «Нет» — взять выбранный сейчас аккаунт."
         ),
         "parsing.compare": "Новые с прошлого запуска",
         "parsing.compare_tip": (
@@ -583,7 +582,6 @@ STRINGS: dict[str, dict[str, str]] = {
         "dash.device": "Устройство: {value}",
         "dash.device_unknown": "Неизвестно",
         "status.active": "Активен",
-        "status.ready": "Готов",
         "status.flood": "Пауза Telegram",
         "status.error": "Ошибка",
         "status.inactive": "Неактивен",
@@ -1054,8 +1052,7 @@ STRINGS: dict[str, dict[str, str]] = {
         ),
         "parsing.resume_title": "Resume fetch",
         "parsing.resume_ask": (
-            "The original run used account {account}.\n"
-            "Continue with it? No — use the account selected now."
+            "The original run used account {account}.\nContinue with it? No — use the account selected now."
         ),
         "parsing.compare": "New since previous run",
         "parsing.compare_tip": (
@@ -1391,7 +1388,6 @@ STRINGS: dict[str, dict[str, str]] = {
         "dash.device": "Device: {value}",
         "dash.device_unknown": "Unknown",
         "status.active": "Active",
-        "status.ready": "Ready",
         "status.flood": "Telegram pause",
         "status.error": "Error",
         "status.inactive": "Inactive",

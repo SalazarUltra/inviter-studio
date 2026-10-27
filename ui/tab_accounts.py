@@ -165,8 +165,7 @@ class AccountsTab(ctk.CTkFrame):
 
     def _account_matches(self, account: dict, query: str) -> bool:
         haystack = " ".join(
-            str(account.get(key) or "")
-            for key in ("phone", "tg_first_name", "tg_last_name", "tg_username")
+            str(account.get(key) or "") for key in ("phone", "tg_first_name", "tg_last_name", "tg_username")
         ).casefold()
         if query and query not in haystack:
             return False

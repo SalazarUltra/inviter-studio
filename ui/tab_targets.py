@@ -15,9 +15,9 @@ from core.user_feedback import explain_error
 from core.validation import parse_usernames, recipient_label
 from ui.campaigns import CampaignBar
 from ui.components import empty_state, page_intro, set_page_intro
-from ui.i18n import t
 from ui.dispatch import post_ui
 from ui.hints import tip
+from ui.i18n import t
 from ui.private_bridge_dialog import PrivateBridgeDialog
 from ui.recipient_editor import RecipientEditor
 from ui.theme import COLORS, FONTS, apply_button_role, get_density_preset, init_fonts, style_card, style_tree

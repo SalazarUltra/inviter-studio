@@ -1175,9 +1175,7 @@ class TaskTab(ctk.CTkFrame):
             self._account_labels[account["id"]] = account_headline(account) or account["phone"]
             checkbox = ctk.CTkCheckBox(
                 self.accounts_box,
-                text=account_menu_label(
-                    account, used=self._used_today(account), limit=account.get("daily_limit", 40)
-                ),
+                text=account_menu_label(account, used=self._used_today(account), limit=account.get("daily_limit", 40)),
                 variable=var,
                 command=self.update_readiness,
             )

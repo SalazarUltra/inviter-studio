@@ -647,9 +647,7 @@ class AIWriter:
                 backfill = float(guessed)
                 self.session_cost_estimated = True
         if self.db and self.config.get("id"):
-            await self.db.update_ai_usage(
-                int(self.config["id"]), input_tokens + output_tokens, billed + backfill
-            )
+            await self.db.update_ai_usage(int(self.config["id"]), input_tokens + output_tokens, billed + backfill)
         self.config["total_tokens"] = prev_tokens + input_tokens + output_tokens
         self.config["total_cost_usd"] = prev_cost + billed + backfill
 

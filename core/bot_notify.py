@@ -131,7 +131,14 @@ def _error_for(status: int, data: Any, *, method: str) -> BotNotifyError:
     return BotNotifyError(f"Telegram ответил кодом {status} ({method}). Проверьте токен и chat_id.")
 
 
-async def _post(token: str, method: str, *, json_payload: dict | None = None, form: aiohttp.FormData | None = None, timeout: float = REQUEST_TIMEOUT) -> Any:
+async def _post(
+    token: str,
+    method: str,
+    *,
+    json_payload: dict | None = None,
+    form: aiohttp.FormData | None = None,
+    timeout: float = REQUEST_TIMEOUT,
+) -> Any:
     """POST JSON or multipart to a Bot API method and return ``result``; raises ``BotNotifyError`` only."""
     url = f"{API_BASE}/bot{token}/{method}"
     try:

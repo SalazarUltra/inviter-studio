@@ -17,9 +17,9 @@ from core.user_feedback import explain_error
 from core.warmup_engine import WARMUP_LEVELS, WarmupEngine
 from core.warmup_runs import WarmupRunRegistry
 from ui.components import empty_state, page_intro, set_page_intro
-from ui.i18n import t
 from ui.dispatch import post_ui
 from ui.hints import tip
+from ui.i18n import t
 from ui.theme import COLORS, FONTS, bind_text_tags, init_fonts, style_card, style_tree
 
 
@@ -89,7 +89,7 @@ class TabWarmup(ctk.CTkFrame):
 
     def stop_all(self) -> int:
         stopped = 0
-        for account_id, run in self._runs.items():
+        for _account_id, run in self._runs.items():
             engine = run.get("engine")
             if engine:
                 self.async_loop.call_soon_threadsafe(engine.stop)
@@ -152,9 +152,7 @@ class TabWarmup(ctk.CTkFrame):
         self.account_combo.pack(fill="x", padx=16, pady=(0, 12))
         tip(self.account_combo, t("warmup.account_tip"))
 
-        self.level_label = ctk.CTkLabel(
-            left, text=t("warmup.level"), font=FONTS["body"], text_color=COLORS["muted"]
-        )
+        self.level_label = ctk.CTkLabel(left, text=t("warmup.level"), font=FONTS["body"], text_color=COLORS["muted"])
         self.level_label.pack(anchor="w", padx=16, pady=(0, 4))
         self.level_var = ctk.StringVar(value="medium")
         self.level_radios: dict[str, ctk.CTkRadioButton] = {}
@@ -173,9 +171,7 @@ class TabWarmup(ctk.CTkFrame):
             radio.pack(anchor="w", padx=24, pady=2)
             self.level_radios[value] = radio
 
-        self.topic_label = ctk.CTkLabel(
-            left, text=t("warmup.topic"), font=FONTS["body"], text_color=COLORS["muted"]
-        )
+        self.topic_label = ctk.CTkLabel(left, text=t("warmup.topic"), font=FONTS["body"], text_color=COLORS["muted"])
         self.topic_label.pack(anchor="w", padx=16, pady=(12, 4))
         self.topic_entry = ctk.CTkEntry(
             left,
@@ -731,14 +727,10 @@ class TabWarmup(ctk.CTkFrame):
 
         tone_label = self._tone_labels().get(self._tone_key(), t("warmup.tone.neutral"))
         memory_text = (
-            t("warmup.scenario.memory_on")
-            if bool(self.ai_memory_enabled.get())
-            else t("warmup.scenario.memory_off")
+            t("warmup.scenario.memory_on") if bool(self.ai_memory_enabled.get()) else t("warmup.scenario.memory_off")
         )
         chats_n = self._selected_chats_count()
-        chats_text = (
-            t("warmup.scenario.chats", n=chats_n) if chats_n else t("warmup.scenario.chats_none")
-        )
+        chats_text = t("warmup.scenario.chats", n=chats_n) if chats_n else t("warmup.scenario.chats_none")
         pace = config.get("actions_per_day") or {"min": 0, "max": 0}
 
         self.scenario_title.configure(text=t("warmup.scenario.title"))
@@ -1082,9 +1074,7 @@ class TabWarmup(ctk.CTkFrame):
         progress = min(day / total, 1.0) if total > 0 else 0
         self.progress_bar.set(progress)
         self.day_label.configure(text=t("warmup.day", day=day, total=total))
-        self.actions_label.configure(
-            text=t("warmup.actions_today", n=int(session.get("actions_today") or 0))
-        )
+        self.actions_label.configure(text=t("warmup.actions_today", n=int(session.get("actions_today") or 0)))
         status_map = {
             "idle": ("warmup.session.idle", COLORS["muted"]),
             "running": ("warmup.session.running", COLORS["success"]),
@@ -1207,9 +1197,7 @@ class TabWarmup(ctk.CTkFrame):
         parsing = getattr(app, "parsing_tab", None)
         if parsing is not None and parsing.busy():
             if getattr(parsing, "multi_mode", lambda: False)():
-                chosen = {
-                    aid for aid, var in getattr(parsing, "multi_vars", {}).items() if var.get()
-                }
+                chosen = {aid for aid, var in getattr(parsing, "multi_vars", {}).items() if var.get()}
                 if account_id in chosen:
                     return t("warmup.account_in_parsing")
             elif getattr(parsing, "_selected_account_id", None) == account_id:
@@ -1218,9 +1206,7 @@ class TabWarmup(ctk.CTkFrame):
         scheduler = getattr(app, "scheduler", None)
         if task is not None and scheduler is not None:
             if scheduler.is_running() or getattr(task, "_starting", False):
-                selected = {
-                    key for key, var in getattr(task, "account_vars", {}).items() if var.get()
-                }
+                selected = {key for key, var in getattr(task, "account_vars", {}).items() if var.get()}
                 if account_id in selected:
                     return t("warmup.account_in_task")
         return None
@@ -1246,15 +1232,15 @@ class TabWarmup(ctk.CTkFrame):
         focus = self._runs.get(self.current_account_id)
         if focus and focus.get("engine") and getattr(focus["engine"], "ai_writer", None):
             stats = focus["engine"].ai_writer.get_session_stats()
-            self.ai_tokens_label.configure(
-                text=t("ai.tokens", tokens=f"{int(stats.get('tokens', 0)):,}")
-            )
+            self.ai_tokens_label.configure(text=t("ai.tokens", tokens=f"{int(stats.get('tokens', 0)):,}"))
             cost = stats.get("cost_formatted") or t("ai.cost_unknown")
             self.ai_cost_label.configure(text=t("ai.cost", cost=cost))
         else:
             self.ai_tokens_label.configure(text=t("ai.tokens", tokens=f"{total_tokens:,}"))
-            cost = cost_parts[0] if len(cost_parts) == 1 else (
-                t("ai.cost_unknown") if not cost_parts else " / ".join(cost_parts[:3])
+            cost = (
+                cost_parts[0]
+                if len(cost_parts) == 1
+                else (t("ai.cost_unknown") if not cost_parts else " / ".join(cost_parts[:3]))
             )
             self.ai_cost_label.configure(text=t("ai.cost", cost=cost))
         if any_running:
@@ -1326,10 +1312,9 @@ class TabWarmup(ctk.CTkFrame):
             except FutureCancelledError:
                 pass
             except Exception as exc:  # noqa: BLE001
-                self._safe_after(
-                    lambda exc=exc: self._log("ERROR", f"Ошибка прогрева: {exc}", account_label=label)
-                )
+                self._safe_after(lambda exc=exc: self._log("ERROR", f"Ошибка прогрева: {exc}", account_label=label))
             finally:
+
                 def finish():
                     self._runs.discard(account_id)
                     self._set_warmup_controls()

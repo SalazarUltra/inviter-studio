@@ -174,7 +174,9 @@ class AIWriterTests(unittest.IsolatedAsyncioTestCase):
         from core.ai_writer import preview_warmup_prompt
 
         writer = AIWriter(topic="крипто")
-        prompts = {tone: writer._build_prompt(context="рынок спокоен", tone=tone) for tone in ("neutral", "friendly", "expert")}
+        prompts = {
+            tone: writer._build_prompt(context="рынок спокоен", tone=tone) for tone in ("neutral", "friendly", "expert")
+        }
         self.assertIn("нейтральный", prompts["neutral"].lower())
         self.assertIn("дружелюбный", prompts["friendly"].lower())
         self.assertIn("экспертный", prompts["expert"].lower())

@@ -89,9 +89,7 @@ class FakeAiohttp:
                 return False
 
             def post(self, url, json=None, data=None, allow_redirects=True):
-                outer.calls.append(
-                    {"url": url, "json": json, "data": data, "allow_redirects": allow_redirects}
-                )
+                outer.calls.append({"url": url, "json": json, "data": data, "allow_redirects": allow_redirects})
                 if outer.error:
                     raise outer.error
                 return FakeResponse(outer.status, outer.data)

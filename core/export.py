@@ -291,9 +291,7 @@ def txt_lines_with_ids(rows) -> list[str]:
 def parsed_txt_content(rows, format_name: str) -> str:
     """Build a TXT body for parsed people. ``format_name`` is ``txt`` or ``txt_ids``."""
     if format_name == "txt":
-        return "".join(
-            f"@{name}\n" for name in dict.fromkeys(row["username"] for row in rows if row.get("username"))
-        )
+        return "".join(f"@{name}\n" for name in dict.fromkeys(row["username"] for row in rows if row.get("username")))
     if format_name == "txt_ids":
         return "".join(f"{line}\n" for line in txt_lines_with_ids(rows))
     raise ValueError("Выберите TXT или TXT с ID")

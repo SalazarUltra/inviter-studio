@@ -102,16 +102,8 @@ def estimate_cost_usd(
     out = max(0, int(output_tokens))
     cached = min(max(0, int(cached_input_tokens)), inp)
     uncached = inp - cached
-    cached_rate = (
-        float(cached_input_per_million)
-        if cached_input_per_million is not None
-        else float(input_per_million)
-    )
-    return (
-        uncached * float(input_per_million)
-        + cached * cached_rate
-        + out * float(output_per_million)
-    ) / 1_000_000
+    cached_rate = float(cached_input_per_million) if cached_input_per_million is not None else float(input_per_million)
+    return (uncached * float(input_per_million) + cached * cached_rate + out * float(output_per_million)) / 1_000_000
 
 
 def _input_fraction(provider: str, model: str) -> float:

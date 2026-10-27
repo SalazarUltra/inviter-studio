@@ -11,10 +11,10 @@ from core.ai_writer import AIWriter
 from core.user_feedback import explain_error
 from ui.campaigns import show_report
 from ui.components import empty_state, page_intro, set_page_intro
-from ui.i18n import t
 from ui.dispatch import post_ui
 from ui.entry_utils import paste_text, setup_entry
 from ui.hints import hint, tip
+from ui.i18n import t
 from ui.theme import COLORS, FONTS, apply_button_role, init_fonts, style_card, style_tree
 
 
@@ -323,9 +323,7 @@ class TabAISettings(ctk.CTkFrame):
             cost_text = format_usd(total_cost, estimated=any_estimate, unknown=t("ai.cost_unknown"))
             if any_estimate:
                 cost_text = f"{cost_text} ({t('ai.cost_estimate_note', as_of=RATES_AS_OF)})"
-        self.total_label.configure(
-            text=t("ai.total_usage", tokens=f"{total_tokens:,}", cost=cost_text)
-        )
+        self.total_label.configure(text=t("ai.total_usage", tokens=f"{total_tokens:,}", cost=cost_text))
 
     def _build_config_card(self, parent, config: dict):
         is_active = bool(config.get("is_active"))

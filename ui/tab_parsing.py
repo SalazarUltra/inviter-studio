@@ -13,6 +13,7 @@ from telethon.errors import FloodWaitError
 from core import account_manager as account_core
 from core.account_display import account_headline, account_owner_tag
 from core.account_manager import AccountManager
+from core.bot_notify import BotNotifyError, bot_is_configured, send_document_to_bot
 from core.chat_authors import (
     MAX_HISTORY_MESSAGES,
     ChatAuthorsEngine,
@@ -20,7 +21,6 @@ from core.chat_authors import (
     history_period,
 )
 from core.database import is_flood_blocking, order_audience
-from core.bot_notify import BotNotifyError, bot_is_configured, send_document_to_bot
 from core.export import parsed_txt_content, txt_lines_with_ids, write_parsed
 from core.parse_compare import describe_difference, only_new, user_id_set
 from core.parser import (
@@ -73,9 +73,9 @@ TABLE_COLUMNS = (
 
 
 def _run_labels():
-    return {key: t(f"parsing.run.{key}") for key in (
-        "running", "completed", "partial", "failed", "stopped", "interrupted"
-    )}
+    return {
+        key: t(f"parsing.run.{key}") for key in ("running", "completed", "partial", "failed", "stopped", "interrupted")
+    }
 
 
 def _mode_map():
@@ -312,7 +312,12 @@ class ParsingTab(ctk.CTkFrame):
         )
         self.export_format.grid(row=0, column=1, padx=(0, 8))
         self.open_folder_button = ctk.CTkButton(
-            save_bar, text=t("parsing.open_folder"), width=140, height=34, state="disabled", command=self.open_saved_folder
+            save_bar,
+            text=t("parsing.open_folder"),
+            width=140,
+            height=34,
+            state="disabled",
+            command=self.open_saved_folder,
         )
         self.open_folder_button.grid(row=0, column=2, padx=(0, 8))
         self.send_bot_button = ctk.CTkButton(
@@ -384,9 +389,7 @@ class ParsingTab(ctk.CTkFrame):
         own.pack(fill="x", padx=16, pady=(0, 8))
         self.group_menu = ctk.CTkOptionMenu(own, values=[t("parsing.groups_first")], width=320)
         self.group_menu.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self.add_group_button = ctk.CTkButton(
-            own, text=t("parsing.add"), width=95, height=30, command=self.add_group
-        )
+        self.add_group_button = ctk.CTkButton(own, text=t("parsing.add"), width=95, height=30, command=self.add_group)
         self.add_group_button.pack(side="left")
         self.source_box = ctk.CTkTextbox(config, height=90, wrap="none", font=FONTS["body"])
         self.source_box.pack(fill="x", padx=16, pady=(0, 8))
@@ -502,13 +505,9 @@ class ParsingTab(ctk.CTkFrame):
         self.author_filters = ctk.CTkFrame(filters, fg_color="transparent")
         self.author_filters.pack(fill="x", padx=16, pady=(0, 8))
         self.author_filters.grid_columnconfigure((0, 1), weight=1)
-        self.min_msg_label = ctk.CTkLabel(
-            self.author_filters, text=t("parsing.min_msg_label"), font=FONTS["small"]
-        )
+        self.min_msg_label = ctk.CTkLabel(self.author_filters, text=t("parsing.min_msg_label"), font=FONTS["small"])
         self.min_msg_label.grid(row=0, column=0, sticky="w")
-        self.last_post_label = ctk.CTkLabel(
-            self.author_filters, text=t("parsing.last_post_label"), font=FONTS["small"]
-        )
+        self.last_post_label = ctk.CTkLabel(self.author_filters, text=t("parsing.last_post_label"), font=FONTS["small"])
         self.last_post_label.grid(row=0, column=1, sticky="w")
         self.min_messages_menu = ctk.CTkOptionMenu(
             self.author_filters,
@@ -651,9 +650,7 @@ class ParsingTab(ctk.CTkFrame):
         self.exclude_chat_check.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 6))
         self.exclude_chat_entry = ctk.CTkEntry(audience, placeholder_text=t("parsing.exclude_chat_ph"))
         self.exclude_chat_entry.grid(row=3, column=0, columnspan=2, sticky="ew")
-        self.delete_button = ctk.CTkButton(
-            export, text=t("parsing.delete_run"), width=170, command=self.delete_run
-        )
+        self.delete_button = ctk.CTkButton(export, text=t("parsing.delete_run"), width=170, command=self.delete_run)
         apply_button_role(self.delete_button, "danger")
         self.delete_button.pack(anchor="w", padx=16, pady=(0, 8))
         self.export_hint = hint(export, t("parsing.export_hint"))
@@ -940,9 +937,7 @@ class ParsingTab(ctk.CTkFrame):
 
     def multi_selection_changed(self):
         count = sum(1 for var in self.multi_vars.values() if var.get())
-        self.multi_hint.configure(
-            text=t("parsing.multi_hint", count=count) if count else t("parsing.multi_hint_empty")
-        )
+        self.multi_hint.configure(text=t("parsing.multi_hint", count=count) if count else t("parsing.multi_hint_empty"))
 
     async def selected_accounts(self):
         """Fresh, usable accounts ticked in the multi-account list (blocked ones are skipped with a note)."""
@@ -1020,11 +1015,7 @@ class ParsingTab(ctk.CTkFrame):
         if hasattr(warmup, "is_warming"):
             if warmup.is_warming(account_id):
                 return "Этот аккаунт сейчас на прогреве. Выберите другой аккаунт или остановите прогрев"
-        elif (
-            warmup.warmup_future
-            and not warmup.warmup_future.done()
-            and warmup.current_account_id == account_id
-        ):
+        elif warmup.warmup_future and not warmup.warmup_future.done() and warmup.current_account_id == account_id:
             return "Этот аккаунт сейчас на прогреве. Выберите другой аккаунт или остановите прогрев"
         account = next((row for row in self.accounts.values() if row["id"] == account_id), None)
         if account and account_core.AccountManager.is_session_busy(account["phone"], account.get("session_name")):
@@ -1243,9 +1234,7 @@ class ParsingTab(ctk.CTkFrame):
     def _run_finished(self, result):
         labels = _run_labels()
         self.status.configure(
-            text=labels.get(result["status"], result["status"])
-            + ": "
-            + (result["detail"] or t("parsing.saved_note")),
+            text=labels.get(result["status"], result["status"]) + ": " + (result["detail"] or t("parsing.saved_note")),
             text_color=COLORS["muted"],
         )
         self._results_loading = True
@@ -1677,9 +1666,7 @@ class ParsingTab(ctk.CTkFrame):
         )
         tip(self.limit_entry, t("parsing.limit_tip"))
         self.resume_button.configure(
-            text=t("parsing.resume_n", count=len(self._resume_pending))
-            if self._resume_pending
-            else t("parsing.resume")
+            text=t("parsing.resume_n", count=len(self._resume_pending)) if self._resume_pending else t("parsing.resume")
         )
         tip(self.resume_button, t("parsing.resume_tip"))
         self.compare_check.configure(text=t("parsing.compare"))

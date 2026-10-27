@@ -345,9 +345,9 @@ class TabDashboard(ctk.CTkFrame):
         total = len(data["accounts"])
         active = data["active_count"]
         flood = data["flood_count"]
-        ctk.CTkLabel(
-            self.card_accounts.content, text=str(total), font=FONTS["stat"], text_color=COLORS["text"]
-        ).pack(anchor="w")
+        ctk.CTkLabel(self.card_accounts.content, text=str(total), font=FONTS["stat"], text_color=COLORS["text"]).pack(
+            anchor="w"
+        )
         ctk.CTkLabel(
             self.card_accounts.content, text=t("dash.accounts_unit"), font=FONTS["small"], text_color=COLORS["muted"]
         ).pack(anchor="w", pady=(0, 6))
@@ -403,9 +403,9 @@ class TabDashboard(ctk.CTkFrame):
             w.destroy()
         sessions = data["warmup_sessions"]
         if not sessions:
-            ctk.CTkLabel(
-                self.card_warmup.content, text="—", font=FONTS["stat"], text_color=COLORS["muted"]
-            ).pack(anchor="w")
+            ctk.CTkLabel(self.card_warmup.content, text="—", font=FONTS["stat"], text_color=COLORS["muted"]).pack(
+                anchor="w"
+            )
             ctk.CTkLabel(
                 self.card_warmup.content, text=t("dash.warmup_off"), font=FONTS["small"], text_color=COLORS["muted"]
             ).pack(anchor="w")
@@ -431,9 +431,9 @@ class TabDashboard(ctk.CTkFrame):
         if data["total_ai_cost"] > 0:
             cost = data["total_ai_cost"]
             color = COLORS["success"] if cost < 0.01 else COLORS["warning"]
-            ctk.CTkLabel(
-                self.card_warmup.content, text=f"AI: ${cost:.4f}", font=FONTS["small"], text_color=color
-            ).pack(anchor="w", pady=(4, 0))
+            ctk.CTkLabel(self.card_warmup.content, text=f"AI: ${cost:.4f}", font=FONTS["small"], text_color=color).pack(
+                anchor="w", pady=(4, 0)
+            )
 
     def _update_progress(self, data: dict):
         stats = data["stats"]
