@@ -184,7 +184,8 @@ class FollowupStore:
             await db.commit()
             return dict(row) | {"state": "sending", "random_id": random_id}
 
-    async def finish_followup(self, username, state, message_id=None):
+    async def finish_followup(self, username, state, message_id=None, detail=None):
+        """Close a ``sending`` row. ``detail`` is an optional ``(action, text)`` log override."""
         if state not in {"sent", "blocked", "uncertain", "ready"}:
             raise ValueError("Неизвестный результат второго сообщения")
         async with connection() as db:
@@ -218,7 +219,7 @@ class FollowupStore:
                 ),
                 "ready": ("FOLLOWUP_WAIT", "Второе сообщение отложено из-за ограничений Telegram"),
             }
-            await note(db, row, *labels[state])
+            await note(db, row, *(detail or labels[state]))
             await db.commit()
 
     async def block_followup(self, username):

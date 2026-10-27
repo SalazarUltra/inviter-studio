@@ -6,6 +6,7 @@ from datetime import datetime
 import customtkinter as ctk
 
 from ui.artwork import studio_art
+from ui.conversion_panel import ConversionPanel
 from ui.dispatch import post_ui
 from ui.icons import icon
 from ui.tab_logs import display_log_message
@@ -177,6 +178,9 @@ class TabDashboard(ctk.CTkFrame):
         ):
             self.recent_log.tag_config(tag, foreground=color)
 
+        self.conversion = ConversionPanel(content, self.app)
+        self.conversion.pack(fill="x", padx=18, pady=(0, 20))
+
     def _resize_hero(self, event):
         if event.widget is not self:
             return
@@ -296,6 +300,7 @@ class TabDashboard(ctk.CTkFrame):
         self._update_progress(data)
         self._update_accounts_list(data["accounts"], data["campaign_kind"])
         self._update_recent_log(data["logs"])
+        self.conversion.tick()
         style_tree(self)
 
     def _update_accounts_card(self, data: dict):

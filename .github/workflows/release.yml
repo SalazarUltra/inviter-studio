@@ -1,0 +1,204 @@
+name: Release
+
+# Portable release: InviterStudioPortable.zip + SHA256.txt on a GitHub Release.
+# No code signing and no signing secrets: INVITER_SIGNING_THUMBPRINT is left unset,
+# so tools/build_windows.py builds an unsigned package.
+#
+# Trigger:
+#   - push a tag `v1.2.24` (must equal core/version.py VERSION), or
+#   - run manually (workflow_dispatch) and type the version, e.g. `1.2.24`;
+#     the tag `v<version>` is then created on the selected commit.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version without the leading v (must match core/version.py), e.g. 1.2.24"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark the GitHub Release as pre-release"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.14"
+  PYTHONUTF8: "1"
+  # Unsigned build: make sure no signing configuration leaks in.
+  INVITER_SIGNING_THUMBPRINT: ""
+
+jobs:
+  build:
+    name: Quality checks and portable build
+    runs-on: windows-latest
+    # PyInstaller onedir + zip on a cold runner can be slow; be generous.
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements-lock.txt
+            requirements-build.txt
+
+      - name: Resolve and verify version
+        id: version
+        shell: pwsh
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+            $requested = $env:INPUT_VERSION
+          } else {
+            $requested = $env:GITHUB_REF_NAME
+          }
+          $requested = $requested.Trim() -replace '^v', ''
+          if ($requested -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Version '$requested' is not in MAJOR.MINOR.PATCH form."
+          }
+          $actual = (python -c "from core.version import VERSION; print(VERSION)").Trim()
+          if ($actual -ne $requested) {
+            throw "Release version '$requested' does not match core/version.py VERSION '$actual'. Bump core/version.py first."
+          }
+          "version=$requested" >> $env:GITHUB_OUTPUT
+          Write-Host "Releasing $requested"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-lock.txt -r requirements-build.txt ruff==0.17.0
+
+      # Same gate as ci.yml / tools/check_quality.ps1.
+      - name: Lint
+        run: ruff check core ui tests tools
+      - name: Formatting
+        run: ruff format --check core ui tests tools
+      - name: Compile
+        run: python -m compileall -q core ui tests tools
+      - name: Unit tests
+        run: python -m unittest discover -s tests -t .
+      - name: Dependency consistency
+        run: pip check
+
+      - name: Build portable package
+        run: python -m tools.build_windows
+
+      - name: Locate and verify artifacts
+        id: artifacts
+        shell: pwsh
+        run: |
+          # The handoff folder name lives in tools.distribution (non-ASCII), resolve it from Python.
+          $handoff = (python -c "from tools.distribution import HANDOFF_NAME; print(HANDOFF_NAME)").Trim()
+          $dir = Join-Path $env:GITHUB_WORKSPACE $handoff
+          $zip = Join-Path $dir 'InviterStudioPortable.zip'
+          $sha = Join-Path $dir 'SHA256.txt'
+          foreach ($file in @($zip, $sha)) {
+            if (-not (Test-Path -LiteralPath $file)) { throw "Missing build artifact: $file" }
+          }
+
+          $expected = ((Get-Content -LiteralPath $sha -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
+          $actual = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($expected -ne $actual) { throw "SHA256 mismatch: file says $expected, zip is $actual" }
+
+          # Sanity checks on the ZIP content: app present, no user data.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($zip)
+          try {
+            $names = $archive.Entries | ForEach-Object { $_.FullName }
+          } finally {
+            $archive.Dispose()
+          }
+          foreach ($required in 'InviterStudio.exe', 'start.bat', 'update.bat') {
+            if (-not ($names | Where-Object { $_ -like "*/$required" -or $_ -eq $required })) {
+              throw "ZIP does not contain $required"
+            }
+          }
+          $forbidden = $names | Where-Object { $_ -match '(^|/)(profile|data|sessions|backups|\.audit|\.git)/' -or $_ -match '\.session|\.db($|-wal$|-shm$)|(^|/)\.env' }
+          if ($forbidden) { throw "ZIP contains user data: $($forbidden -join ', ')" }
+
+          $size = [math]::Round((Get-Item -LiteralPath $zip).Length / 1MB, 1)
+          Write-Host "InviterStudioPortable.zip: $size MB, sha256 $actual"
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+
+      - name: Extract release notes from CHANGELOG.md
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ZIP_PATH: ${{ steps.artifacts.outputs.zip }}
+          SHA_PATH: ${{ steps.artifacts.outputs.sha }}
+        run: |
+          $text = Get-Content -LiteralPath CHANGELOG.md -Raw -Encoding UTF8
+          $pattern = '(?ms)^## \[' + [regex]::Escape($env:VERSION) + '\][^\r\n]*\r?\n(.*?)(?=^## \[|^\[[^\]]+\]:\s|\z)'
+          $match = [regex]::Match($text, $pattern)
+          if ($match.Success -and $match.Groups[1].Value.Trim()) {
+            $body = $match.Groups[1].Value.Trim()
+          } else {
+            Write-Warning "No CHANGELOG.md section for $($env:VERSION); using a generic note."
+            $body = "Inviter Studio $($env:VERSION). См. CHANGELOG.md."
+          }
+          $footer = @(
+            '',
+            '',
+            '---',
+            '**Установка:** скачайте `InviterStudioPortable.zip`, сверьте SHA-256 с `SHA256.txt`, распакуйте целиком и запустите `start.bat`.',
+            'Сборка **не подписана** — Windows SmartScreen / Smart App Control может предупредить (см. README).'
+          ) -join "`n"
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          Copy-Item -LiteralPath $env:ZIP_PATH, $env:SHA_PATH -Destination release-assets
+          ($body + $footer) | Set-Content -LiteralPath release-assets/release-notes.md -Encoding UTF8
+          Get-ChildItem release-assets
+          Get-Content -LiteralPath release-assets/release-notes.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: portable-${{ steps.version.outputs.version }}
+          if-no-files-found: error
+          retention-days: 14
+          path: release-assets/*
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: portable-${{ needs.build.outputs.version }}
+          path: release
+
+      - name: List assets
+        run: |
+          ls -la release
+          cat release/SHA256.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.build.outputs.version }}
+          # For workflow_dispatch the tag is created on this commit; for tag pushes it already exists.
+          target_commitish: ${{ github.sha }}
+          name: Inviter Studio ${{ needs.build.outputs.version }}
+          body_path: release/release-notes.md
+          prerelease: ${{ github.event.inputs.prerelease == 'true' }}
+          fail_on_unmatched_files: true
+          files: |
+            release/InviterStudioPortable.zip
+            release/SHA256.txt

@@ -1053,7 +1053,7 @@ class ParsingTab(ctk.CTkFrame):
             self.status.configure(text="Проверьте адреса и числовой лимит: " + str(exc), text_color=COLORS["error"])
             return
 
-        multi = self.multi_mode() and not authors  # authors mode always reads with the single selected account
+        multi = self.multi_mode()
 
         async def collect():
             account = await self.selected_accounts() if multi else await self.selected_account()

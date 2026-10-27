@@ -9,7 +9,15 @@ from telethon.tl.functions.messages import GetHistoryRequest
 from telethon.tl.types import Channel, Chat, Message, PeerUser, User
 
 from core.account_manager import AccountManager
-from core.parser import ACCOUNT_ERRORS, MAX_RUN_RECORDS, MAX_SOURCES, ParserEngine, access_error, member_row
+from core.parser import (
+    ACCOUNT_ERRORS,
+    MAX_RUN_RECORDS,
+    MAX_SOURCES,
+    ParserEngine,
+    _account_list,
+    access_error,
+    member_row,
+)
 
 MAX_HISTORY_MESSAGES = 10000
 PERIOD_CHOICES = {
@@ -114,6 +122,7 @@ class ChatAuthorsEngine(ParserEngine):
             await manager.disconnect()
 
     async def start(self, account, sources, limit, *, since=None, until=None):
+        """Read authors. `account` is one account dict, or a list: sources are then shared between accounts."""
         if not 1 <= limit <= MAX_HISTORY_MESSAGES or not 1 <= len(sources) <= MAX_SOURCES:
             raise ValueError("Укажите до 10 источников и от 1 до 10000 сообщений на источник")
         if any(
@@ -123,152 +132,153 @@ class ChatAuthorsEngine(ParserEngine):
         since, until = utc(since) if since else None, utc(until) if until else None
         if since and until and since >= until:
             raise ValueError("Начало периода должно быть раньше конца")
-        self._task, self.run_id = asyncio.current_task(), None
-        manager = AccountManager(account, self.db)
-        outcome, detail, budget, successful, saved = "completed", "", MAX_RUN_RECORDS, 0, 0
-        seen_sources = set()
+        return await self._run(_account_list(account), sources, limit, since=since, until=until)
+
+    def _new_manager(self, account):
+        return AccountManager(account, self.db)
+
+    @staticmethod
+    def _record_budget():
+        return MAX_RUN_RECORDS  # viewed messages, not stored people
+
+    async def resume(self, account, run_id):
+        raise ValueError("Продолжить можно только сохранённое получение участников")
+
+    async def _create_run(self, accounts, sources, ctx):
+        since, until = ctx.options.get("since"), ctx.options.get("until")
+        return await self.db.create_parse_run(
+            accounts[0]["id"],
+            sources,
+            mode="authors",
+            since=since.isoformat() if since else None,
+            until=until.isoformat() if until else None,
+            scan_limit=ctx.limit,
+        )
+
+    async def _process_source(self, manager, account, reference, own, ctx):
+        """Read the history of one source. «ok» continues this account's loop; anything else stops it."""
+        since, until = ctx.options.get("since"), ctx.options.get("until")
+        info, count, reserved, source_id = {}, 0, 0, None
         try:
-            self.run_id = await self.db.create_parse_run(
-                account["id"],
-                sources,
-                mode="authors",
-                since=since.isoformat() if since else None,
-                until=until.isoformat() if until else None,
-                scan_limit=limit,
-            )
-            await manager.connect()
-            for reference in sources:
-                info, count = {}, 0
-                try:
-                    entity, info, _ = await self.open_source(manager.client, reference)
-                    if info["source_id"] in seen_sources:
+            # Several accounts reserve from one message budget: wait while it is fully reserved elsewhere.
+            while ctx.budget <= 0 and ctx.outstanding > 0:
+                await asyncio.sleep(0.2)
+            entity, info, _ = await self.open_source(manager.client, reference)
+            source_id = info["source_id"]
+            if source_id in ctx.seen_sources:
+                return "ok"
+            ctx.seen_sources.add(source_id)
+            await self.db.save_parse_source(self.run_id, str(reference), info, "running", "Чтение доступной истории")
+            cap, cursor, messages_seen, people = min(ctx.limit, ctx.budget), 0, set(), {}
+            reserved = cap
+            ctx.budget -= reserved
+            ctx.outstanding += reserved
+            reason, excluded, found = "", 0, 0
+            while count < cap:
+                response = await asyncio.wait_for(
+                    manager.client(history_request(entity, cursor, min(100, cap - count), until)), 30
+                )
+                messages = response.messages
+                if not messages:
+                    reason = "Достигнут конец доступной истории."
+                    break
+                users = {user.id: user for user in response.users if isinstance(user, User)}
+                changed, reached_start, fresh = set(), False, 0
+                for message in messages[: cap - count]:
+                    message_id = getattr(message, "id", 0)
+                    if message_id <= 0 or message_id in messages_seen or cursor and message_id >= cursor:
                         continue
-                    seen_sources.add(info["source_id"])
-                    await self.db.save_parse_source(
-                        self.run_id, str(reference), info, "running", "Чтение доступной истории"
+                    messages_seen.add(message_id)
+                    fresh += 1
+                    stamp = utc(message.date) if getattr(message, "date", None) else None
+                    if stamp and since and stamp < since:
+                        reached_start = True
+                    if not stamp or since and stamp < since or until and stamp >= until:
+                        continue
+                    if not isinstance(message, Message) or not isinstance(message.from_id, PeerUser):
+                        excluded += 1
+                        continue
+                    user_id = message.from_id.user_id
+                    profile = member_row(users.get(user_id) or User(id=user_id), None, info["source_id"])
+                    if profile is None:
+                        excluded += 1
+                        continue
+                    profile["role"] = "unknown"
+                    person = people.setdefault(
+                        user_id,
+                        {
+                            **profile,
+                            "message_count": 0,
+                            "first_message_at": stamp.isoformat(),
+                            "last_message_at": stamp.isoformat(),
+                        },
                     )
-                    cap, cursor, messages_seen, people = min(limit, budget), 0, set(), {}
-                    reason, excluded, found = "", 0, 0
-                    while count < cap:
-                        response = await asyncio.wait_for(
-                            manager.client(history_request(entity, cursor, min(100, cap - count), until)), 30
-                        )
-                        messages = response.messages
-                        if not messages:
-                            reason = "Достигнут конец доступной истории."
-                            break
-                        users = {user.id: user for user in response.users if isinstance(user, User)}
-                        changed, reached_start, fresh = set(), False, 0
-                        for message in messages[: cap - count]:
-                            message_id = getattr(message, "id", 0)
-                            if message_id <= 0 or message_id in messages_seen or cursor and message_id >= cursor:
-                                continue
-                            messages_seen.add(message_id)
-                            fresh += 1
-                            stamp = utc(message.date) if getattr(message, "date", None) else None
-                            if stamp and since and stamp < since:
-                                reached_start = True
-                            if not stamp or since and stamp < since or until and stamp >= until:
-                                continue
-                            if not isinstance(message, Message) or not isinstance(message.from_id, PeerUser):
-                                excluded += 1
-                                continue
-                            user_id = message.from_id.user_id
-                            profile = member_row(users.get(user_id) or User(id=user_id), None, info["source_id"])
-                            if profile is None:
-                                excluded += 1
-                                continue
-                            profile["role"] = "unknown"
-                            person = people.setdefault(
-                                user_id,
-                                {
-                                    **profile,
-                                    "message_count": 0,
-                                    "first_message_at": stamp.isoformat(),
-                                    "last_message_at": stamp.isoformat(),
-                                },
-                            )
-                            # Upgrade missing profile information if a later page includes it.
-                            for field in ("username", "first_name", "last_name"):
-                                if not person[field]:
-                                    person[field] = profile[field]
-                            for field in (
-                                "is_bot",
-                                "is_deleted",
-                                "is_premium",
-                                "has_photo",
-                                "scam",
-                                "fake",
-                                "restricted",
-                                "contact_require_premium",
-                            ):
-                                person[field] = person[field] or profile[field]
-                            if profile["activity"] != "unknown":
-                                person["activity"], person["last_seen"] = profile["activity"], profile["last_seen"]
-                            person["message_count"] += 1
-                            person["first_message_at"] = min(person["first_message_at"], stamp.isoformat())
-                            person["last_message_at"] = max(person["last_message_at"], stamp.isoformat())
-                            changed.add(user_id)
-                            found += 1
-                        count += fresh
-                        budget -= fresh
-                        await self.db.save_parsed_authors(
-                            self.run_id, [people[key] for key in changed], str(reference), count
-                        )
-                        saved += len(changed)
-                        self.progress(f"{info['title']}: просмотрено {count} сообщений, найдено {len(people)} авторов")
-                        if reached_start:
-                            reason = "Достигнуто начало выбранного периода."
-                            break
-                        next_cursor = min(
-                            (getattr(message, "id", 0) for message in messages if getattr(message, "id", 0) > 0),
-                            default=0,
-                        )
-                        if not fresh or not next_cursor or cursor and next_cursor >= cursor:
-                            reason = "Telegram повторил страницу истории; полученная часть сохранена."
-                            outcome = "partial"
-                            break
-                        cursor = next_cursor
-                        if count < cap:
-                            await asyncio.sleep(0.5)
-                    partial = not reason or "повторил" in reason
-                    reason = reason or "Достигнут лимит сообщений; период мог быть просмотрен не полностью."
-                    source_detail = f"{reason} Сообщений от найденных людей: {found}; служебных/анонимных/своих пропущено: {excluded}. Это авторы доступных сообщений, не список текущих участников."
-                    await self.db.save_parse_source(
-                        self.run_id, str(reference), info, "partial" if partial else "completed", source_detail, count
-                    )
-                    successful += 1
-                    if partial:
-                        outcome = "partial"
-                except (FloodWaitError, *ACCOUNT_ERRORS) as exc:
-                    if isinstance(exc, FloodWaitError):
-                        await self.db.set_flood_wait(account["id"], exc.seconds)
-                    detail = access_error(exc)
-                    await self.db.save_parse_source(self.run_id, str(reference), info, "failed", detail, count)
-                    outcome = "partial" if successful or saved else "failed"
+                    # Upgrade missing profile information if a later page includes it.
+                    for field in ("username", "first_name", "last_name"):
+                        if not person[field]:
+                            person[field] = profile[field]
+                    for field in (
+                        "is_bot",
+                        "is_deleted",
+                        "is_premium",
+                        "has_photo",
+                        "scam",
+                        "fake",
+                        "restricted",
+                        "contact_require_premium",
+                    ):
+                        person[field] = person[field] or profile[field]
+                    if profile["activity"] != "unknown":
+                        person["activity"], person["last_seen"] = profile["activity"], profile["last_seen"]
+                    person["message_count"] += 1
+                    person["first_message_at"] = min(person["first_message_at"], stamp.isoformat())
+                    person["last_message_at"] = max(person["last_message_at"], stamp.isoformat())
+                    changed.add(user_id)
+                    found += 1
+                count += fresh
+                await self.db.save_parsed_authors(self.run_id, [people[key] for key in changed], str(reference), count)
+                ctx.collected += len(changed)
+                self.progress(f"{info['title']}: просмотрено {count} сообщений, найдено {len(people)} авторов")
+                if reached_start:
+                    reason = "Достигнуто начало выбранного периода."
                     break
-                except (ValueError, RPCError, asyncio.TimeoutError, ConnectionError, OSError) as exc:
-                    detail = access_error(exc)
-                    await self.db.save_parse_source(self.run_id, str(reference), info, "failed", detail, count)
-                    outcome = "partial"
-                    self.progress(detail)
-                if budget <= 0:
-                    outcome, detail = (
-                        "partial",
-                        "Достигнут общий предел 20000 просмотренных сообщений; остальные источники не запрашивались.",
-                    )
+                next_cursor = min(
+                    (getattr(message, "id", 0) for message in messages if getattr(message, "id", 0) > 0),
+                    default=0,
+                )
+                if not fresh or not next_cursor or cursor and next_cursor >= cursor:
+                    reason = "Telegram повторил страницу истории; полученная часть сохранена."
+                    ctx.outcome = "partial"
                     break
-            if not successful and not saved:
-                outcome = "failed"
-        except asyncio.CancelledError:
-            outcome, detail = "stopped", "Остановлено. Уже найденные авторы и их счётчики сохранены."
-        except Exception as exc:
-            outcome, detail = "partial" if saved else "failed", access_error(exc)
+                cursor = next_cursor
+                if count < cap:
+                    await asyncio.sleep(0.5)
+            partial = not reason or "повторил" in reason
+            reason = reason or "Достигнут лимит сообщений; период мог быть просмотрен не полностью."
+            source_detail = f"{reason} Сообщений от найденных людей: {found}; служебных/анонимных/своих пропущено: {excluded}. Это авторы доступных сообщений, не список текущих участников."
+            await self.db.save_parse_source(
+                self.run_id, str(reference), info, "partial" if partial else "completed", source_detail, count
+            )
+            ctx.successful += 1
+            if partial:
+                ctx.outcome = "partial"
+        except FloodWaitError as exc:
+            await self.db.set_flood_wait(account["id"], exc.seconds)
+            return await self._account_limited(account, reference, source_id, own, exc, ctx)
+        except ACCOUNT_ERRORS as exc:
+            return await self._account_limited(account, reference, source_id, own, exc, ctx)
+        except (ValueError, RPCError, asyncio.TimeoutError, ConnectionError, OSError) as exc:
+            ctx.detail = access_error(exc)
+            await self.db.save_parse_source(self.run_id, str(reference), info, "failed", ctx.detail, count)
+            ctx.outcome = "partial"
+            self.progress(ctx.detail)
         finally:
-            try:
-                await manager.disconnect()
-            finally:
-                if self.run_id is not None:
-                    await self.db.finish_parse_run(self.run_id, outcome, detail)
-                self._task = None
-        return {"run_id": self.run_id, "status": outcome, "detail": detail}
+            # Messages really read stay spent; the unused part of the reservation goes back to the shared budget.
+            ctx.outstanding -= reserved
+            ctx.budget += max(0, reserved - count)
+        if ctx.budget <= 0 and ctx.outstanding <= 0:
+            ctx.outcome = "partial"
+            ctx.detail = "Достигнут общий предел 20000 просмотренных сообщений; остальные источники не запрашивались."
+            ctx.stop = True
+            return "budget"
+        return "ok"

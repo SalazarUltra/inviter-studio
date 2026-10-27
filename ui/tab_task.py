@@ -6,6 +6,7 @@ from tkinter import messagebox
 
 import customtkinter as ctk
 
+from core.ab_test import DEFAULT_SPLIT_A, normalize_split, planned_split, split_label
 from core.database import Database
 from core.diagnostics import estimate_messages_eta, format_report, message_usage_today, preflight
 from core.inviter import describe_next_available
@@ -13,14 +14,12 @@ from core.message_template import SAMPLE_NAME, has_placeholders, preview_message
 from core.messenger import send_test_message
 from core.pacing import (
     PACE_KEYS,
-    PACE_LABELS,
     aggressive_warnings,
     daily_cap_status,
     describe_skipped_warmup,
     detect_preset,
     format_warning_block,
     gate_accounts,
-    pace_label,
     parse_daily_cap,
     preset_values,
     split_warmup_ready,
@@ -53,10 +52,18 @@ from ui.components import page_intro
 from ui.dispatch import post_ui
 from ui.entry_utils import paste_text, setup_entry
 from ui.hints import hint, tip, wrap_label
+from ui.i18n import t
+from ui.queue_picker import QueuePicker
 from ui.task_recipients import TaskRecipients
 from ui.template_dialog import TemplateDialog
 from ui.theme import COLORS, FONTS, UI, apply_button_role, init_fonts, style_card, style_tree
 
+SECTION_KEYS = (
+    "task.sections.recipients",
+    "task.sections.message",
+    "task.sections.accounts",
+    "task.sections.review",
+)
 INVITE_ORDER_CHOICES = {"Перемешивать": "shuffle", "Как в списке": "as_is"}
 
 
@@ -113,9 +120,11 @@ class TaskTab(ctk.CTkFrame):
         sections = ctk.CTkFrame(self, fg_color="transparent")
         sections.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 8))
         CampaignBar(sections).pack(fill="x", pady=(0, 6))
+        QueuePicker(sections).pack(fill="x", pady=(0, 6))
         section_links = ctk.CTkFrame(sections, fg_color="transparent")
         section_links.pack(fill="x")
-        for index, title in enumerate(("Получатели", "Сообщение / чат", "Аккаунты и темп", "Проверка")):
+        for index, title_key in enumerate(SECTION_KEYS):
+            title = t(title_key)
             button = ctk.CTkButton(
                 section_links,
                 text=f"{index + 1:02}  {title}",
@@ -140,31 +149,31 @@ class TaskTab(ctk.CTkFrame):
         self._footer_actions = actions
         actions.pack(fill="x", pady=(0, 6))
         self.back_btn = ctk.CTkButton(
-            buttons, text="Назад", width=90, height=UI["btn_h_lg"], command=lambda: self._scroll_section(self._step - 1)
+            buttons,
+            text=t("btn.back"),
+            width=90,
+            height=UI["btn_h_lg"],
+            command=lambda: self._scroll_section(self._step - 1),
         )
         apply_button_role(self.back_btn, "secondary")
         self.back_btn.pack(side="left", padx=(0, 6))
-        for title, command in (
-            ("Предпросмотр", lambda: self.check_task(False)),
-            ("Проверить подключение", lambda: self.check_task(True)),
-            ("Сохранить настройки", self.save_settings),
+        self._action_keys = []
+        for key, command in (
+            ("preview", lambda: self.check_task(False)),
+            ("check", lambda: self.check_task(True)),
+            ("save", self.save_settings),
         ):
-            button = ctk.CTkButton(actions, text=title, height=30, width=155, command=command)
+            label_key = "btn.save" if key == "save" else f"task.{key}"
+            button = ctk.CTkButton(actions, text=t(label_key), height=30, width=155, command=command)
             self._task_action_buttons.append(button)
+            self._action_keys.append((key, label_key))
             apply_button_role(button, "secondary")
             button.pack(side="left", padx=(0, 6))
-            tip(
-                button,
-                {
-                    "Предпросмотр": "Проверка настроек и очереди без подключения к Telegram. Ничего не отправляет.",
-                    "Проверить подключение": "Проверяет сессии, прокси и для приглашений — права в чате. Ничего не отправляет.",
-                    "Сохранить настройки": "Сохранить параметры выбранной кампании для следующего запуска. Текст сообщения сохраняется автоматически.",
-                }[title],
-            )
+            tip(button, t(f"task.{key}_tip"))
         buttons.pack(fill="x", pady=(0, 8))
         self.start_btn = ctk.CTkButton(
             buttons,
-            text="Запустить задачу",
+            text=t("btn.start"),
             height=UI["btn_h_lg"],
             corner_radius=12,
             font=FONTS["heading"],
@@ -173,7 +182,7 @@ class TaskTab(ctk.CTkFrame):
         self.start_btn.pack(side="left", fill="x", expand=True)
         self.pause_btn = ctk.CTkButton(
             buttons,
-            text="Пауза",
+            text=t("btn.pause"),
             height=UI["btn_h_lg"],
             corner_radius=12,
             font=FONTS["heading"],
@@ -182,7 +191,7 @@ class TaskTab(ctk.CTkFrame):
         self.pause_btn.pack(side="left", fill="x", expand=True, padx=8)
         self.stop_btn = ctk.CTkButton(
             buttons,
-            text="Остановить",
+            text=t("btn.stop"),
             height=UI["btn_h_lg"],
             corner_radius=12,
             font=FONTS["heading"],
@@ -192,12 +201,9 @@ class TaskTab(ctk.CTkFrame):
         apply_button_role(self.start_btn, "primary")
         apply_button_role(self.pause_btn, "accent-line")
         apply_button_role(self.stop_btn, "danger")
-        tip(self.start_btn, "Начать реальные сообщения или приглашения выбранной кампании после проверки подключения.")
-        tip(self.pause_btn, "Приостановить следующие действия. Для возобновления нажмите «Продолжить».")
-        tip(
-            self.stop_btn,
-            "Завершить текущую задачу. Ожидающие остаются в очереди; уже отправленный запрос может завершиться.",
-        )
+        tip(self.start_btn, t("task.start_tip"))
+        tip(self.pause_btn, t("task.pause_tip"))
+        tip(self.stop_btn, t("task.stop_tip"))
 
         progress_frame = ctk.CTkFrame(footer, fg_color="transparent")
         self._progress_frame = progress_frame
@@ -339,7 +345,7 @@ class TaskTab(ctk.CTkFrame):
             self._account_labels.get(key, str(key)) for key, var in self.account_vars.items() if var.get()
         ]
         lines.insert(3, "Аккаунты: " + (", ".join(selected_names) or "не выбраны"))
-        lines.insert(5, "Темп: " + pace_label(self.current_pace()))
+        lines.insert(5, t("task.pace_label", name=t(f"pace.{self.current_pace()}")))
         try:
             cap = parse_daily_cap(self.daily_cap_entry.get())
         except ValueError:
@@ -364,6 +370,8 @@ class TaskTab(ctk.CTkFrame):
             if eta:
                 lines.extend(["", eta])
             lines.extend(["", "Первое сообщение:", self.message_box.get("1.0", "end-1c") or "Не заполнено"])
+            if self.ab_enabled.get():
+                lines.extend(self._ab_review_lines())
             if self.followup_enabled.get():
                 lines.extend(
                     [
@@ -396,6 +404,20 @@ class TaskTab(ctk.CTkFrame):
         self.review_box.insert("1.0", text)
         self.review_box.yview_moveto(position)
         self.review_box.configure(state="disabled")
+
+    def _ab_review_lines(self) -> list[str]:
+        """Review block for an enabled A/B test: split, planned recipient counts and the B text."""
+        try:
+            split = normalize_split(self.ab_split_entry.get())
+        except ValueError as exc:
+            return ["", "A/B-тест: " + str(exc)]
+        lines = ["", f"A/B-тест текста: {split_label(split)}. Текст выше — вариант A."]
+        pending = [row["username"] for row in (self.recipients.expected or []) if row.get("username")]
+        if pending:
+            counts = planned_split(pending, split, salt=str(self.db.campaign_id))
+            lines.append(f"Из {len(pending)} в очереди: вариант A — {counts['A']}, вариант B — {counts['B']}")
+        lines.extend(["", "Вариант B:", self.ab_box.get("1.0", "end-1c") or "Не заполнено"])
+        return lines
 
     def _used_today(self, account: dict) -> int:
         if self.operation_mode() == "messages":
@@ -557,7 +579,7 @@ class TaskTab(ctk.CTkFrame):
             f"Показать текст так, как увидит получатель по имени «{SAMPLE_NAME}». Ничего не отправляется.",
         )
         self.test_message_btn = ctk.CTkButton(
-            preview_row, text="Тест в Избранное", width=150, height=28, command=self.send_test_to_saved
+            preview_row, text=t("task.test_saved_btn"), width=150, height=28, command=self.send_test_to_saved
         )
         apply_button_role(self.test_message_btn, "accent-line")
         self.test_message_btn.pack(side="left")
@@ -577,6 +599,50 @@ class TaskTab(ctk.CTkFrame):
         )
         wrap_label(self.preview_label)
         self.preview_label.pack(fill="x", padx=16, pady=(0, 8))
+        self.ab_enabled = ctk.BooleanVar(value=False)
+        self.ab_switch = ctk.CTkSwitch(
+            self.message_frame,
+            text="A/B-тест: второй вариант первого сообщения",
+            variable=self.ab_enabled,
+            command=self.toggle_ab,
+        )
+        self.ab_switch.pack(anchor="w", padx=16, pady=(4, 8))
+        tip(
+            self.ab_switch,
+            "Каждый получатель стабильно попадает в вариант A или B (по хэшу никнейма). "
+            "Какой текст ушёл, сохраняется в журнале отправок; сравнение — на вкладке «Аудитория».",
+        )
+        self.ab_frame = ctk.CTkFrame(self.message_frame, fg_color="transparent")
+        ab_header = ctk.CTkFrame(self.ab_frame, fg_color="transparent")
+        ab_header.pack(fill="x", padx=16)
+        ctk.CTkLabel(ab_header, text="Текст B (текст A — поле «Первое сообщение» выше)", font=FONTS["small"]).pack(
+            side="left"
+        )
+        self.ab_counter = ctk.CTkLabel(ab_header, text="0 / 4096", font=FONTS["small"])
+        self.ab_counter.pack(side="left", padx=8)
+        self.paste_ab_btn = ctk.CTkButton(
+            ab_header, text="Вставить", width=100, height=28, command=lambda: paste_text(self.ab_box)
+        )
+        apply_button_role(self.paste_ab_btn, "secondary")
+        self.paste_ab_btn.pack(side="right")
+        self.ab_box = ctk.CTkTextbox(self.ab_frame, height=125, wrap="word", font=FONTS["body"])
+        self.ab_box.pack(fill="x", padx=16, pady=(6, 8))
+        self.ab_box.bind("<<Modified>>", self._message_modified, add="+")
+        ab_split_row = ctk.CTkFrame(self.ab_frame, fg_color="transparent")
+        ab_split_row.pack(fill="x", padx=16, pady=(0, 4))
+        ctk.CTkLabel(ab_split_row, text="Доля варианта A, %", font=FONTS["body"]).pack(side="left")
+        self.ab_split_entry = ctk.CTkEntry(ab_split_row, width=70, height=32)
+        setup_entry(self.ab_split_entry)
+        self.ab_split_entry.insert(0, str(DEFAULT_SPLIT_A))
+        self.ab_split_entry.pack(side="left", padx=(8, 8))
+        self.ab_split_entry.bind("<KeyRelease>", self._ab_split_changed, add="+")
+        self.ab_split_label = ctk.CTkLabel(ab_split_row, text="", font=FONTS["small"], text_color=COLORS["muted"])
+        self.ab_split_label.pack(side="left")
+        hint(
+            self.ab_frame,
+            "1–99. Остальным уходит вариант B. Подстановки {имя} и {а|б} работают в обоих текстах. "
+            "Если включить второе сообщение, ответы считаются отдельно для A и B.",
+        )
         self.followup_enabled = ctk.BooleanVar(value=False)
         self.followup_switch = ctk.CTkSwitch(
             self.message_frame,
@@ -637,12 +703,13 @@ class TaskTab(ctk.CTkFrame):
         interval_block = self._block("Интервал между действиями")
         pace_row = ctk.CTkFrame(interval_block, fg_color="transparent")
         pace_row.pack(fill="x", padx=UI["space_4"], pady=(0, UI["space_2"]))
-        ctk.CTkLabel(pace_row, text="Темп:", font=FONTS["body"]).pack(side="left", padx=(0, 8))
+        self.pace_caption = ctk.CTkLabel(pace_row, text=t("task.pace"), font=FONTS["body"])
+        self.pace_caption.pack(side="left", padx=(0, 8))
         self.pace_buttons: dict[str, ctk.CTkButton] = {}
         for key in PACE_KEYS:
             button = ctk.CTkButton(
                 pace_row,
-                text=PACE_LABELS[key],
+                text=t(f"pace.{key}"),
                 width=110,
                 height=30,
                 command=lambda value=key: self.apply_pace_preset(value),
@@ -650,16 +717,14 @@ class TaskTab(ctk.CTkFrame):
             apply_button_role(button, "secondary")
             button.pack(side="left", padx=(0, 6))
             self.pace_buttons[key] = button
-        tip(
-            self.pace_buttons["safe"],
-            "Редкие действия и частые перерывы: самый низкий риск ограничений. Заполняет интервал и перерывы.",
+        for key, button in self.pace_buttons.items():
+            tip(button, t(f"task.pace_{key}_tip"))
+        self.pace_label = ctk.CTkLabel(
+            pace_row,
+            text=t("task.pace_selected", name=t("pace.custom")),
+            font=FONTS["small"],
+            text_color=COLORS["muted"],
         )
-        tip(self.pace_buttons["normal"], "Рекомендуемый баланс скорости и безопасности. Заполняет интервал и перерывы.")
-        tip(
-            self.pace_buttons["fast"],
-            "Быстрее, но выше риск PeerFlood и ограничений аккаунта. Заполняет интервал и перерывы.",
-        )
-        self.pace_label = ctk.CTkLabel(pace_row, text="Выбрано: Свой", font=FONTS["small"], text_color=COLORS["muted"])
         self.pace_label.pack(side="left", padx=(6, 0))
         self.pace_warning = hint(interval_block, "")
         self.pace_warning.configure(text_color=COLORS["error"])
@@ -1201,6 +1266,10 @@ class TaskTab(ctk.CTkFrame):
                 widget.configure(state=input_state)
         followup_state = "disabled" if running or self._starting else "normal"
         for widget in (
+            self.ab_switch,
+            self.ab_box,
+            self.paste_ab_btn,
+            self.ab_split_entry,
             self.followup_switch,
             self.followup_box,
             self.paste_followup_btn,
@@ -1217,27 +1286,28 @@ class TaskTab(ctk.CTkFrame):
         if running:
             self.start_btn.configure(
                 state="disabled",
-                text="Задача на паузе" if paused else "Задача запущена",
+                text=t("task.paused") if paused else t("task.running"),
             )
-            self.pause_btn.configure(state="normal", text="Продолжить" if paused else "Пауза")
+            self.pause_btn.configure(state="normal", text=t("btn.resume") if paused else t("btn.pause"))
             self.stop_btn.configure(state="normal")
         else:
             self.start_btn.configure(
                 state="disabled" if self._starting else "normal",
-                text="Проверяем перед запуском..."
+                text=t("task.starting")
                 if self._starting
                 else (
-                    ("Далее: сообщение / чат", "Далее: аккаунты и темп", "Далее: проверка", "Запустить задачу")[
-                        self._step
-                    ]
-                ),
+                    t("task.next_message"),
+                    t("task.next_accounts"),
+                    t("task.next_review"),
+                    t("btn.start"),
+                )[self._step],
             )
-            self.pause_btn.configure(state="disabled", text="Пауза")
+            self.pause_btn.configure(state="disabled", text=t("btn.pause"))
             self.stop_btn.configure(state="disabled")
         if not running and self._loading_campaign:
             self.start_btn.configure(
                 state="normal" if self._load_error else "disabled",
-                text="Повторить загрузку" if self._load_error else "Загружаем настройки…",
+                text=t("task.retry_load") if self._load_error else t("task.loading"),
             )
         self._footer_actions.pack_forget()
         if self._step == 3 or running:
@@ -1253,12 +1323,7 @@ class TaskTab(ctk.CTkFrame):
                 self._progress_frame.pack(fill="x", before=self.status_label)
             else:
                 self._hide_details()
-        tip(
-            self.start_btn,
-            "Начать реальные сообщения или приглашения после проверки подключения."
-            if self._step == 3
-            else "Перейти к следующему шагу. Сообщения и приглашения не отправляются.",
-        )
+        tip(self.start_btn, t("task.start_tip") if self._step == 3 else t("task.next_tip"))
 
     def set_invite_order(self, key: str) -> None:
         """Mirror a stored invite order into the menu so a later save does not overwrite it."""
@@ -1317,7 +1382,7 @@ class TaskTab(ctk.CTkFrame):
                 button.configure(fg_color=COLORS["accent_soft"], text_color=COLORS["accent"])
             else:
                 apply_button_role(button, "secondary")
-        self.pace_label.configure(text=f"Выбрано: {pace_label(active)}")
+        self.pace_label.configure(text=t("task.pace_selected", name=t(f"pace.{active}")))
         warnings = self._pace_warnings()
         if warnings:
             self.pace_warning.configure(text="Внимание: " + " ".join(warnings))
@@ -1342,7 +1407,7 @@ class TaskTab(ctk.CTkFrame):
             entry.delete(0, "end")
             entry.insert(0, values[field])
         self._refresh_pace()
-        self.set_status(f"Темп «{PACE_LABELS[key]}» применён. Нажмите «Сохранить настройки», чтобы запомнить его.")
+        self.set_status(t("task.pace_applied", name=t(f"pace.{key}")))
 
     def _soften_message_interval(self) -> None:
         """Switching to direct messages with an invite-style fast pace: offer the safe default."""
@@ -1375,22 +1440,22 @@ class TaskTab(ctk.CTkFrame):
 
     def send_test_to_saved(self) -> None:
         if self._starting or self.scheduler.is_running():
-            messagebox.showwarning("Задача выполняется", "Остановите задачу: аккаунт нужен для тестовой отправки.")
+            messagebox.showwarning(t("dlg.task_running_title"), t("dlg.task_running_text"))
             return
         text = self.message_box.get("1.0", "end-1c")
         try:
             validate_message(text)
         except ValueError as exc:
-            messagebox.showerror("Тест в Избранное", explain_error(exc))
+            messagebox.showerror(t("dlg.test_saved"), explain_error(exc))
             return
         selected = [key for key, var in self.account_vars.items() if var.get()]
         if not selected:
-            messagebox.showerror("Тест в Избранное", "Отметьте аккаунт, через который отправить тест.")
+            messagebox.showerror(t("dlg.test_saved"), t("dlg.test_saved_pick"))
             return
         account_id = selected[0]
         phone = self._account_labels.get(account_id, str(account_id))
         if not messagebox.askyesno(
-            "Тест в Избранное",
+            t("dlg.test_saved"),
             f"Отправить текст в «Избранное» аккаунта {phone}?\n"
             f"Имя получателя подставится как «{SAMPLE_NAME}». Никому из списка сообщение не уйдёт.",
             parent=self.app,
@@ -1410,7 +1475,7 @@ class TaskTab(ctk.CTkFrame):
                     self.set_status("Тестовая отправка отменена")
                 elif result.exception():
                     self.set_status("Тест не отправлен")
-                    messagebox.showerror("Тест в Избранное", explain_error(result.exception()))
+                    messagebox.showerror(t("dlg.test_saved"), explain_error(result.exception()))
                 else:
                     self.set_status("Тест отправлен в «Избранное»")
                     self.preview_label.configure(text=f"Отправлено в «Избранное»:\n{result.result()}")
@@ -1434,6 +1499,19 @@ class TaskTab(ctk.CTkFrame):
                     validate_message(self.followup_box.get("1.0", "end-1c"))
                 except ValueError as exc:
                     raise ValueError("Второе сообщение: " + str(exc)) from None
+        ab_text_b = self.ab_box.get("1.0", "end-1c")
+        ab_on = mode == "messages" and self.ab_enabled.get()
+        if ab_on:
+            try:
+                validate_message(ab_text_b)
+            except ValueError as exc:
+                raise ValueError("Текст B: " + str(exc)) from None
+        try:
+            ab_split = str(normalize_split(self.ab_split_entry.get()))
+        except ValueError:
+            if ab_on:
+                raise
+            ab_split = str(DEFAULT_SPLIT_A)  # unused while the test is off: keep a valid value
         followup_wait_hours = self.followup_wait_entry.get().strip() or "24"
         if self.followup_enabled.get() and not (followup_wait_hours.isdigit() and 1 <= int(followup_wait_hours) <= 168):
             raise ValueError("«Ждать ответ, часов»: целое число от 1 до 168")
@@ -1450,6 +1528,9 @@ class TaskTab(ctk.CTkFrame):
             "target_chat": chat,
             "operation_mode": mode,
             "message_text": message,
+            "ab_enabled": "1" if self.ab_enabled.get() else "0",
+            "message_text_b": ab_text_b,
+            "ab_split_a": ab_split,
             "followup_enabled": "1" if self.followup_enabled.get() else "0",
             "followup_text": self.followup_box.get("1.0", "end-1c"),
             "followup_wait_hours": followup_wait_hours if followup_wait_hours.isdigit() else "24",
@@ -1494,6 +1575,9 @@ class TaskTab(ctk.CTkFrame):
             "interval_max": "40",
             "selected_accounts": "[]",
             "message_text": "",
+            "message_text_b": "",
+            "ab_enabled": "0",
+            "ab_split_a": str(DEFAULT_SPLIT_A),
             "followup_text": "",
             "followup_enabled": "0",
             "followup_wait_hours": "24",
@@ -1547,6 +1631,15 @@ class TaskTab(ctk.CTkFrame):
                 self.followup_box._textbox.edit_modified(False)
                 self.followup_enabled.set(draft["followup_enabled"] == "1")
                 self.toggle_followup()
+                self.ab_box.configure(state="normal")
+                self.ab_box.delete("1.0", "end")
+                self.ab_box.insert("1.0", draft.get("message_text_b", values["message_text_b"]))
+                self.ab_box._textbox.edit_modified(False)
+                self.ab_split_entry.configure(state="normal")
+                self.ab_split_entry.delete(0, "end")
+                self.ab_split_entry.insert(0, values["ab_split_a"])
+                self.ab_enabled.set(draft.get("ab_enabled", values["ab_enabled"]) == "1")
+                self.toggle_ab()
                 self._followup_stats = {}
                 self.update_message_count()
                 self.on_mode_change()
@@ -1615,6 +1708,28 @@ class TaskTab(ctk.CTkFrame):
         self.followup_counter.configure(
             text=f"{length} / 4096", text_color=COLORS["error"] if length > 4096 else COLORS["muted"]
         )
+        length = len(self.ab_box.get("1.0", "end-1c").encode("utf-16-le")) // 2
+        self.ab_counter.configure(
+            text=f"{length} / 4096", text_color=COLORS["error"] if length > 4096 else COLORS["muted"]
+        )
+
+    def toggle_ab(self):
+        if self.ab_enabled.get():
+            self.ab_frame.pack(fill="x", after=self.ab_switch)
+        else:
+            self.ab_frame.pack_forget()
+        self._ab_split_changed()
+        if not self._loading_campaign:
+            self.flush_draft()
+            self.update_readiness()
+
+    def _ab_split_changed(self, _event=None):
+        try:
+            self.ab_split_label.configure(text=split_label(normalize_split(self.ab_split_entry.get())))
+        except ValueError:
+            self.ab_split_label.configure(text="Введите 1–99")
+        if not self._loading_campaign and not self.app._closing:
+            self.update_readiness()
 
     def toggle_followup(self):
         if self.followup_enabled.get():
@@ -1659,6 +1774,8 @@ class TaskTab(ctk.CTkFrame):
                     "message_text": self.message_box.get("1.0", "end-1c"),
                     "followup_text": self.followup_box.get("1.0", "end-1c"),
                     "followup_enabled": "1" if self.followup_enabled.get() else "0",
+                    "message_text_b": self.ab_box.get("1.0", "end-1c"),
+                    "ab_enabled": "1" if self.ab_enabled.get() else "0",
                 },
             )
         return list(self._drafts.values())
@@ -1748,7 +1865,7 @@ class TaskTab(ctk.CTkFrame):
                     if settings["schedule_enabled"] == "1"
                     else "выключено"
                 )
-                text += "\nТемп: " + pace_label(self.current_pace())
+                text += "\n" + t("task.pace_label", name=t(f"pace.{self.current_pace()}"))
                 cap = int(settings["campaign_daily_cap"])
                 text += f"\nДневной лимит кампании: {cap if cap else 'выключен'}"
                 if settings["require_warmup_ready"] == "1":
@@ -1765,6 +1882,11 @@ class TaskTab(ctk.CTkFrame):
                     text += "\n\n" + warning_block
                 if settings["operation_mode"] == "messages":
                     text += "\n\nТекст сообщения:\n" + settings["message_text"]
+                    if settings["ab_enabled"] == "1":
+                        text += (
+                            f"\n\nA/B-тест: {split_label(int(settings['ab_split_a']))}. Вариант B:\n"
+                            + settings["message_text_b"]
+                        )
                     if settings["followup_enabled"] == "1":
                         text += "\n\nВторое сообщение — только после ответа:\n" + settings["followup_text"]
                 text += "\nПриглашения и сообщения не отправлялись."
@@ -1870,18 +1992,18 @@ class TaskTab(ctk.CTkFrame):
         if not self.scheduler.is_running():
             messagebox.showwarning("Внимание", "Нет активной задачи.")
             return
-        if self.pause_btn.cget("text") == "Продолжить":
+        if self.pause_btn.cget("text") == t("btn.resume"):
             self.scheduler.resume()
             self.run_coro(self.db.set_setting("task_status", "running"))
             self.log_callback("INFO", "Задача продолжена")
             self.set_status("Выполняется...")
-            self.pause_btn.configure(text="Пауза")
+            self.pause_btn.configure(text=t("btn.pause"))
         else:
             self.scheduler.pause()
             self.run_coro(self.db.set_setting("task_status", "paused"))
             self.log_callback("INFO", "Задача на паузе")
             self.set_status("Пауза")
-            self.pause_btn.configure(text="Продолжить")
+            self.pause_btn.configure(text=t("btn.resume"))
 
     def stop_task(self) -> None:
         if not self.scheduler.is_running() or getattr(self, "_stop_confirming", False):
@@ -1902,8 +2024,8 @@ class TaskTab(ctk.CTkFrame):
                     stats = result.result()
                     pending = stats.get("waiting", 0) + stats.get("ready", 0)
                 if pending > 0 and not messagebox.askyesno(
-                    "Остановить задачу?",
-                    f"Остановить задачу? Ожидание вторых сообщений ({pending}) будет отменено.",
+                    t("task.stop_confirm_title"),
+                    t("task.stop_confirm", pending=pending),
                     parent=self.app,
                 ):
                     return
@@ -1917,31 +2039,59 @@ class TaskTab(ctk.CTkFrame):
         if not self.scheduler.is_running():
             return
         self.scheduler.stop()
-        self.start_btn.configure(state="disabled", text="Останавливаем задачу...")
+        self.start_btn.configure(state="disabled", text=t("task.stopping"))
         self.run_coro(self.db.set_setting("task_status", "stopped"))
         self.log_callback("INFO", "Задача остановлена")
-        self.set_status("Остановлено")
+        self.set_status(t("task.status_stopped"))
         self._update_buttons_state()
 
     def show_summary(self, stats: dict) -> None:
-        msg = (
-            "Задача завершена\n\n"
-            f"Добавлено: {stats.get('added', 0)}\n"
-            f"Первых сообщений: {stats.get('sent', 0)}\n"
-            f"Вторых сообщений после ответа: {stats.get('followup_sent', 0)}\n"
-            f"Вторых сообщений отменено после завершения: {stats.get('followup_cancelled', 0)}\n"
-            f"Пропущено: {stats.get('skipped', 0)}\n"
-            f"Ошибок: {stats.get('errors', 0)}\n"
-            f"Время работы: {stats.get('duration', '00:00:00')}"
-        )
+        outcome = stats.get("outcome", "completed")
+        known = outcome in {"completed", "stopped", "failed"}
+        title = t(f"task.summary.title.{outcome}" if known else "task.summary.title.completed")
+        lines = [
+            title,
+            "",
+            t("task.summary.added", n=stats.get("added", 0)),
+            t("task.summary.sent", n=stats.get("sent", 0)),
+            t("task.summary.followup_sent", n=stats.get("followup_sent", 0)),
+            t("task.summary.followup_cancelled", n=stats.get("followup_cancelled", 0)),
+            t("task.summary.skipped", n=stats.get("skipped", 0)),
+            t("task.summary.errors", n=stats.get("errors", 0)),
+            t("task.summary.duration", value=stats.get("duration", "00:00:00")),
+        ]
         accounts = stats.get("accounts") or []
         if accounts:
-            msg += "\n\nПо аккаунтам:\n" + "\n".join(
-                f"{item['phone']}: добавлено {item['added']}, пропущено {item['skipped']}, ошибок {item['errors']}"
+            lines += ["", t("task.summary.by_account")]
+            lines += [
+                t(
+                    "task.summary.account_line",
+                    phone=item["phone"],
+                    added=item["added"],
+                    skipped=item["skipped"],
+                    errors=item["errors"],
+                )
                 for item in accounts
-            )
-        outcome = stats.get("outcome", "completed")
-        title = {"completed": "Итог", "stopped": "Остановлено", "failed": "Ошибка задачи"}.get(outcome, "Итог")
-        msg = msg.replace("Задача завершена", title, 1)
+            ]
         self._update_buttons_state()
-        messagebox.showinfo(title, msg)
+        messagebox.showinfo(title, "\n".join(lines))
+
+    def retranslate(self) -> None:
+        """Rebuild labels after a language switch; widgets and user input stay untouched."""
+        for button, title_key in zip(self._section_buttons, SECTION_KEYS, strict=True):
+            index = self._section_buttons.index(button)
+            button.configure(text=f"{index + 1:02}  {t(title_key)}")
+        self.back_btn.configure(text=t("btn.back"))
+        for button, (key, label_key) in zip(self._task_action_buttons, self._action_keys, strict=True):
+            button.configure(text=t(label_key))
+            tip(button, t(f"task.{key}_tip"))
+        tip(self.pause_btn, t("task.pause_tip"))
+        tip(self.stop_btn, t("task.stop_tip"))
+        self.stop_btn.configure(text=t("btn.stop"))
+        self.test_message_btn.configure(text=t("task.test_saved_btn"))
+        self.pace_caption.configure(text=t("task.pace"))
+        for key, button in self.pace_buttons.items():
+            button.configure(text=t(f"pace.{key}"))
+            tip(button, t(f"task.pace_{key}_tip"))
+        self._refresh_pace()
+        self._update_buttons_state()

@@ -9,17 +9,22 @@ from tkinter import messagebox
 import customtkinter as ctk
 
 from core.database import Database
+from core.first_run import WIZARD_DONE_KEY, should_show_wizard
 from core.scheduler import TaskScheduler
+from core.summary import deliver_task_summary, flush_daily
 from core.support import SUPPORT_SEEN_KEY
 from core.user_feedback import explain_error
 from core.version import VERSION
 from ui.components import NavTooltip
 from ui.dispatch import UIDispatcher, post_ui
 from ui.entry_utils import install_clipboard_shortcuts
+from ui.first_run_wizard import FirstRunWizard
 from ui.help_dialog import HelpDialog
 from ui.hints import tip
+from ui.i18n import DEFAULT_LANG, LANG_LABELS, LANG_SETTING_KEY, LANGS, normalize_lang, set_language, t
 from ui.icons import icon
 from ui.notifications import WindowsNotifications
+from ui.queue_runner import QueueRunner
 from ui.support_dialog import SupportDialog
 from ui.tab_accounts import AccountsTab
 from ui.tab_ai_settings import TabAISettings
@@ -50,7 +55,12 @@ class App(ctk.CTk):
         self._support_intro_handled = False
         self._support_seen_future = None
         self._support_intro_job = None
+        self._wizard = None
+        self._last_ready_text = t("status.ready")
+        self._summary_tick_job = None
+        set_language(DEFAULT_LANG)
         self.notifications = WindowsNotifications(self)
+        self.queue_runner = QueueRunner(self)
         self._notification_save_future = None
         self._notification_preference_changed = False
         self._account_notice_times = {}
@@ -110,6 +120,7 @@ class App(ctk.CTk):
         self._load_profile_setting()
         self._load_density_setting()
         self._load_notification_setting()
+        self._load_language_setting()
         self._load_last_campaign()
         self._switch_tab("dashboard")
         self._resize_shell()
@@ -120,7 +131,9 @@ class App(ctk.CTk):
         self._drain_ui()
         self._poll_ui()
         if show_startup_support:
+            self.after(700, self._load_first_run)
             self._support_intro_job = self.after(1800, self._load_support_intro)
+            self._summary_tick_job = self.after(20000, self._daily_summary_tick)
 
     def _build_shell(self):
         self.grid_columnconfigure(1, weight=1)
@@ -144,22 +157,17 @@ class App(ctk.CTk):
         self.brand_text = ctk.CTkLabel(brand, text="Inviter Studio", font=FONTS["brand"])
         self.brand_text.pack(side="left", padx=(10, 0))
         self.nav_heading = ctk.CTkLabel(
-            self.sidebar, text="ИНСТРУМЕНТЫ", font=FONTS["label"], text_color=COLORS["subtle"], anchor="w"
+            self.sidebar, text=t("nav.heading"), font=FONTS["label"], text_color=COLORS["subtle"], anchor="w"
         )
         self.nav_heading.pack(fill="x", padx=22, pady=(0, 10))
         self.nav_buttons = {}
         self.nav_lines = {}
         self.tab_name_to_key = {}
         self.nav_titles = {
-            "dashboard": "Обзор",
-            "accounts": "Аккаунты",
-            "targets": "Аудитория",
-            "task": "Задача",
-            "warmup": "Прогрев",
-            "ai": "AI-студия",
-            "logs": "Журнал",
-            "parsing": "Парсинг",
+            key: t(f"nav.{key}")
+            for key in ("dashboard", "accounts", "targets", "task", "warmup", "ai", "logs", "parsing")
         }
+        self.nav_tooltips = {}
         self.current_tab_key = "dashboard"
         for key, title in self.nav_titles.items():
             self.tab_name_to_key.update({title: key, title.lower(): key, key: key})
@@ -182,7 +190,7 @@ class App(ctk.CTk):
             button._studio_styled = True
             button.pack(fill="x", padx=12, pady=2)
             self.nav_buttons[key] = button
-            NavTooltip(button, title)
+            self.nav_tooltips[key] = NavTooltip(button, title)
         self.tab_name_to_key.update({"Главная": "dashboard", "Список": "targets", "Логи": "logs", "AI": "ai"})
         self.rail_footer = ctk.CTkFrame(self.sidebar, fg_color=COLORS["surface"], corner_radius=12)
         self.rail_footer.pack(side="bottom", fill="x", padx=12, pady=12)
@@ -197,13 +205,13 @@ class App(ctk.CTk):
             text_color=COLORS["accent"],
         ).pack(side="left", padx=8, pady=8)
         self.footer_brand = ctk.CTkLabel(
-            self.rail_footer, text="Помощь · F1", font=FONTS["small"], text_color=COLORS["muted"], cursor="hand2"
+            self.rail_footer, text=t("nav.help"), font=FONTS["small"], text_color=COLORS["muted"], cursor="hand2"
         )
         self.footer_brand.pack(side="left")
         self.footer_brand.bind("<Button-1>", lambda _event: self.show_help("start"))
         self.support_button = ctk.CTkButton(
             self.sidebar,
-            text="Поддержать проект",
+            text=t("nav.support"),
             image=icon("support", COLORS["accent"]),
             height=36,
             width=164,
@@ -212,7 +220,7 @@ class App(ctk.CTk):
         )
         apply_button_role(self.support_button, "secondary")
         self.support_button.pack(side="bottom", fill="x", padx=12, pady=(6, 0))
-        NavTooltip(self.support_button, "Поддержать проект · адрес и сети для доната")
+        self.support_tooltip = NavTooltip(self.support_button, t("nav.support_tip"))
         workspace = ctk.CTkFrame(self, fg_color=COLORS["bg"], corner_radius=0)
         workspace.grid(row=0, column=1, sticky="nsew")
         workspace.grid_columnconfigure(0, weight=1)
@@ -223,7 +231,10 @@ class App(ctk.CTk):
         breadcrumb = ctk.CTkFrame(header, fg_color="transparent")
         breadcrumb.grid(row=0, column=0, sticky="w", padx=26, pady=18)
         self.breadcrumb_label = ctk.CTkLabel(
-            breadcrumb, text="Рабочее пространство  /  Обзор", font=FONTS["small"], text_color=COLORS["muted"]
+            breadcrumb,
+            text=f"{t('nav.workspace')}  /  {t('nav.dashboard')}",
+            font=FONTS["small"],
+            text_color=COLORS["muted"],
         )
         self.breadcrumb_label.pack(anchor="w")
         settings = ctk.CTkFrame(header, fg_color="transparent")
@@ -232,6 +243,18 @@ class App(ctk.CTk):
         self.ui_density_var = ctk.StringVar(value="Обычный")
         self._active_profile_name = "Кастом"
         self._active_density_mode = "normal"
+        self.lang_var = ctk.StringVar(value=LANG_LABELS[DEFAULT_LANG])
+        self.lang_menu = ctk.CTkOptionMenu(
+            settings,
+            values=[LANG_LABELS[code] for code in LANGS],
+            variable=self.lang_var,
+            width=96,
+            height=32,
+            font=FONTS["small"],
+            command=self._on_language_change,
+        )
+        self.lang_menu.pack(side="left", padx=(0, 8))
+        self.lang_tip = tip(self.lang_menu, t("nav.language_tip"))
         self.profile_menu = ctk.CTkOptionMenu(
             settings,
             values=list(APP_PROFILES),
@@ -265,10 +288,10 @@ class App(ctk.CTk):
         self.help_button = ctk.CTkButton(settings, text="?", width=32, height=32, command=self.show_help)
         apply_button_role(self.help_button, "secondary")
         self.help_button.pack(side="left", padx=(0, 10))
-        tip(self.help_button, "Помощь по текущему разделу и пошаговый запуск. Можно открыть клавишей F1.")
-        new_task = ctk.CTkButton(
+        tip(self.help_button, t("nav.help_tip"))
+        self.new_task_button = new_task = ctk.CTkButton(
             settings,
-            text="Настроить задачу",
+            text=t("nav.new_task"),
             image=icon("arrow", COLORS["bg"], 16),
             compound="right",
             width=164,
@@ -277,7 +300,7 @@ class App(ctk.CTk):
         )
         apply_button_role(new_task, "primary")
         new_task.pack(side="left")
-        tip(new_task, "Открыть настройки выбранной кампании. Отправка начнётся только после «Запустить задачу».")
+        tip(new_task, t("nav.new_task_tip"))
         self.content = ctk.CTkFrame(workspace, fg_color=COLORS["bg"], corner_radius=0)
         self.content.grid(row=1, column=0, sticky="nsew")
         self.page_frames = {
@@ -290,7 +313,7 @@ class App(ctk.CTk):
         )
         self.status_dot.pack(side="left")
         self.status_text = ctk.CTkLabel(
-            status_bar, text="Готов к работе", font=FONTS["small"], text_color=COLORS["muted"], anchor="w"
+            status_bar, text=t("status.ready"), font=FONTS["small"], text_color=COLORS["muted"], anchor="w"
         )
         self.status_text.pack(side="left", fill="x", expand=True, padx=6)
         self.status_text.bind(
@@ -299,7 +322,7 @@ class App(ctk.CTk):
         self.notifications_var = ctk.BooleanVar(value=True)
         self.notifications_switch = ctk.CTkSwitch(
             status_bar,
-            text="Уведомления Windows",
+            text=t("nav.notifications"),
             variable=self.notifications_var,
             command=self._toggle_notifications,
             font=FONTS["small"],
@@ -309,6 +332,112 @@ class App(ctk.CTk):
             self.notifications_switch,
             "Уведомлять о завершении задачи и парсинга. Без текстов переписки и номеров аккаунтов. Windows может скрыть уведомление в режиме «Не беспокоить». Выбор сохраняется.",
         )
+
+    def _breadcrumb_text(self, key: str | None = None) -> str:
+        title = self.nav_titles[key or self.current_tab_key]
+        return f"{t('nav.workspace')}  /  {title}" if self._rail_expanded else title
+
+    def _update_breadcrumb(self) -> None:
+        self.breadcrumb_label.configure(text=self._breadcrumb_text())
+
+    def _on_language_change(self, label: str) -> None:
+        code = next((code for code, name in LANG_LABELS.items() if name == label), DEFAULT_LANG)
+        self.set_ui_language(code, persist=True)
+
+    def set_ui_language(self, lang, *, persist: bool = False) -> None:
+        """Switch the interface language without a restart and optionally store it as ``ui_lang``."""
+        code = set_language(normalize_lang(lang))
+        self.lang_var.set(LANG_LABELS[code])
+        self.apply_language()
+        if persist:
+            future = self.run_coro(self.db.set_setting(LANG_SETTING_KEY, code))
+
+            def done(result):
+                if result.cancelled() or result.exception():
+                    self._safe_after(lambda: self.set_status(t("lang.save_failed"), COLORS["error"]))
+
+            future.add_done_callback(done)
+
+    def apply_language(self) -> None:
+        """Rebuild the labels of the shell and the translated tabs from the active language."""
+        previous_ready = self._last_ready_text
+        for key in self.nav_titles:
+            title = t(f"nav.{key}")
+            self.nav_titles[key] = title
+            self.tab_name_to_key.update({title: key, title.lower(): key})
+            self.nav_buttons[key].configure(text=title if self._rail_expanded else "")
+            self.nav_tooltips[key].title = title
+        self.nav_heading.configure(text=t("nav.heading"))
+        self.footer_brand.configure(text=t("nav.help"))
+        self.support_button.configure(text=t("nav.support") if self._rail_expanded else "")
+        self.support_tooltip.title = t("nav.support_tip")
+        self.new_task_button.configure(text=t("nav.new_task"))
+        self.notifications_switch.configure(text=t("nav.notifications"))
+        self.lang_tip.text = t("nav.language_tip")
+        tip(self.help_button, t("nav.help_tip"))
+        tip(self.new_task_button, t("nav.new_task_tip"))
+        self._update_breadcrumb()
+        self._last_ready_text = t("status.ready")
+        if self.status_text.cget("text") == previous_ready:
+            self.status_text.configure(text=self._last_ready_text)
+        self.title(f"Inviter Studio {VERSION}")
+        for tab in (self.task_tab, self.accounts_tab):
+            try:
+                tab.retranslate()
+            except Exception:
+                logging.getLogger(__name__).exception("Не удалось перевести раздел")
+
+    def _load_language_setting(self) -> None:
+        future = self.run_coro(self.db.get_setting(LANG_SETTING_KEY, DEFAULT_LANG))
+
+        def done(result):
+            if result.cancelled() or result.exception():
+                return
+            code = normalize_lang(result.result())
+            if code != DEFAULT_LANG:
+                self._safe_after(lambda: self.set_ui_language(code))
+
+        future.add_done_callback(done)
+
+    def _load_first_run(self) -> None:
+        if self._closing:
+            return
+
+        async def read():
+            accounts = await self.db.get_accounts()
+            done_flag = await self.db.get_setting(WIZARD_DONE_KEY, "0")
+            return len(accounts), done_flag
+
+        future = self.run_coro(read())
+
+        def done(result):
+            if result.cancelled() or result.exception():
+                return
+            count, done_flag = result.result()
+            if should_show_wizard(count, done_flag):
+                self._safe_after(self.show_first_run_wizard)
+            elif count > 0 and done_flag != "1":
+                # Returning user who never saw the wizard: never show it later either.
+                self.run_coro(self.db.set_setting(WIZARD_DONE_KEY, "1"))
+
+        future.add_done_callback(done)
+
+    def show_first_run_wizard(self):
+        if self._closing:
+            return None
+        if self._wizard is not None and self._wizard.winfo_exists():
+            self._wizard.lift()
+            return self._wizard
+        self._wizard = FirstRunWizard(self)
+        return self._wizard
+
+    def _daily_summary_tick(self) -> None:
+        """Send the previous day's counters (opt-in, daily mode) and re-check once an hour."""
+        self._summary_tick_job = None
+        if self._closing:
+            return
+        self.run_coro(flush_daily(self.db, log=self.add_log))
+        self._summary_tick_job = self.after(3_600_000, self._daily_summary_tick)
 
     def show_help(self, topic=None):
         if self._closing:
@@ -340,7 +469,8 @@ class App(ctk.CTk):
     def _show_support_intro(self):
         if self._closing or self._support_intro_handled:
             return
-        if self.state() == "iconic" or self.grab_current() is not None:
+        wizard_open = self._wizard is not None and self._wizard.winfo_exists()
+        if self.state() == "iconic" or self.grab_current() is not None or wizard_open:
             self._support_intro_job = self.after(1000, self._show_support_intro)
             return
         self.show_support()
@@ -369,7 +499,7 @@ class App(ctk.CTk):
             return
         self._rail_expanded = expanded
         self.support_button.configure(
-            text="Поддержать проект" if expanded else "",
+            text=t("nav.support") if expanded else "",
             anchor="w" if expanded else "center",
             width=164 if expanded else 48,
         )
@@ -388,9 +518,7 @@ class App(ctk.CTk):
                 anchor="w" if expanded else "center",
                 width=164 if expanded else 48,
             )
-        self.breadcrumb_label.configure(
-            text=f"{'Рабочее пространство  /  ' if expanded else ''}{self.nav_titles[self.current_tab_key]}"
-        )
+        self._update_breadcrumb()
 
     def run_coro(self, coro) -> Future:
         if self._closing:
@@ -496,9 +624,7 @@ class App(ctk.CTk):
         if campaign_id == self.db.campaign_id:
             return
         if self.scheduler.is_running() or self.task_tab._starting:
-            messagebox.showwarning(
-                "Кампания выполняется", "Остановите задачу или дождитесь проверки перед переключением"
-            )
+            messagebox.showwarning(t("dlg.campaign_busy_title"), t("dlg.campaign_busy_text"))
             return
         if not discard_current and not self.task_tab.recipients.can_leave():
             return
@@ -585,9 +711,7 @@ class App(ctk.CTk):
                 image=icon(tab_key, color),
                 fg_color=COLORS["accent_soft"] if active else "transparent",
             )
-        self.breadcrumb_label.configure(
-            text=f"{'Рабочее пространство  /  ' if self._rail_expanded else ''}{self.nav_titles[key]}"
-        )
+        self._update_breadcrumb()
         style_tree(self.page_frames[key])
 
     def switch_tab(self, tab_name: str) -> None:
@@ -754,22 +878,21 @@ class App(ctk.CTk):
         return True
 
     def on_fatal(self, text: str) -> None:
-        self._safe_after(lambda: messagebox.showerror("Критическая ошибка", text))
+        self._safe_after(lambda: messagebox.showerror(t("dlg.fatal"), text))
 
     def on_complete(self, summary: dict) -> None:
+        finished_db = getattr(self.scheduler.engine, "db", None)  # scope of the run that just ended
+
         def show():
             outcome = summary.get("outcome", "completed")
-            title = {
-                "completed": "Задача завершена",
-                "failed": "Задача требует внимания",
-                "stopped": "Задача остановлена",
-            }.get(outcome, "Итог задачи")
-            self.notify(
-                title,
-                "Откройте Inviter Studio: итог доступен в задаче, подробности — в журнале.",
-                warning=outcome == "failed",
+            title = t(
+                f"dlg.complete.{outcome}" if outcome in {"completed", "failed", "stopped"} else "dlg.complete.other"
             )
+            self.notify(title, t("dlg.complete.text"), warning=outcome == "failed")
+            # Opt-in Saved Messages summary: counters only, sent after the engine released its sessions.
+            self.run_coro(deliver_task_summary(self.db, summary, log=self.add_log))
             self.task_tab.show_summary(summary)
+            self.queue_runner.offer(finished_db, summary)  # campaign queue: asks before starting the next one
 
         self._safe_after(show)
 
@@ -888,7 +1011,7 @@ class App(ctk.CTk):
             getattr(self.warmup_tab, "warmup_future", None) and not self.warmup_tab.warmup_future.done()
         )
         active = active or self.parsing_tab.busy()
-        if active and not messagebox.askyesno("Выход", "Задача выполняется. Закрыть приложение?"):
+        if active and not messagebox.askyesno(t("dlg.exit_title"), t("dlg.exit_text")):
             return
         self._closing = True
         self.set_status("Завершение фоновых операций...")

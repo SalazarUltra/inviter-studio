@@ -613,14 +613,26 @@ class ParserEngine:
         limit = min(max(int(run.get("limit_per_source") or 500), 1), MAX_PER_SOURCE)
         return await self._run(_account_list(account), pending, limit, run_id=run_id)
 
-    async def _run(self, accounts, sources, limit, run_id=None):
+    def _new_manager(self, account):
+        return AccountManager(account, self.db)
+
+    @staticmethod
+    def _record_budget():
+        return MAX_RUN_RECORDS
+
+    async def _create_run(self, accounts, sources, ctx):
+        """Create the saved run row. The authors engine overrides this to store its period and scan limit."""
+        return await self.db.create_parse_run(accounts[0]["id"], sources, limit_per_source=ctx.limit)
+
+    async def _run(self, accounts, sources, limit, run_id=None, **options):
         self._task = asyncio.current_task()
         self.run_id = None
         ctx = SimpleNamespace(
+            options=options,  # engine specific settings (the authors period), read by subclasses
             limit=limit,
             outcome="completed",
             detail="",
-            budget=MAX_RUN_RECORDS,  # records not yet reserved by a source
+            budget=self._record_budget(),  # records not yet reserved by a source
             outstanding=0,  # records reserved by sources that are being read right now
             successful=0,
             collected=0,
@@ -645,7 +657,7 @@ class ParserEngine:
                     if row["source_id"] is not None and row["status"] == "completed"
                 }
             else:
-                self.run_id = await self.db.create_parse_run(accounts[0]["id"], sources, limit_per_source=limit)
+                self.run_id = await self._create_run(accounts, sources, ctx)
             queues = {
                 account_id: deque(items)
                 for account_id, items in split_sources_round_robin(sources, [a["id"] for a in accounts]).items()
@@ -700,7 +712,7 @@ class ParserEngine:
     async def _worker(self, account, own, ctx):
         if (not own and not ctx.orphans) or ctx.stop:
             return
-        manager = AccountManager(account, self.db)
+        manager = self._new_manager(account)
         try:
             try:
                 await manager.connect()

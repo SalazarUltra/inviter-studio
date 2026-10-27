@@ -16,6 +16,8 @@ from ui.components import empty_state, page_intro
 from ui.dispatch import post_ui
 from ui.entry_utils import setup_entry
 from ui.hints import hint, tip
+from ui.i18n import t
+from ui.summary_card import SummaryCard
 from ui.theme import COLORS, FONTS, apply_button_role, get_density_preset, init_fonts, style_card, style_tree
 
 STATUS_COLORS = {
@@ -81,9 +83,9 @@ class AccountsTab(ctk.CTkFrame):
         )
         top.pack(fill="x", padx=0, pady=(0, 10))
         style_card(top, color=COLORS["accent"])
-        ctk.CTkButton(
+        self.add_button = ctk.CTkButton(
             top,
-            text="+ Добавить аккаунт",
+            text=t("accounts.add"),
             command=self.show_add_form,
             corner_radius=12,
             height=36,
@@ -91,11 +93,13 @@ class AccountsTab(ctk.CTkFrame):
             fg_color=COLORS["accent"],
             hover_color=COLORS["warning"],
             text_color=COLORS["text"],
-        ).pack(side="left", padx=16, pady=12)
+        )
+        self.add_button.pack(side="left", padx=16, pady=12)
         filters = ctk.CTkFrame(self.left_frame, fg_color="transparent")
         filters.pack(fill="x", pady=(0, 8))
         filters.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(filters, text="Телефон:", font=FONTS["small"]).grid(row=0, column=0, padx=(0, 8))
+        self.phone_label = ctk.CTkLabel(filters, text=t("accounts.phone"), font=FONTS["small"])
+        self.phone_label.grid(row=0, column=0, padx=(0, 8))
         self.search_entry = ctk.CTkEntry(filters, textvariable=self.search_var, height=30)
         self.search_entry.grid(row=0, column=1, sticky="ew", padx=(0, 8))
         self.filter_menu = ctk.CTkOptionMenu(
@@ -118,6 +122,8 @@ class AccountsTab(ctk.CTkFrame):
 
         filters.bind("<Configure>", fit_filters, add="+")
 
+        self.summary_card = SummaryCard(self.left_frame, get_db=lambda: self.db, run_coro=run_coro)
+        self.summary_card.pack(side="bottom", fill="x", pady=(0, 4))
         self.table = ctk.CTkScrollableFrame(self.left_frame, fg_color=COLORS["surface"], corner_radius=12)
         self.table.pack(fill="both", expand=True, padx=0, pady=(0, 10))
 
@@ -141,7 +147,7 @@ class AccountsTab(ctk.CTkFrame):
     def _open_api_site(self) -> None:
         url = "https://my.telegram.org/apps"
         if not webbrowser.open(url):
-            messagebox.showinfo("Официальный сайт Telegram", url)
+            messagebox.showinfo(t("accounts.official_site"), url)
 
     def _show_api_instructions(self):
         from ui.campaigns import show_report
@@ -186,11 +192,11 @@ class AccountsTab(ctk.CTkFrame):
     def _toggle_proxy_section(self, toggle_btn: ctk.CTkButton) -> None:
         if self.proxy_visible:
             self.proxy_frame.pack_forget()
-            toggle_btn.configure(text="Прокси (необязательно)")
+            toggle_btn.configure(text=t("accounts.proxy"))
             self.proxy_visible = False
         else:
             self.proxy_frame.pack(fill="x", padx=8, pady=(4, 0))
-            toggle_btn.configure(text="▼  Прокси (необязательно)")
+            toggle_btn.configure(text="▼  " + t("accounts.proxy"))
             self.proxy_visible = True
 
     def _build_add_form(self) -> None:
@@ -199,7 +205,7 @@ class AccountsTab(ctk.CTkFrame):
 
         header = ctk.CTkFrame(self.right_frame, fg_color="transparent")
         header.pack(fill="x", padx=16, pady=(16, 0))
-        ctk.CTkLabel(header, text="Новый аккаунт", font=FONTS["subhead"], text_color=COLORS["text"]).pack(side="left")
+        ctk.CTkLabel(header, text=t("accounts.new"), font=FONTS["subhead"], text_color=COLORS["text"]).pack(side="left")
         ctk.CTkButton(
             header,
             text="✕",
@@ -245,12 +251,12 @@ class AccountsTab(ctk.CTkFrame):
             padx=8,
         )
         self.api_site_button = ctk.CTkButton(
-            scroll, text="Получить API ID и API Hash ↗", height=30, command=self._open_api_site
+            scroll, text=t("accounts.api_site"), height=30, command=self._open_api_site
         )
         apply_button_role(self.api_site_button, "secondary")
         self.api_site_button.pack(fill="x", padx=8, pady=(0, 8))
         self.api_instructions_button = ctk.CTkButton(
-            scroll, text="Пошагово: где взять данные", height=30, command=self._show_api_instructions
+            scroll, text=t("accounts.api_steps"), height=30, command=self._show_api_instructions
         )
         apply_button_role(self.api_instructions_button, "ghost")
         self.api_instructions_button.pack(fill="x", padx=8, pady=(0, 8))
@@ -287,7 +293,7 @@ class AccountsTab(ctk.CTkFrame):
         self.proxy_visible = False
         proxy_toggle = ctk.CTkButton(
             scroll,
-            text="Прокси (необязательно)",
+            text=t("accounts.proxy"),
             fg_color="transparent",
             hover_color=COLORS["border"],
             text_color=COLORS["muted"],
@@ -333,7 +339,7 @@ class AccountsTab(ctk.CTkFrame):
         ctk.CTkFrame(scroll, fg_color=COLORS["border"], height=1).pack(fill="x", padx=8, pady=12)
         self.step_label = ctk.CTkLabel(
             scroll,
-            text="Шаг 1: заполните данные и нажмите «Получить код»",
+            text=t("accounts.step1"),
             font=FONTS["small"],
             text_color=COLORS["muted"],
             wraplength=280,
@@ -342,7 +348,7 @@ class AccountsTab(ctk.CTkFrame):
 
         self.get_code_btn = ctk.CTkButton(
             scroll,
-            text="Получить код",
+            text=t("accounts.get_code"),
             height=40,
             corner_radius=12,
             font=FONTS["subhead"],
@@ -368,7 +374,7 @@ class AccountsTab(ctk.CTkFrame):
         setup_entry(self.code_entry)
         ctk.CTkButton(
             self.code_section,
-            text="Подтвердить",
+            text=t("accounts.confirm"),
             height=40,
             corner_radius=12,
             font=FONTS["subhead"],
@@ -394,7 +400,7 @@ class AccountsTab(ctk.CTkFrame):
         setup_entry(self.twofa_entry)
         ctk.CTkButton(
             self.twofa_section,
-            text="Подтвердить 2FA",
+            text=t("accounts.confirm_2fa"),
             height=40,
             corner_radius=12,
             font=FONTS["subhead"],
@@ -406,7 +412,7 @@ class AccountsTab(ctk.CTkFrame):
 
         ctk.CTkButton(
             scroll,
-            text="Отмена",
+            text=t("btn.cancel"),
             height=36,
             corner_radius=12,
             font=FONTS["subhead"],
@@ -456,7 +462,7 @@ class AccountsTab(ctk.CTkFrame):
 
         self._code_request_inflight = True
         if self.get_code_btn:
-            self.get_code_btn.configure(state="disabled", text="Отправка...")
+            self.get_code_btn.configure(state="disabled", text=t("accounts.sending"))
         self.step_label.configure(text="Запрашиваем код в Telegram...")
 
         self.pending_account_payload = payload
@@ -500,7 +506,9 @@ class AccountsTab(ctk.CTkFrame):
                 self._code_request_inflight = False
                 self._safe_after(
                     lambda: (
-                        self.get_code_btn.configure(state="normal", text="Получить код") if self.get_code_btn else None
+                        self.get_code_btn.configure(state="normal", text=t("accounts.get_code"))
+                        if self.get_code_btn
+                        else None
                     )
                 )
 
@@ -639,8 +647,16 @@ class AccountsTab(ctk.CTkFrame):
                 return
             self._safe_after(lambda: self._render_accounts(accounts))
             self._safe_after(self.refresh_task_accounts)
+            self._safe_after(self.summary_card.refresh_accounts)
 
         fut.add_done_callback(done)
+
+    def retranslate(self) -> None:
+        """Re-render labels after a language switch (no restart)."""
+        self.add_button.configure(text=t("accounts.add"))
+        self.phone_label.configure(text=t("accounts.phone"))
+        self.summary_card.retranslate()
+        self._render_accounts(self._all_accounts)
 
     def _render_accounts(self, accounts: list[dict]) -> None:
         self._all_accounts = accounts
@@ -664,14 +680,14 @@ class AccountsTab(ctk.CTkFrame):
 
         if not accounts:
             if all_count:
-                empty_state(self.table, "Нет совпадений", "Измените телефон или выберите фильтр «Все».", "accounts")
+                empty_state(self.table, t("accounts.no_match"), t("accounts.no_match_hint"), "accounts")
                 return
             empty_state(
                 self.table,
-                "Подключите первый аккаунт",
-                "Добавьте Telegram-аккаунт, чтобы начать работу.",
+                t("accounts.empty_title"),
+                t("accounts.empty_text"),
                 "accounts",
-                ("Добавить аккаунт", self.show_add_form),
+                (t("accounts.empty_add"), self.show_add_form),
             )
             style_tree(self.table)
             return
@@ -699,7 +715,7 @@ class AccountsTab(ctk.CTkFrame):
             content = ctk.CTkFrame(card, fg_color="transparent")
             content.pack(fill="x", padx=12, pady=(6, 2))
             ctk.CTkLabel(content, text=account["phone"], anchor="w", font=FONTS["subhead"]).pack(side="left")
-            switch = ctk.CTkSwitch(content, text="Использовать", width=110, font=FONTS["small"])
+            switch = ctk.CTkSwitch(content, text=t("accounts.use"), width=110, font=FONTS["small"])
             tip(switch, "Разрешить использовать аккаунт в задачах. Сам по себе переключатель ничего не запускает.")
             if int(account.get("is_enabled", 1)) == 1:
                 switch.select()
@@ -734,7 +750,7 @@ class AccountsTab(ctk.CTkFrame):
             ).pack(anchor="w", pady=(0, 5))
             ctk.CTkButton(
                 actions,
-                text="Проверить",
+                text=t("accounts.test"),
                 width=70,
                 height=density["list_item_h"],
                 corner_radius=12,
@@ -748,7 +764,7 @@ class AccountsTab(ctk.CTkFrame):
             ).pack(side="left", padx=(0, 6))
             ctk.CTkButton(
                 actions,
-                text="Изменить",
+                text=t("accounts.edit"),
                 width=70,
                 height=density["list_item_h"],
                 corner_radius=12,
@@ -762,7 +778,7 @@ class AccountsTab(ctk.CTkFrame):
             ).pack(side="left")
             ctk.CTkButton(
                 actions,
-                text="Удалить",
+                text=t("accounts.delete"),
                 width=70,
                 height=density["list_item_h"],
                 corner_radius=12,
@@ -821,7 +837,7 @@ class AccountsTab(ctk.CTkFrame):
         fut.add_done_callback(done)
 
     def delete_account(self, account_id: int) -> None:
-        if not messagebox.askyesno("Подтверждение", "Удалить аккаунт?"):
+        if not messagebox.askyesno(t("accounts.delete_title"), t("accounts.delete_confirm")):
             return
 
         async def remove():
@@ -954,7 +970,7 @@ class AccountsTab(ctk.CTkFrame):
 
         ctk.CTkButton(
             modal,
-            text="Сохранить изменения",
+            text=t("accounts.save_changes"),
             command=save,
             corner_radius=12,
             height=36,

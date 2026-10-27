@@ -119,9 +119,14 @@ CAMPAIGN_SETTINGS = {
     "followup_enabled",
     "followup_text",
     "followup_wait_hours",
+    "ab_enabled",
+    "message_text_b",
+    "ab_split_a",
     "invite_order",
     "campaign_daily_cap",
     "require_warmup_ready",
+    "queue_next_campaign_id",
+    "queue_next_on",
 }
 
 INVITE_ORDERS = ("shuffle", "as_is")
@@ -484,7 +489,7 @@ class Database(FollowupStore):
                 "INSERT INTO campaigns(name,kind,created_at) VALUES (?,?,?)", (name, source[0], _now_iso())
             )
             campaign_id = cursor.lastrowid
-            for key in CAMPAIGN_SETTINGS - {"task_status"}:
+            for key in CAMPAIGN_SETTINGS - {"task_status", "queue_next_campaign_id", "queue_next_on"}:
                 cursor = await db.execute("SELECT value FROM settings WHERE key=?", (self._setting_key(key),))
                 row = await cursor.fetchone()
                 if row is not None:
@@ -605,6 +610,11 @@ class Database(FollowupStore):
             for table in ("targets", "logs", "campaign_runs", "campaign_daily_counters"):
                 await db.execute(f"DELETE FROM {table} WHERE campaign_id=?", (self.campaign_id,))
             await db.execute("DELETE FROM settings WHERE key GLOB ?", (f"campaign:{self.campaign_id}:*",))
+            # Other campaigns queued to start this one lose their link instead of pointing at a tombstone.
+            await db.execute(
+                "UPDATE settings SET value='' WHERE key GLOB 'campaign:*:queue_next_campaign_id' AND value=?",
+                (str(self.campaign_id),),
+            )
             # A tombstone prevents startup migrations from recreating campaign 1
             # and prevents reuse of IDs referenced by the global delivery ledger.
             await db.execute(
@@ -718,6 +728,93 @@ class Database(FollowupStore):
                 raise ValueError("Кампания не найдена")
             return row[0]
 
+    async def get_ab_stats(self) -> dict[str, Any]:
+        """First messages sent and replies received per A/B variant for this campaign.
+
+        Replies are only known when the second-message (follow-up) feature tracked the recipient:
+        ``replies_tracked`` is False for campaigns that never had follow-ups, so the UI can say
+        «not tracked» instead of showing a misleading zero. Deliveries made without A/B are in ``untested``.
+        """
+        stats: dict[str, Any] = {
+            "A": {"sent": 0, "replies": 0},
+            "B": {"sent": 0, "replies": 0},
+            "untested": 0,
+            "replies_tracked": False,
+        }
+        async with _connect() as db:
+            for variant, count in await (
+                await db.execute(
+                    "SELECT variant,COUNT(*) FROM message_deliveries WHERE campaign_id=? AND state='sent' "
+                    "GROUP BY variant",
+                    (self.campaign_id,),
+                )
+            ).fetchall():
+                if variant in ("A", "B"):
+                    stats[variant]["sent"] = int(count)
+                else:
+                    stats["untested"] += int(count)
+            tracked = await (
+                await db.execute("SELECT 1 FROM message_followups WHERE campaign_id=? LIMIT 1", (self.campaign_id,))
+            ).fetchone()
+            stats["replies_tracked"] = tracked is not None
+            for variant, count in await (
+                await db.execute(
+                    "SELECT d.variant,COUNT(*) FROM message_followups f JOIN message_deliveries d "
+                    "ON d.username=f.username AND d.campaign_id=f.campaign_id "
+                    "WHERE f.campaign_id=? AND f.reply_id IS NOT NULL AND d.variant IN ('A','B') GROUP BY d.variant",
+                    (self.campaign_id,),
+                )
+            ).fetchall():
+                stats[variant]["replies"] = int(count)
+        return stats
+
+    async def get_campaign_export_data(self, setting_keys) -> dict[str, Any]:
+        """Name, kind, the requested campaign settings and targets (oldest first) for a JSON export."""
+        keys = [key for key in setting_keys if key in CAMPAIGN_SETTINGS]
+        async with _connect() as db:
+            db.row_factory = aiosqlite.Row
+            campaign = await (
+                await db.execute(
+                    "SELECT name,kind FROM campaigns WHERE id=? AND deleted_at IS NULL", (self.campaign_id,)
+                )
+            ).fetchone()
+            if campaign is None:
+                raise ValueError("Кампания не найдена")
+            targets = await (
+                await db.execute(
+                    "SELECT username,user_id,status FROM targets WHERE campaign_id=? ORDER BY sort_order,id",
+                    (self.campaign_id,),
+                )
+            ).fetchall()
+        values = await self.get_settings_map(keys)
+        return {
+            "name": campaign["name"],
+            "kind": campaign["kind"],
+            "settings": {key: value for key, value in values.items() if value is not None},
+            "targets": [dict(row) for row in targets],
+        }
+
+    async def create_campaign_with_settings(self, name: str, kind: str, settings: dict[str, str]) -> int:
+        """Create a campaign and its settings in one transaction; targets are added by the caller."""
+        if kind not in {"invite", "messages"}:
+            raise ValueError("Неизвестный режим кампании")
+        name = name.strip()
+        if not 1 <= len(name) <= 80:
+            raise ValueError("Название кампании: от 1 до 80 символов")
+        if not set(settings) <= CAMPAIGN_SETTINGS - {"task_status", "selected_accounts", "operation_mode"}:
+            raise ValueError("Неизвестная настройка кампании")
+        async with _connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "INSERT INTO campaigns(name,created_at,kind) VALUES (?,?,?)", (name, _now_iso(), kind)
+            )
+            campaign_id = int(cursor.lastrowid)
+            rows = [(f"campaign:{campaign_id}:{key}", str(value)) for key, value in settings.items()]
+            rows.append((f"campaign:{campaign_id}:operation_mode", kind))
+            await db.executemany("INSERT INTO settings(key,value) VALUES (?,?)", rows)
+            await db.commit()
+            return campaign_id
+
     async def delivery_exists(self, username):
         async with _connect() as db:
             cur = await db.execute(
@@ -735,8 +832,18 @@ class Database(FollowupStore):
             return (await cur.fetchone())[0]
 
     async def reserve_delivery(
-        self, target_id, account_id, user_id, *, followup_text=None, access_hash=None, first_name=None
+        self,
+        target_id,
+        account_id,
+        user_id,
+        *,
+        followup_text=None,
+        access_hash=None,
+        first_name=None,
+        variant=None,
     ):
+        if variant not in (None, "A", "B"):
+            raise ValueError("Неизвестный вариант A/B-текста")
         if followup_text is not None:
             validate_message(followup_text)
             if access_hash is None:
@@ -752,8 +859,8 @@ class Database(FollowupStore):
                 raise RuntimeError("Получатель больше не находится в обработке")
             random_id = secrets.randbits(63) or 1
             cur = await db.execute(
-                "INSERT OR IGNORE INTO message_deliveries(username,user_id,campaign_id,target_id,account_id,random_id,state,created_at) VALUES (?,?,?,?,?,?,'reserved',?)",
-                (row[0], user_id, self.campaign_id, target_id, account_id, random_id, _now_iso()),
+                "INSERT OR IGNORE INTO message_deliveries(username,user_id,campaign_id,target_id,account_id,random_id,state,created_at,variant) VALUES (?,?,?,?,?,?,'reserved',?,?)",
+                (row[0], user_id, self.campaign_id, target_id, account_id, random_id, _now_iso(), variant),
             )
             if cur.rowcount == 1 and followup_text is not None:
                 await db.execute(
@@ -2557,8 +2664,12 @@ async def init_db() -> None:
         if "deleted_at" not in campaign_columns:
             await db.execute("ALTER TABLE campaigns ADD COLUMN deleted_at TEXT")
         await db.execute(
-            "CREATE TABLE IF NOT EXISTS message_deliveries(username TEXT PRIMARY KEY, user_id INTEGER NOT NULL UNIQUE, campaign_id INTEGER NOT NULL, target_id INTEGER NOT NULL, account_id INTEGER NOT NULL, random_id INTEGER NOT NULL, state TEXT NOT NULL, message_id INTEGER, created_at TEXT, completed_at TEXT)"
+            "CREATE TABLE IF NOT EXISTS message_deliveries(username TEXT PRIMARY KEY, user_id INTEGER NOT NULL UNIQUE, campaign_id INTEGER NOT NULL, target_id INTEGER NOT NULL, account_id INTEGER NOT NULL, random_id INTEGER NOT NULL, state TEXT NOT NULL, message_id INTEGER, created_at TEXT, completed_at TEXT, variant TEXT)"
         )
+        cursor = await db.execute("PRAGMA table_info(message_deliveries)")
+        if "variant" not in {row[1] for row in await cursor.fetchall()}:
+            # A/B text variant ("A"/"B") used for the first message; NULL = sent without an A/B test.
+            await db.execute("ALTER TABLE message_deliveries ADD COLUMN variant TEXT")
         await db.execute(
             "CREATE TABLE IF NOT EXISTS message_followups(username TEXT PRIMARY KEY,user_id INTEGER NOT NULL,access_hash INTEGER NOT NULL,"
             "campaign_id INTEGER NOT NULL,target_id INTEGER NOT NULL,account_id INTEGER NOT NULL,text TEXT NOT NULL,state TEXT NOT NULL,"

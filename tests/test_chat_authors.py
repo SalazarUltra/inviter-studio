@@ -418,3 +418,85 @@ class AuthorsEngineTests(DatabaseCase):
             with self.assertRaises(ValueError):
                 await self.engine.start(self.account, ["group_one"], **options)
         self.assertEqual(await self.db.get_parse_runs(), [])
+
+
+class AuthorsMultiAccountTests(DatabaseCase):
+    class GroupsHistory(FakeHistoryClient):
+        """Every reference is its own group with one author, so sources can move between accounts."""
+
+        def __init__(self, **options):
+            super().__init__(**options)
+            self.groups = {f"group_{n}": n for n in (1, 2, 3, 4)}
+
+        async def get_entity(self, reference):
+            self.references.append(reference)
+            self.entity = channel(100 + self.groups[reference])
+            number = self.groups[reference]
+            self.messages = [message(number, user_id=number * 10)]
+            self.users = [User(id=number * 10, username=f"author_{number}")]
+            return self.entity
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.first, self.second = await self.add_account(1), await self.add_account(2)
+        patcher = patch("core.chat_authors.asyncio.sleep", new=AsyncMock())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_with(self, clients, sources, accounts=None):
+        def factory(account, db=None):
+            return AsyncMock(client=clients[account["id"]])
+
+        async def call():
+            with patch("core.chat_authors.AccountManager", side_effect=factory):
+                return await ChatAuthorsEngine(self.db).start(accounts or [self.first, self.second], sources, 100)
+
+        return asyncio.wait_for(call(), 10)
+
+    async def test_sources_are_shared_between_accounts(self):
+        clients = {self.first["id"]: self.GroupsHistory(), self.second["id"]: self.GroupsHistory()}
+        result = await self.run_with(clients, ["group_1", "group_2", "group_3", "group_4"])
+        rows, sources = await self.db.get_parse_results(result["run_id"])
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(clients[self.first["id"]].references, ["group_1", "group_3"])
+        self.assertEqual(clients[self.second["id"]].references, ["group_2", "group_4"])
+        self.assertEqual(sorted(item["user_id"] for item in rows), [10, 20, 30, 40])
+        self.assertEqual([item["status"] for item in sources], ["completed"] * 4)
+        self.assertEqual((await self.db.get_parse_runs())[0]["mode"], "authors")
+
+    async def test_flood_wait_hands_the_sources_over_to_the_other_account(self):
+        flooded = self.GroupsHistory(fail_offset=0, failure=FloodWaitError(None, 90))
+        healthy = self.GroupsHistory()
+        result = await self.run_with(
+            {self.first["id"]: flooded, self.second["id"]: healthy}, ["group_1", "group_2", "group_3"]
+        )
+        rows, sources = await self.db.get_parse_results(result["run_id"])
+        self.assertEqual(flooded.references, ["group_1"])
+        self.assertCountEqual(healthy.references, ["group_2", "group_1", "group_3"])
+        self.assertEqual(sorted(item["user_id"] for item in rows), [10, 20, 30])
+        self.assertEqual([item["status"] for item in sources], ["completed"] * 3)
+        self.assertEqual([item["message_count"] for item in rows], [1, 1, 1])
+        self.assertIn("Аккаунты", result["detail"])
+        self.assertEqual((await self.db.get_account(self.first["id"]))["status"], "flood")
+
+    async def test_flood_of_the_only_account_still_ends_the_run(self):
+        flooded = self.GroupsHistory(fail_offset=0, failure=FloodWaitError(None, 90))
+        result = await self.run_with({self.first["id"]: flooded}, ["group_1", "group_2"], accounts=[self.first])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(flooded.references, ["group_1"])
+
+    async def test_single_account_dict_and_one_item_list_behave_alike(self):
+        for accounts in (self.first, [self.first]):
+            client = self.GroupsHistory()
+            result = await self.run_with({self.first["id"]: client}, ["group_1", "group_2"], accounts=accounts)
+            rows, _ = await self.db.get_parse_results(result["run_id"])
+            self.assertEqual((result["status"], sorted(item["user_id"] for item in rows)), ("completed", [10, 20]))
+            self.assertEqual(client.references, ["group_1", "group_2"])
+
+    async def test_shared_message_budget_is_not_exceeded_by_two_accounts(self):
+        clients = {self.first["id"]: self.GroupsHistory(), self.second["id"]: self.GroupsHistory()}
+        with patch("core.chat_authors.MAX_RUN_RECORDS", 1):
+            result = await self.run_with(clients, ["group_1", "group_2", "group_3"])
+        rows, _ = await self.db.get_parse_results(result["run_id"])
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(sum(item["message_count"] for item in rows), 1)

@@ -7,6 +7,7 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
+from core.ab_test import format_ab_stats
 from core.audience_import import load_audience_file
 from core.database import Database
 from core.export import write_targets_csv, write_targets_xlsx
@@ -369,6 +370,10 @@ class TargetsTab(ctk.CTkFrame):
             ).pack(anchor="center")
             self.stats_value_labels[key] = value_label
 
+        self.ab_label = ctk.CTkLabel(
+            self, text="", font=FONTS["small"], text_color=COLORS["muted"], justify="left", anchor="w", wraplength=760
+        )
+        self._ab_text = ""
         self.progress = ctk.CTkProgressBar(self)
         self.progress.pack(fill="x", padx=10, pady=(0, 8))
         self.progress.set(0)
@@ -760,7 +765,35 @@ class TargetsTab(ctk.CTkFrame):
 
         fut.add_done_callback(done)
 
+    def _show_ab_stats(self, text: str) -> None:
+        self._ab_text = text
+        self.ab_label.configure(text=text)
+        if text:
+            self.ab_label.pack(fill="x", padx=16, pady=(0, 6), before=self.progress)
+        else:
+            self.ab_label.pack_forget()
+
+    def refresh_ab_stats(self) -> None:
+        db = self.db
+
+        async def load():
+            if await db.get_campaign_kind() != "messages":
+                return ""
+            return format_ab_stats(await db.get_ab_stats())
+
+        fut = self.run_coro(load())
+
+        def done(f):
+            try:
+                text = f.result()
+            except Exception:
+                return
+            self._safe_after(lambda: self._show_ab_stats(text) if self.db is db else None)
+
+        fut.add_done_callback(done)
+
     def refresh_stats(self) -> None:
+        self.refresh_ab_stats()
         fut = self.run_coro(self.db.get_targets_stats())
 
         def done(f):

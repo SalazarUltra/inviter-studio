@@ -550,6 +550,78 @@ class AccountManager:
 
         return await asyncio.wait_for(scan(), timeout=20)
 
+    async def followup_catchup(
+        self,
+        rows,
+        *,
+        dialog_limit: int = 100,
+        max_history: int = 15,
+        history_delay: float = 0.5,
+        since=None,
+    ) -> dict:
+        """Find replies to first messages that arrived while the app was offline.
+
+        Walks the most recent dialogs (newest first, ``dialog_limit`` at most) and only looks at
+        private chats with a person who still has a waiting follow-up. A reply that is already the
+        top message of the dialog needs no extra request; otherwise the chat history after the last
+        checked message is read (at most ``max_history`` such reads per pass, ``history_delay`` apart).
+        Nothing is sent and nothing is marked read.
+
+        Returns ``{"replies": {user_id: reply_id}, "checked": {user_id: last_id}, "dialogs": int,
+        "history": int}``. Telegram limits (``FloodWaitError`` etc.) are raised to the caller.
+        """
+        result = {"replies": {}, "checked": {}, "dialogs": 0, "history": 0}
+        if not self.client or not rows:
+            return result
+        wanted = {row["user_id"]: row for row in rows}
+        threshold = None
+        if isinstance(since, datetime):
+            threshold = since if since.tzinfo else since.astimezone()
+        handled: set[int] = set()
+
+        async def scan():
+            async for dialog in self.client.iter_dialogs(limit=dialog_limit):
+                if len(handled) >= len(wanted):
+                    break
+                dialog_date = getattr(dialog, "date", None)
+                if isinstance(dialog_date, datetime) and threshold is not None:
+                    if (dialog_date if dialog_date.tzinfo else dialog_date.replace(tzinfo=timezone.utc)) < threshold:
+                        break  # newest first: everything below is older than the first messages
+                result["dialogs"] += 1
+                entity = getattr(dialog, "entity", None)
+                row = wanted.get(entity.id) if isinstance(entity, User) else None
+                if row is None or row["user_id"] in handled:
+                    continue
+                user_id, first_id = row["user_id"], row["first_message_id"]
+                checked = max(first_id, row.get("checked_id") or 0)
+                top = getattr(dialog, "message", None)
+                top_id = top.id if isinstance(getattr(top, "id", None), int) else 0
+                if top_id <= checked:
+                    handled.add(user_id)  # nothing new in this chat since the last check
+                    continue
+                if is_followup_reply(top, user_id, first_id):
+                    handled.add(user_id)
+                    result["replies"][user_id] = top_id
+                    result["checked"][user_id] = top_id
+                    continue
+                if result["history"] >= max_history:
+                    continue
+                if result["history"]:
+                    await asyncio.sleep(history_delay)
+                result["history"] += 1
+                handled.add(user_id)
+                last_id = checked
+                peer = InputPeerUser(user_id, row["access_hash"])
+                async for message in self.client.iter_messages(peer, min_id=checked, reverse=True, limit=30):
+                    last_id = max(last_id, getattr(message, "id", 0) or 0)
+                    if is_followup_reply(message, user_id, first_id):
+                        result["replies"][user_id] = message.id
+                        break
+                result["checked"][user_id] = last_id
+
+        await asyncio.wait_for(scan(), timeout=90)
+        return result
+
     async def followup_peer(self, row):
         peer = InputUser(row["user_id"], row["access_hash"])
         result = await asyncio.wait_for(self.client(GetFullUserRequest(peer)), timeout=20)

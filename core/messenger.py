@@ -13,6 +13,7 @@ from telethon.errors import (
     UsernameNotOccupiedError,
 )
 
+from core.ab_test import ABConfig, normalize_split, split_label, variant_key
 from core.account_manager import AccountManager, classify_recipient_rpc, rpc_error_text
 from core.followups import ReplyFollowups
 from core.inviter import PEER_FLOOD_COOLDOWN_SECONDS, InviterEngine
@@ -64,6 +65,8 @@ class MessageEngine(InviterEngine):
         self.followup_text = None
         self.followups = None
         self._followup_failed = False
+        self.ab = ABConfig(text)
+        self._variant_counts = {"A": 0, "B": 0}
         claimed = reserved = run_id = None
         outcome = "completed"
         try:
@@ -71,6 +74,7 @@ class MessageEngine(InviterEngine):
                 return
             if await self.db.get_campaign_kind() != "messages":
                 raise ValueError("Выберите кампанию личных сообщений")
+            self.ab = await self._load_ab_config(text)
             self.followup_text = (
                 await self.db.get_setting("followup_text", "")
                 if await self.db.get_setting("followup_enabled", "0") == "1"
@@ -313,7 +317,8 @@ class MessageEngine(InviterEngine):
                     claimed = None
                     continue
                 try:
-                    rendered = validate_message(render_message(text, getattr(user, "first_name", None)))
+                    variant, variant_text = self.ab.choose(variant_key(target["username"], getattr(user, "id", None)))
+                    rendered = validate_message(render_message(variant_text, getattr(user, "first_name", None)))
                 except ValueError as exc:
                     await self.db.mark_target(
                         claimed,
@@ -332,6 +337,7 @@ class MessageEngine(InviterEngine):
                     followup_text=self.followup_text,
                     access_hash=getattr(user, "access_hash", None),
                     first_name=getattr(user, "first_name", None),
+                    variant=variant,
                 )
                 if random_id is None:
                     await self._skip_duplicate(target)
@@ -352,6 +358,7 @@ class MessageEngine(InviterEngine):
                     await self.db.finish_delivery(reserved, "sent", result.get("message_id"))
                     claimed = reserved = None
                     self._session_counts["sent"] += 1
+                    self._count_variant(variant)
                     self._daily_done = await self.db.add_campaign_daily_success()
                     await self.db.add_log(account["phone"], target["username"], "MESSAGE_SENT", "Сообщение отправлено")
                     await self._record_streak(account["id"])
@@ -417,6 +424,7 @@ class MessageEngine(InviterEngine):
                         claimed = reserved = None
                         self._verify_requeues.pop(target["id"], None)
                         self._session_counts["sent"] += 1
+                        self._count_variant(variant)
                         await self.db.add_log(
                             account["phone"],
                             target["username"],
@@ -505,6 +513,8 @@ class MessageEngine(InviterEngine):
                 "followup_waiting": 0,
                 "followup_cancelled": 0,
             }
+            if self.ab.enabled:
+                summary["variants"] = dict(self._variant_counts)
             try:
                 if self.followups:
                     await self.followups.close()
@@ -542,6 +552,24 @@ class MessageEngine(InviterEngine):
                 self._task = None
             if self.complete_callback:
                 self.complete_callback(summary)
+
+    async def _load_ab_config(self, text_a):
+        """A/B settings of this campaign; raises ValueError for an enabled test with an unusable text B."""
+        values = await self.db.get_settings_map(["ab_enabled", "message_text_b", "ab_split_a"])
+        if values["ab_enabled"] != "1":
+            return ABConfig(text_a)
+        text_b = values["message_text_b"] or ""
+        try:
+            validate_message(render_message(validate_message(text_b), SAMPLE_NAME))
+        except ValueError as exc:
+            raise ValueError("Текст B: " + str(exc)) from None
+        config = ABConfig(text_a, text_b, normalize_split(values["ab_split_a"]), salt=str(self.db.campaign_id))
+        self.log_callback("INFO", "A/B-тест текста включён: " + split_label(config.split_a))
+        return config
+
+    def _count_variant(self, variant):
+        if variant in self._variant_counts:
+            self._variant_counts[variant] += 1
 
     async def _verify_uncertain_send(self, manager, user, text, random_id, since, result):
         """Check the chat history after an uncertain send.
