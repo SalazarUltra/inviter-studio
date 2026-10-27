@@ -17,6 +17,8 @@ from core.ai_writer import AIWriter
 from core.user_feedback import explain_error
 from core.warmup_actions import WarmupActions
 
+MAX_CONSECUTIVE_FAILURES = 10
+
 WARMUP_LEVELS = {
     "light": {
         "days": 3,
@@ -75,6 +77,8 @@ class WarmupEngine:
             return
         if level not in WARMUP_LEVELS:
             raise ValueError("Неизвестный уровень прогрева")
+        if account.get("id"):
+            account = await self.db.clear_expired_flood(account)
         if int(account.get("is_enabled", 1)) != 1 or account.get("status") in {
             "flood",
             "restricted",
@@ -203,8 +207,11 @@ class WarmupEngine:
             session["id"], status="running", started_at=session.get("started_at") or datetime.now().isoformat()
         )
 
+        consecutive_failures = 0
         while self.running:
             fresh_account = await self.db.get_account(account["id"])
+            if fresh_account:
+                fresh_account = await self.db.clear_expired_flood(fresh_account)
             if (
                 not fresh_account
                 or int(fresh_account.get("is_enabled", 1)) != 1
@@ -236,6 +243,19 @@ class WarmupEngine:
                 session["daily_action_limit"] = 0
 
             if int(session.get("day_current") or 0) > int(config["days"]):
+                if int(session.get("actions_total") or 0) < 1:
+                    # Days elapsed with zero successes — not completed. Reset the day
+                    # counter so the next start can retry the same level/topic.
+                    await self.db.update_warmup_session(
+                        session["id"],
+                        day_current=0,
+                        last_reset_date=None,
+                        actions_today=0,
+                    )
+                    raise RuntimeError(
+                        "Прогрев не завершён: за все дни не выполнено ни одного успешного действия. "
+                        "Проверьте аккаунт, каналы и подключение, затем запустите снова."
+                    )
                 await self.db.update_warmup_session(
                     session["id"],
                     status="completed",
@@ -279,8 +299,15 @@ class WarmupEngine:
                     actions_total=int(session.get("actions_total") or 0) + 1,
                     last_action_at=datetime.now().isoformat(),
                 )
+                consecutive_failures = 0
             else:
                 self.log_callback("WARN", f"⚠️ {result.get('detail', 'Неизвестная ошибка')}")
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    raise RuntimeError(
+                        f"Прогрев остановлен: {consecutive_failures} неудачных действий подряд. "
+                        "Проверьте аккаунт, каналы, прокси и подключение, затем запустите снова."
+                    )
 
             wait = random.randint(300, 1800)
             self.log_callback("INFO", f"⏳ Следующее действие через {wait // 60} мин")

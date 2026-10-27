@@ -32,12 +32,53 @@ def _today_iso() -> str:
     return date.today().isoformat()
 
 
+def is_flood_blocking(account: dict[str, Any], now: datetime | None = None) -> bool:
+    """True only while Telegram's flood pause (flood_until) is still in the future."""
+    deadline = account.get("flood_until")
+    if not deadline:
+        return False
+    try:
+        return datetime.fromisoformat(str(deadline)) > (now or datetime.now())
+    except ValueError:
+        return False
+
+
 async def _require_active_campaign(connection, campaign_id):
     row = await (
         await connection.execute("SELECT id FROM campaigns WHERE id=? AND deleted_at IS NULL", (campaign_id,))
     ).fetchone()
     if row is None:
         raise ValueError("Кампания удалена или не найдена")
+
+
+def effective_account_age_days(account: dict[str, Any]) -> int:
+    """Stored age wins; when it is 0/empty, derive it from created_at (ISO string or unix timestamp)."""
+    try:
+        stored = int(account.get("account_age_days") or 0)
+    except (TypeError, ValueError):
+        stored = 0
+    if stored > 0:
+        return stored
+    created = account.get("created_at")
+    if not created:
+        return 0
+    try:
+        if isinstance(created, (int, float)):
+            created_at = datetime.fromtimestamp(created)
+        elif str(created).strip().replace(".", "", 1).isdigit():
+            created_at = datetime.fromtimestamp(float(created))
+        else:
+            created_at = datetime.fromisoformat(str(created).strip())
+        if created_at.tzinfo is not None:
+            created_at = created_at.astimezone().replace(tzinfo=None)
+    except (ValueError, OverflowError, OSError):
+        return 0
+    return max(0, (datetime.now() - created_at).days)
+
+
+def _with_age(account: dict[str, Any]) -> dict[str, Any]:
+    account["account_age_days"] = effective_account_age_days(account)
+    return account
 
 
 def _row_to_dict(row: aiosqlite.Row | None) -> dict[str, Any] | None:
@@ -631,8 +672,8 @@ class Database(FollowupStore):
                     phone, api_id, api_hash, session_name,
                     proxy_type, proxy_host, proxy_port, proxy_login, proxy_password,
                     daily_limit, added_today, last_reset_date, status, flood_until, notes, created_at,
-                    device_profile
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'active', NULL, ?, ?, ?)
+                    device_profile, account_age_days
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'active', NULL, ?, ?, ?, ?)
                 """,
                 (
                     payload["phone"],
@@ -649,10 +690,74 @@ class Database(FollowupStore):
                     payload.get("notes"),
                     now,
                     payload.get("device_profile"),
+                    int(payload.get("account_age_days") or 0),
                 ),
             )
             await db.commit()
             return int(cur.lastrowid)
+
+    async def get_account_by_phone(self, phone: str) -> dict[str, Any] | None:
+        async with _connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT * FROM accounts WHERE phone = ?", (phone,))
+            row = await cur.fetchone()
+            return reveal_row(row) if row else None
+
+    async def save_authorized_account(self, payload: dict[str, Any]) -> tuple[int, bool]:
+        """Insert a newly authorized account or refresh the login of an existing phone.
+
+        Returns (account_id, created). A re-login never inserts a duplicate: it
+        stores the new session data, marks the account active and clears any pause.
+        """
+        payload = validate_account(payload)
+        async with _connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            row = await (await db.execute("SELECT id FROM accounts WHERE phone = ?", (payload["phone"],))).fetchone()
+            if row is None:
+                await db.commit()
+                return await self.add_account(payload), True
+            account_id = int(row[0])
+            fields = ["api_id = ?", "api_hash = ?", "session_name = ?", "status = 'active'", "flood_until = NULL"]
+            values: list[Any] = [
+                str(payload["api_id"]),
+                protect(payload["api_hash"]),
+                session_name(payload["phone"], payload.get("session_name")),
+            ]
+            if any(payload.get(key) for key in ("proxy_type", "proxy_host")):
+                for key in ("proxy_type", "proxy_host", "proxy_port", "proxy_login", "proxy_password"):
+                    fields.append(f"{key} = ?")
+                    value = payload.get(key)
+                    values.append(protect(value) if key == "proxy_password" else value)
+            if payload.get("device_profile"):
+                fields.append("device_profile = ?")
+                values.append(payload["device_profile"])
+            if payload.get("account_age_days") not in (None, ""):
+                fields.append("account_age_days = ?")
+                values.append(int(payload["account_age_days"]))
+            values.append(account_id)
+            await db.execute(f"UPDATE accounts SET {', '.join(fields)} WHERE id = ?", values)
+            await db.commit()
+            return account_id, False
+
+    async def clear_expired_flood(self, account: dict[str, Any]) -> dict[str, Any]:
+        """Reset a 'flood' account to active once its pause has passed (account dict is updated in place)."""
+        if account.get("status") != "flood" or is_flood_blocking(account):
+            return account
+        async with _connect() as db:
+            # Only reset the exact pause we observed; a newer flood wait must survive.
+            cur = await db.execute(
+                "UPDATE accounts SET status = 'active', flood_until = NULL "
+                "WHERE id = ? AND status = 'flood' AND flood_until IS ?",
+                (account["id"], account.get("flood_until")),
+            )
+            await db.commit()
+            changed = cur.rowcount == 1
+        if changed:
+            account["status"] = "active"
+            account["flood_until"] = None
+        else:
+            account.update(await self.get_account(account["id"]) or {})
+        return account
 
     async def update_account(self, account_id: int, payload: dict[str, Any]) -> None:
         # Read and write under one immediate transaction: the engine may update
@@ -677,6 +782,7 @@ class Database(FollowupStore):
                 "proxy_login",
                 "proxy_password",
                 "daily_limit",
+                "account_age_days",
                 "notes",
                 "status",
                 "flood_until",
@@ -741,21 +847,22 @@ class Database(FollowupStore):
         async with _connect() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute("SELECT * FROM accounts WHERE id = ?", (account_id,))
-            return _row_to_dict(await cur.fetchone())
+            account = _row_to_dict(await cur.fetchone())
+            return _with_age(account) if account else None
 
     async def get_accounts(self) -> list[dict[str, Any]]:
         async with _connect() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute("SELECT * FROM accounts ORDER BY id DESC")
             rows = await cur.fetchall()
-            return [reveal_row(row) for row in rows]
+            return [_with_age(reveal_row(row)) for row in rows]
 
     async def get_enabled_accounts(self) -> list[dict[str, Any]]:
         async with _connect() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute("SELECT * FROM accounts WHERE is_enabled = 1 ORDER BY id DESC")
             rows = await cur.fetchall()
-            return [reveal_row(row) for row in rows]
+            return [_with_age(reveal_row(row)) for row in rows]
 
     async def get_accounts_by_ids(self, account_ids: list[int]) -> list[dict[str, Any]]:
         if not account_ids:
@@ -768,7 +875,7 @@ class Database(FollowupStore):
                 account_ids,
             )
             rows = await cur.fetchall()
-            return [reveal_row(row) for row in rows]
+            return [_with_age(reveal_row(row)) for row in rows]
 
     async def delete_account(self, account_id: int) -> None:
         session_name: str | None = None

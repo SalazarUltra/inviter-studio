@@ -504,6 +504,11 @@ class TaskTab(ctk.CTkFrame):
             interval_block,
             "Случайная пауза от минимума до максимума. Для фиксированной паузы задайте одинаковые числа.",
         )
+        hint(
+            interval_block,
+            "В режиме приглашений ночью и поздним вечером пауза может автоматически увеличиваться. "
+            "Время определяется по системным часам компьютера (не по московскому времени).",
+        )
         tip(
             self.interval_min_entry,
             "Нижняя граница паузы в секундах. В личных сообщениях интервал общий для всех аккаунтов.",
@@ -1244,30 +1249,37 @@ class TaskTab(ctk.CTkFrame):
         db = self.db
 
         async def prepare():
-            report = await preflight(
-                db,
-                selected_ids,
-                chat,
-                live=True,
-                mode=settings["operation_mode"],
-                message=settings["message_text"],
-                followup_enabled=settings["followup_enabled"] == "1",
-            )
-            if not report["ok"]:
-                raise ValueError(format_report(report))
-            accounts = await db.get_accounts_by_ids(selected_ids)
-            if not accounts:
-                raise ValueError("Выбранные аккаунты не найдены. Обновите список и выберите доступный аккаунт")
-            async with self._draft_lock:
-                await db.save_campaign_settings({**settings, "task_status": "running"})
-            self.scheduler.start(
-                accounts,
-                chat,
-                interval_min,
-                interval_max,
-                mode=settings["operation_mode"],
-                message=settings["message_text"],
-            )
+            marked_running = False
+            try:
+                report = await preflight(
+                    db,
+                    selected_ids,
+                    chat,
+                    live=True,
+                    mode=settings["operation_mode"],
+                    message=settings["message_text"],
+                    followup_enabled=settings["followup_enabled"] == "1",
+                )
+                if not report["ok"]:
+                    raise ValueError(format_report(report))
+                accounts = await db.get_accounts_by_ids(selected_ids)
+                if not accounts:
+                    raise ValueError("Выбранные аккаунты не найдены. Обновите список и выберите доступный аккаунт")
+                async with self._draft_lock:
+                    await db.save_campaign_settings({**settings, "task_status": "running"})
+                marked_running = True
+                self.scheduler.start(
+                    accounts,
+                    chat,
+                    interval_min,
+                    interval_max,
+                    mode=settings["operation_mode"],
+                    message=settings["message_text"],
+                )
+            except Exception:
+                if marked_running and not self.scheduler.is_running():
+                    await db.set_setting("task_status", "stopped")
+                raise
 
         future = self.run_coro(prepare())
 

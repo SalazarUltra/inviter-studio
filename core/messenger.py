@@ -8,6 +8,7 @@ from telethon.errors import (
     AuthKeyUnregisteredError,
     FloodWaitError,
     PeerFloodError,
+    RPCError,
     UsernameInvalidError,
     UsernameNotOccupiedError,
 )
@@ -20,6 +21,8 @@ from core.validation import validate_message
 
 
 class MessageEngine(InviterEngine):
+    MAX_TRANSIENT_FAILURES = 5  # consecutive transient resolve errors before stopping
+
     async def start(self, accounts, text, interval_min, interval_max):
         validate_message(text)
         if self.running:
@@ -102,6 +105,7 @@ class MessageEngine(InviterEngine):
                     self.log_callback("INFO", "Сохраняется интервал после предыдущей отправки")
                     await self._wait(remaining)
             wait_reason = None
+            transient_failures = 0
             while self.running:
                 if self.paused:
                     await asyncio.sleep(0.25)
@@ -177,6 +181,7 @@ class MessageEngine(InviterEngine):
                 try:
                     user = await manager.resolve_recipient(target["username"])
                 except (ValueError, UsernameInvalidError, UsernameNotOccupiedError):
+                    transient_failures = 0
                     await self.db.mark_target(
                         claimed, "not_found", error_message="Получатель не найден или не является пользователем"
                     )
@@ -211,6 +216,32 @@ class MessageEngine(InviterEngine):
                     )
                     await self.db.add_log(account["phone"], target["username"], "MESSAGE_STOPPED", reason)
                     raise RuntimeError(f"{reason}. Кампания остановлена.") from None
+                except (asyncio.TimeoutError, ConnectionError, OSError, RPCError) as exc:
+                    # Transient network/RPC failure: the recipient stays queued and the
+                    # next account (round-robin) retries; one timeout must not end the run
+                    # or cancel waiting follow-ups. A persistent outage still stops safely.
+                    await self.db.mark_target(claimed, "pending")
+                    claimed = None
+                    transient_failures += 1
+                    detail = explain_error(exc)
+                    await self.db.add_log(
+                        account["phone"],
+                        target["username"],
+                        "RESOLVE_RETRY",
+                        f"Временная ошибка сети или Telegram ({detail}); получатель остался в очереди",
+                    )
+                    self.log_callback(
+                        "WARN",
+                        f"@{target['username']}: временная ошибка ({detail}). Повтор позже "
+                        f"({transient_failures}/{self.MAX_TRANSIENT_FAILURES})",
+                    )
+                    if transient_failures >= self.MAX_TRANSIENT_FAILURES:
+                        raise RuntimeError(
+                            "Несколько ошибок сети подряд. Проверьте интернет и прокси; получатели остались в очереди."
+                        ) from None
+                    await self._wait(min(30, 5 * transient_failures))
+                    continue
+                transient_failures = 0
                 if not self.running or self.paused:
                     await self.db.mark_target(claimed, "pending")
                     claimed = None
@@ -395,8 +426,9 @@ class MessageEngine(InviterEngine):
             ):
                 continue
             if account.get("status") == "flood":
-                await self.db.update_account_status(account["id"], "active")
-                account["status"] = "active"
+                account = await self.db.clear_expired_flood(account)
+                if account.get("status") == "flood":
+                    continue
             # The configured daily quota is the number of initial outreach
             # messages. A requested reply-triggered follow-up has its own
             # counter with the same conservative limit and must remain

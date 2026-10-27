@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from typing import Callable
 
 from core.account_manager import AccountManager
-from core.database import Database
+from core.database import Database, effective_account_age_days
 from core.user_feedback import explain_error
 from core.validation import time_minutes
 
@@ -337,8 +337,9 @@ class InviterEngine:
             if fresh.get("status") == "flood":
                 if flood_until and datetime.fromisoformat(flood_until) > now:
                     continue
-                await self.db.update_account_status(fresh["id"], "active")
-                fresh["status"] = "active"
+                fresh = await self.db.clear_expired_flood(fresh)
+                if fresh.get("status") == "flood":
+                    continue
 
             if rotation_break_until and datetime.fromisoformat(rotation_break_until) > now:
                 continue
@@ -382,7 +383,7 @@ class InviterEngine:
 
     @staticmethod
     def get_safe_daily_limit(account: dict) -> int:
-        age = int(account.get("account_age_days") or 0)
+        age = effective_account_age_days(account)
         limit = int(account.get("daily_limit", 40))
         if age < 7:
             return min(limit, 10)
@@ -408,6 +409,12 @@ class InviterEngine:
         smart_max = max(int(base_max * multiplier), smart_min)
         interval = random.randint(smart_min, smart_max)
         if multiplier > 1.0:
+            if not getattr(self, "_smart_clock_logged", False):
+                self._smart_clock_logged = True
+                self.log_callback(
+                    "INFO",
+                    "Умный интервал считается по системным часам компьютера (не по московскому времени)",
+                )
             self.log_callback(
                 "INFO",
                 f"Умный интервал ({period}): {interval} сек (x{multiplier} от базового)",

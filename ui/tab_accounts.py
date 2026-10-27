@@ -8,7 +8,8 @@ from tkinter import messagebox
 import customtkinter as ctk
 
 from core.account_manager import AccountManager
-from core.database import Database
+from core.database import Database, effective_account_age_days
+from core.inviter import InviterEngine
 from core.user_feedback import explain_error
 from core.validation import validate_account
 from ui.components import empty_state, page_intro
@@ -46,6 +47,8 @@ class AccountsTab(ctk.CTkFrame):
         self.pending_account_payload: dict | None = None
         self.get_code_btn: ctk.CTkButton | None = None
         self._code_request_inflight = False
+        self._save_inflight = False
+        self._confirm_inflight = False
         self._auth_future = None
         self.form_visible = False
         self.proxy_visible = False
@@ -265,6 +268,12 @@ class AccountsTab(ctk.CTkFrame):
             self.new_limit_entry,
             "Максимум на аккаунт в день отдельно для сообщений и приглашений. 0 запрещает действия; доступный лимит может быть меньше заданного.",
         )
+        self.new_age_entry = add_field("Возраст аккаунта, дней")
+        self.new_age_entry.insert(0, "0")
+        tip(
+            self.new_age_entry,
+            "Сколько дней аккаунту Telegram. Новые аккаунты (до 7 дней) ограничены 10 действиями в день, до 30 дней — 20. Если оставить 0, возраст считается с момента добавления в программу.",
+        )
         tip(self.new_phone_entry, "Телефон вашего Telegram в международном формате с + и кодом страны.")
         tip(
             self.new_api_id_entry,
@@ -413,6 +422,7 @@ class AccountsTab(ctk.CTkFrame):
             "api_hash": self.new_api_hash_entry.get().strip(),
             "session_name": f"session_{phone.replace('+', '')}",
             "daily_limit": int(self.new_limit_entry.get().strip() or "40"),
+            "account_age_days": int(self.new_age_entry.get().strip() or "0"),
             "proxy_type": None,
             "proxy_host": None,
             "proxy_port": None,
@@ -497,22 +507,33 @@ class AccountsTab(ctk.CTkFrame):
         future.add_done_callback(done)
 
     def _save_account(self) -> None:
-        if not self.pending_account_payload:
+        if not self.pending_account_payload or self._save_inflight:
             return
-        fut_save = self.run_coro(self.db.add_account(self.pending_account_payload))
+        self._save_inflight = True
+        payload = self.pending_account_payload
+        # AccountManager fills device_profile on the payload while connecting.
+        fut_save = self.run_coro(self.db.save_authorized_account(payload))
 
         def done_save(result):
+            self._save_inflight = False
             try:
-                result.result()
+                _account_id, created = result.result()
             except Exception as exc:
                 self._safe_after(lambda exc=exc: messagebox.showerror("Ошибка сохранения", explain_error(exc)))
                 return
             if self.auth_manager:
                 self.run_coro(self.auth_manager.disconnect())
                 self.auth_manager = None
+            message = "Аккаунт успешно добавлен и авторизован" if created else f"Вход обновлён: {payload['phone']}"
             self._safe_after(self.refresh_table)
             self._safe_after(self.hide_form)
-            self._safe_after(lambda: self.log_callback("SUCCESS", "Аккаунт успешно добавлен и авторизован"))
+            self._safe_after(lambda: self.log_callback("SUCCESS", message))
+            if not created:
+                self._safe_after(
+                    lambda: messagebox.showinfo(
+                        "Вход обновлён", f"Аккаунт {payload['phone']} уже был в списке. Вход обновлён, аккаунт готов."
+                    )
+                )
 
         fut_save.add_done_callback(done_save)
 
@@ -523,11 +544,15 @@ class AccountsTab(ctk.CTkFrame):
         if not code:
             messagebox.showwarning("Внимание", "Введите код.")
             return
+        if self._confirm_inflight:
+            return
+        self._confirm_inflight = True
         fut = self.run_coro(
             self.auth_manager.authorize(self.pending_account_payload["phone"], code=code, password=None)
         )
 
         def done(f):
+            self._confirm_inflight = False
             try:
                 result = f.result()
             except Exception as exc:  # noqa: BLE001
@@ -554,11 +579,15 @@ class AccountsTab(ctk.CTkFrame):
         if not password:
             messagebox.showwarning("Внимание", "Введите пароль 2FA.")
             return
+        if self._confirm_inflight:
+            return
+        self._confirm_inflight = True
         fut = self.run_coro(
             self.auth_manager.authorize(self.pending_account_payload["phone"], code=None, password=password)
         )
 
         def done(f):
+            self._confirm_inflight = False
             try:
                 result = f.result()
             except Exception as exc:  # noqa: BLE001
@@ -696,7 +725,8 @@ class AccountsTab(ctk.CTkFrame):
             ctk.CTkLabel(
                 actions,
                 text=f"Сегодня: приглашений {account.get('added_today') or 0}; сообщений {account.get('sent_today') or 0}"
-                f" / лимит {account.get('daily_limit', 40)} на режим",
+                f" / лимит {account.get('daily_limit', 40)} на режим"
+                f" (доступно сейчас: {InviterEngine.get_safe_daily_limit(account)}, возраст {effective_account_age_days(account)} дн.)",
                 font=FONTS["small"],
                 text_color=COLORS["muted"],
             ).pack(anchor="w", pady=(0, 5))
@@ -853,6 +883,13 @@ class AccountsTab(ctk.CTkFrame):
             return entry
 
         limit_entry = field("Лимит действий в день (0 — не отправлять)", str(account.get("daily_limit", 40)))
+        shown_age = effective_account_age_days(account)
+        age_entry = field("Возраст аккаунта, дней (до 7 — лимит 10, до 30 — 20)", str(shown_age))
+        hint(
+            form,
+            f"Доступный лимит сейчас: {InviterEngine.get_safe_daily_limit(account)} из заданных {account.get('daily_limit', 40)}.",
+            padx=8,
+        )
         proxy_type = field("Тип прокси: SOCKS5 / HTTP (необязательно)", account.get("proxy_type"))
         proxy_host = field("Адрес сервера прокси", account.get("proxy_host"))
         proxy_port = field("Порт прокси", account.get("proxy_port"))
@@ -890,6 +927,9 @@ class AccountsTab(ctk.CTkFrame):
                     "proxy_login": proxy_login.get().strip() or None,
                     "proxy_password": proxy_password.get() or None,
                 }
+                age_text = age_entry.get().strip() or "0"
+                if int(age_text) != shown_age:  # keep derived age automatic unless the user changed it
+                    payload["account_age_days"] = int(age_text)
                 selected_status = statuses[status_menu.get()]
                 if selected_status != (account.get("status") or "inactive"):
                     payload["status"] = selected_status

@@ -3,6 +3,7 @@
 import base64
 import ctypes
 import os
+import sys
 from ctypes import wintypes
 
 PREFIX = "dpapi:v1:"
@@ -13,9 +14,20 @@ class _Blob(ctypes.Structure):
     _fields_ = [("size", wintypes.DWORD), ("data", ctypes.POINTER(ctypes.c_ubyte))]
 
 
+def _require_windows() -> None:
+    """Fail loudly when DPAPI is unavailable; secrets are never stored in plaintext."""
+    if os.name == "nt":
+        return
+    if getattr(sys, "frozen", False):
+        raise RuntimeError(
+            "Собранная версия BotInvityer поддерживает только Windows: защита ключей через DPAPI "
+            "недоступна на этой системе. Запустите программу в Windows."
+        )
+    raise RuntimeError("DPAPI доступен только в Windows: ключи нельзя сохранить без шифрования")
+
+
 def _crypt(data: bytes, decrypt: bool) -> bytes:
-    if os.name != "nt":
-        raise RuntimeError("DPAPI доступен только в Windows")
+    _require_windows()
     buffer = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
     source = _Blob(len(data), buffer)
     target = _Blob()
@@ -45,9 +57,8 @@ def _crypt(data: bytes, decrypt: bool) -> bytes:
 def protect(value):
     if not value or str(value).startswith(PREFIX):
         return value
-    if os.name != "nt":
-        # Portable installs use OS file permissions; see README limitations.
-        return value
+    # Never fall back to plaintext: raises on non-Windows systems.
+    _require_windows()
     return PREFIX + base64.b64encode(_crypt(str(value).encode("utf-8"), False)).decode("ascii")
 
 

@@ -134,6 +134,22 @@ class CampaignTests(DatabaseCase):
         for copy in (self.root / "backups").glob("*.db"):
             validate_backup(copy)
 
+    async def test_automatic_backup_failure_is_soft(self):
+        with patch("core.backup.create_backup", side_effect=ValueError("Это не резервная копия TG Inviter")):
+            with self.assertLogs("core.backup", level="WARNING"):
+                automatic_backup()  # must not raise
+
+    async def test_restore_applies_even_if_pre_restore_backup_fails(self):
+        await self.db.bulk_insert_targets(["alice"])
+        copy = await asyncio.to_thread(create_backup, self.root / "copy.db")
+        await self.db.bulk_insert_targets(["bobby"])
+        await asyncio.to_thread(stage_restore, copy)
+        with patch("core.backup.create_backup", side_effect=ValueError("legacy")):
+            with self.assertLogs("core.backup", level="WARNING"):
+                await asyncio.to_thread(apply_pending_restore)
+        self.assertFalse((self.root / "restore-pending.db").exists())
+        self.assertEqual((await self.db.get_targets_stats())["total"], 1)
+
     async def test_offline_preview_never_connects_or_mutates_queue(self):
         account = await self.add_account()
         await self.db.bulk_insert_targets(["alice"])

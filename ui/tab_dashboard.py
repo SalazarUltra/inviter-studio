@@ -254,7 +254,7 @@ class TabDashboard(ctk.CTkFrame):
 
     async def _fetch_all_data(self) -> dict:
         db = self.app.db
-        accounts = await db.get_accounts()
+        accounts = [await db.clear_expired_flood(a) for a in await db.get_accounts()]
         active = [a for a in accounts if a.get("status") == "active" and a.get("is_enabled", 1)]
         flood = [a for a in accounts if a.get("status") == "flood"]
         disabled = [a for a in accounts if not a.get("is_enabled", 1)]

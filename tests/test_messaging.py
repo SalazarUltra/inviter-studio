@@ -5,7 +5,7 @@ from datetime import date
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from telethon.errors import FloodWaitError, PeerFloodError, UsernameNotOccupiedError, UserPrivacyRestrictedError
+from telethon.errors import FloodWaitError, PeerFloodError, RPCError, UsernameNotOccupiedError, UserPrivacyRestrictedError
 from telethon.tl.functions.messages import SendMessageRequest
 from telethon.tl.types import User
 
@@ -188,6 +188,41 @@ class MessagingTests(DatabaseCase):
             await engine.start([account], "Hello", 10, 10)
         self.assertEqual(manager.send_direct_message.await_count, 2)
         self.assertEqual((await self.db.get_targets_stats())["sent"], 2)
+
+    async def test_transient_resolve_errors_requeue_target_and_continue(self):
+        engine = await self.setup_campaign(["alice", "bobby"])
+        account = await self.add_account()
+        manager = self.manager(account)
+        failures = [asyncio.TimeoutError(), ConnectionError("reset"), OSError("net"), RPCError(None, "x", 500)]
+
+        async def resolve(username):
+            if failures:
+                raise failures.pop(0)
+            return User(id=123 if username == "alice" else 456)
+
+        manager.resolve_recipient.side_effect = resolve
+        with patch("core.messenger.AccountManager", return_value=manager):
+            await asyncio.wait_for(engine.start([account], "Hello", 10, 10), 3)
+        stats = await self.db.get_targets_stats()
+        self.assertEqual((stats["sent"], stats["pending"]), (2, 0))
+        self.assertEqual(self.reports[0]["outcome"], "completed")
+        self.assertEqual(engine._wait.await_count, 5)  # 4 retry back-offs + 1 pause between recipients
+        logs = await self.db.get_logs()
+        self.assertEqual(sum(row["action"] == "RESOLVE_RETRY" for row in logs), 4)
+        self.assertEqual((await self.db.get_account(account["id"]))["status"], "active")
+
+    async def test_persistent_transient_errors_stop_safely_and_keep_target_pending(self):
+        engine = await self.setup_campaign(["alice"])
+        account = await self.add_account()
+        manager = self.manager(account)
+        manager.resolve_recipient.side_effect = asyncio.TimeoutError()
+        with patch("core.messenger.AccountManager", return_value=manager):
+            await asyncio.wait_for(engine.start([account], "Hello", 10, 10), 3)
+        self.assertEqual(manager.resolve_recipient.await_count, engine.MAX_TRANSIENT_FAILURES)
+        manager.send_direct_message.assert_not_awaited()
+        self.assertEqual((await self.db.get_targets_stats())["pending"], 1)
+        self.assertEqual(self.reports[0]["outcome"], "failed")
+        self.assertEqual((await self.db.get_account(account["id"]))["status"], "active")
 
     async def test_global_journal_survives_clear_and_other_campaign(self):
         engine = await self.setup_campaign(["alice"])

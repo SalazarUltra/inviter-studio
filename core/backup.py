@@ -1,5 +1,6 @@
 """SQLite online snapshots and validated restore at the next startup."""
 
+import logging
 import os
 import sqlite3
 import tempfile
@@ -9,6 +10,8 @@ from pathlib import Path
 
 from core import database
 from core.secrets import protect, reveal_row
+
+logger = logging.getLogger(__name__)
 
 
 def validate_backup(path):
@@ -76,15 +79,19 @@ def create_backup(destination=None):
 
 
 def automatic_backup():
-    source = Path(database.DB_PATH)
-    if not source.exists():
-        return
-    folder = source.parent / "backups"
-    today = datetime.now().strftime("%Y%m%d")
-    if not list(folder.glob(f"auto-{today}-*.db")):
-        create_backup(folder / f"auto-{datetime.now():%Y%m%d-%H%M%S-%f}.db")
-    for old in sorted(folder.glob("auto-*.db"), reverse=True)[7:]:
-        old.unlink()
+    """Daily snapshot; never raises, so a bad DB or disk can't block app start."""
+    try:
+        source = Path(database.DB_PATH)
+        if not source.exists():
+            return
+        folder = source.parent / "backups"
+        today = datetime.now().strftime("%Y%m%d")
+        if not list(folder.glob(f"auto-{today}-*.db")):
+            create_backup(folder / f"auto-{datetime.now():%Y%m%d-%H%M%S-%f}.db")
+        for old in sorted(folder.glob("auto-*.db"), reverse=True)[7:]:
+            old.unlink()
+    except Exception as exc:
+        logger.warning("Автоматическая резервная копия не создана: %s", exc)
 
 
 def stage_restore(path):
@@ -116,10 +123,17 @@ def apply_pending_restore():
         return
     validate_backup(staged)
     if source.exists():
-        create_backup()  # Always keep a recovery point before restoring.
-        # Checkpoint the old WAL before replacing the main database.
-        with closing(sqlite3.connect(source)) as conn:
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        # A legacy/corrupt live DB must not block the restore the user asked for.
+        try:
+            create_backup()  # Keep a recovery point before restoring when possible.
+        except Exception as exc:
+            logger.warning("Не удалось создать копию текущей базы перед восстановлением: %s", exc)
+        try:
+            # Checkpoint the old WAL before replacing the main database.
+            with closing(sqlite3.connect(source)) as conn:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception as exc:
+            logger.warning("Не удалось завершить журнал текущей базы перед восстановлением: %s", exc)
     for suffix in ("-wal", "-shm"):
         Path(str(source) + suffix).unlink(missing_ok=True)
     os.replace(staged, source)

@@ -16,6 +16,7 @@ from core.chat_authors import (
     filter_author_stats,
     history_period,
 )
+from core.database import is_flood_blocking
 from core.export import write_parsed
 from core.parser import (
     ACTIVITY_LABELS,
@@ -621,7 +622,8 @@ class ParsingTab(ctk.CTkFrame):
         account = await self.db.get_account(account_id)
         if not account or not account.get("is_enabled"):
             raise ValueError("Аккаунт выключен или удалён")
-        if account.get("flood_until") and datetime.fromisoformat(account["flood_until"]) > datetime.now():
+        account = await self.db.clear_expired_flood(account)
+        if is_flood_blocking(account):
             raise ValueError("Аккаунт ожидает окончания паузы Telegram. Повторите позже")
         return account
 

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import sys
 import threading
@@ -31,9 +32,12 @@ def main() -> None:
     thread = None
     try:
         with InstanceLock():
-            apply_pending_restore()
-            automatic_backup()
+            try:
+                apply_pending_restore()
+            except Exception as exc:
+                logging.getLogger(__name__).warning("Восстановление из копии не применено: %s", exc)
             loop.run_until_complete(init_db())
+            automatic_backup()  # soft-fails internally; runs after migrations
             thread = threading.Thread(target=run_async_loop, args=(loop,), daemon=True)
             thread.start()
             try:

@@ -1,4 +1,6 @@
 import asyncio
+import sqlite3
+from contextlib import closing
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -7,8 +9,8 @@ from telethon.errors import FloodWaitError
 
 from core.inviter import InviterEngine
 from core.warmup_actions import WarmupActions
-from core.warmup_engine import WarmupEngine
-from tests.support import DatabaseCase
+from core.warmup_engine import MAX_CONSECUTIVE_FAILURES, WarmupEngine
+from tests.support import DatabaseCase, account_payload
 
 
 class EngineTests(DatabaseCase):
@@ -30,6 +32,40 @@ class EngineTests(DatabaseCase):
         engine = self.engine()
         engine.account_managers[account["id"]] = SimpleNamespace()
         self.assertIsNone(await engine._pick_available_account([account]))
+
+    async def test_stored_account_age_lifts_new_account_cap(self):
+        account = await self.add_account()  # support payload: age 45, limit 40
+        self.assertEqual(account["account_age_days"], 45)
+        self.assertEqual(InviterEngine.get_safe_daily_limit(account), 40)
+        young = await self.db.add_account({**account_payload(2), "account_age_days": 3})
+        self.assertEqual(InviterEngine.get_safe_daily_limit(await self.db.get_account(young)), 10)
+
+    async def test_account_age_is_editable(self):
+        account = await self.add_account()
+        await self.db.update_account(account["id"], {"account_age_days": 10})
+        fresh = await self.db.get_account(account["id"])
+        self.assertEqual((fresh["account_age_days"], InviterEngine.get_safe_daily_limit(fresh)), (10, 20))
+        with self.assertRaises(ValueError):
+            await self.db.update_account(account["id"], {"account_age_days": -1})
+
+    async def test_zero_age_is_derived_from_created_at(self):
+        key = await self.db.add_account({**account_payload(3), "account_age_days": 0})
+        fresh = await self.db.get_account(key)
+        self.assertEqual(fresh["account_age_days"], 0)
+        self.assertEqual(InviterEngine.get_safe_daily_limit(fresh), 10)
+        old = (datetime.now() - timedelta(days=45)).isoformat(timespec="seconds")
+        with closing(sqlite3.connect(self.root / "inviter.db")) as connection:
+            connection.execute("UPDATE accounts SET created_at=? WHERE id=?", (old, key))
+            connection.commit()
+        derived = await self.db.get_account(key)
+        self.assertEqual(derived["account_age_days"], 45)
+        self.assertEqual(InviterEngine.get_safe_daily_limit(derived), 40)
+        self.assertEqual((await self.db.get_accounts())[0]["account_age_days"], 45)
+        # Manual value overrides derivation; raw rows without a stored age are derived too.
+        await self.db.update_account(key, {"account_age_days": 8})
+        self.assertEqual((await self.db.get_account(key))["account_age_days"], 8)
+        self.assertEqual(InviterEngine.get_safe_daily_limit({"daily_limit": 40, "created_at": old}), 40)
+        self.assertEqual(InviterEngine.get_safe_daily_limit({"daily_limit": 40, "created_at": None}), 10)
 
     async def test_flood_is_respected_and_expiry_restores_account(self):
         account = await self.add_account()
@@ -163,6 +199,72 @@ class EngineTests(DatabaseCase):
         self.assertFalse(engine.running)
         manager.disconnect.assert_awaited_once()
         self.assertEqual((await self.db.get_warmup_session(account["id"]))["status"], "paused")
+
+    async def _select_warmup_channel(self, account):
+        await self.db.save_account_channels(account["id"], [{"id": -1001, "username": "group_one"}])
+        row = (await self.db.get_account_channels(account["id"]))[0]
+        await self.db.toggle_channel_selected(row["id"], True)
+
+    async def test_warmup_stops_with_error_after_consecutive_failures(self):
+        account = await self.add_account()
+        await self._select_warmup_channel(account)
+        engine = WarmupEngine(self.db, lambda *_: None)
+        engine._execute_action = AsyncMock(return_value={"success": False, "detail": "нет доступа"})
+        engine._sleep_interruptible = AsyncMock(return_value=True)
+        with patch("core.warmup_engine.AccountManager", return_value=AsyncMock()):
+            with self.assertRaises(RuntimeError):
+                await engine.start(account, "medium", "test")
+        self.assertEqual(engine._execute_action.await_count, MAX_CONSECUTIVE_FAILURES)
+        session = await self.db.get_warmup_session(account["id"])
+        self.assertEqual(session["status"], "error")
+        self.assertFalse(engine.running)
+
+    async def test_warmup_success_resets_failure_streak(self):
+        account = await self.add_account()
+        await self._select_warmup_channel(account)
+        engine = WarmupEngine(self.db, lambda *_: None)
+        fail = {"success": False, "detail": "нет доступа"}
+        ok = {"success": True, "detail": "готово"}
+        # 9 failures, 1 success, then 10 failures: only the final streak stops the run.
+        results = [fail] * 9 + [ok] + [fail] * MAX_CONSECUTIVE_FAILURES
+        engine._execute_action = AsyncMock(side_effect=results)
+        engine._sleep_interruptible = AsyncMock(return_value=True)
+        with patch("core.warmup_engine.AccountManager", return_value=AsyncMock()):
+            with self.assertRaises(RuntimeError):
+                await engine.start(account, "medium", "test")
+        self.assertEqual(engine._execute_action.await_count, len(results))
+        self.assertEqual((await self.db.get_warmup_session(account["id"]))["actions_total"], 1)
+
+    async def _finished_days_session(self, account, actions_total):
+        await self._select_warmup_channel(account)
+        session_id = await self.db.create_warmup_session(account["id"], "light", "test", 3)
+        await self.db.update_warmup_session(
+            session_id,
+            day_current=4,
+            actions_total=actions_total,
+            last_reset_date=datetime.now().strftime("%Y-%m-%d"),
+        )
+
+    async def test_warmup_not_completed_without_any_success(self):
+        account = await self.add_account()
+        await self._finished_days_session(account, 0)
+        engine = WarmupEngine(self.db, lambda *_: None)
+        engine._execute_action = AsyncMock()
+        with patch("core.warmup_engine.AccountManager", return_value=AsyncMock()):
+            with self.assertRaises(RuntimeError):
+                await engine.start(account, "light", "test")
+        session = await self.db.get_warmup_session(account["id"])
+        self.assertEqual(session["status"], "error")
+        self.assertEqual(session["day_current"], 0)
+        self.assertNotEqual((await self.db.get_account(account["id"]))["warmup_status"], "ready")
+
+    async def test_warmup_completes_when_days_elapsed_with_successes(self):
+        account = await self.add_account()
+        await self._finished_days_session(account, 5)
+        engine = WarmupEngine(self.db, lambda *_: None)
+        with patch("core.warmup_engine.AccountManager", return_value=AsyncMock()):
+            await engine.start(account, "light", "test")
+        self.assertEqual((await self.db.get_warmup_session(account["id"]))["status"], "completed")
 
     async def test_warmup_throttle_works_when_memory_disabled(self):
         account = await self.add_account()

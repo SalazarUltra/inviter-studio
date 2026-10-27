@@ -54,6 +54,11 @@ def validate_account(payload: dict) -> dict:
     if not 0 <= limit <= 10000:
         raise ValueError("Дневной лимит должен быть от 0 до 10000")
     result["daily_limit"] = limit
+    if result.get("account_age_days") not in (None, ""):
+        age = int(result["account_age_days"])
+        if not 0 <= age <= 36500:
+            raise ValueError("Возраст аккаунта должен быть от 0 до 36500 дней")
+        result["account_age_days"] = age
     validate_proxy(result)
     return result
 
