@@ -6,7 +6,7 @@
 
 ## Установка (portable)
 
-1. Откройте [последний релиз](https://github.com/SalazarUltra/inviter-studio/releases/latest).
+1. Откройте [последний релиз](https://github.com/SalazarUltra/inviter-studio/releases/latest) (на GitHub всегда только актуальная версия).
 2. Скачайте **`InviterStudioPortable.zip`** (при желании сверьте SHA-256 с `SHA256.txt`).
 3. Распакуйте целиком и запустите `start.bat`.
 

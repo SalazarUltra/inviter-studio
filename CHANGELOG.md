@@ -4,7 +4,8 @@
 Format: Keep a Changelog; sections are RU with short EN where useful.
 
 Релизы — только portable (`InviterStudioPortable.zip` + `SHA256.txt`), без подписи кода.
-Releases are portable-only (ZIP + SHA-256), unsigned.
+На GitHub хранится **один** актуальный релиз: при новой выкладке старый ZIP и тег удаляются, `/releases/latest` всегда указывает на текущую версию.
+Releases are portable-only (ZIP + SHA-256), unsigned. GitHub keeps only the newest release; older tags/assets are replaced on each ship.
 
 ## [Unreleased]
 
@@ -122,14 +123,4 @@ Releases are portable-only (ZIP + SHA-256), unsigned.
 - Пользовательские данные (`profile`, `data`, `sessions`, `*.db`, `.env`) не попадают ни в git, ни в ZIP; сборка проверяет это. / User data never ships.
 
 [Unreleased]: https://github.com/SalazarUltra/inviter-studio/compare/v1.2.31...HEAD
-[1.2.31]: https://github.com/SalazarUltra/inviter-studio/releases/tag/v1.2.31
-[1.2.30]: https://github.com/SalazarUltra/inviter-studio/releases/tag/v1.2.30
-[1.2.29]: https://github.com/SalazarUltra/inviter-studio/releases/tag/v1.2.29
-[1.2.28]: https://github.com/SalazarUltra/inviter-studio/releases/tag/v1.2.28
-[1.2.27]: https://github.com/SalazarUltra/inviter-studio/releases/tag/v1.2.27
-[1.2.26]: https://github.com/SalazarUltra/inviter-studio/releases/tag/v1.2.26
-[1.2.25]: https://github.com/SalazarUltra/inviter-studio/releases/tag/v1.2.25
-[1.2.24]: https://github.com/SalazarUltra/inviter-studio/releases/tag/v1.2.24
-[1.2.23]: https://github.com/SalazarUltra/inviter-studio/releases/tag/v1.2.23
-[1.2.22]: https://github.com/SalazarUltra/inviter-studio/releases/tag/v1.2.22
-[1.2.21]: https://github.com/SalazarUltra/inviter-studio/releases/tag/v1.2.21
+[1.2.31]: https://github.com/SalazarUltra/inviter-studio/releases/latest

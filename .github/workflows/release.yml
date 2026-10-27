@@ -4,9 +4,12 @@ name: Release
 # No code signing and no signing secrets: INVITER_SIGNING_THUMBPRINT is left unset,
 # so tools/build_windows.py builds an unsigned package.
 #
+# Single-release policy: after publishing, older GitHub Releases and v* tags are deleted
+# so /releases/latest always matches the shipped VERSION.
+#
 # Trigger:
-#   - push a tag `v1.2.24` (must equal core/version.py VERSION), or
-#   - run manually (workflow_dispatch) and type the version, e.g. `1.2.24`;
+#   - push a tag `v1.2.31` (must equal core/version.py VERSION), or
+#   - run manually (workflow_dispatch) and type the version, e.g. `1.2.31`;
 #     the tag `v<version>` is then created on the selected commit.
 
 on:
@@ -198,7 +201,34 @@ jobs:
           name: Inviter Studio ${{ needs.build.outputs.version }}
           body_path: release/release-notes.md
           prerelease: ${{ github.event.inputs.prerelease == 'true' }}
+          make_latest: true
           fail_on_unmatched_files: true
           files: |
             release/InviterStudioPortable.zip
             release/SHA256.txt
+
+      # Policy: GitHub keeps only the newest portable release (and its tag).
+      # Older ZIPs/tags are removed so /releases/latest always matches core/version.py.
+      - name: Replace previous releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP_TAG: v${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          echo "Keeping only ${KEEP_TAG}"
+          mapfile -t tags < <(gh release list --limit 100 --json tagName --jq '.[].tagName')
+          for tag in "${tags[@]}"; do
+            if [ "$tag" != "$KEEP_TAG" ]; then
+              echo "Deleting release $tag"
+              gh release delete "$tag" --yes --cleanup-tag
+            fi
+          done
+          # Drop any leftover v* tags that never had (or no longer have) a release.
+          mapfile -t leftovers < <(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/v" --jq '.[].ref' | sed 's#^refs/tags/##')
+          for tag in "${leftovers[@]}"; do
+            if [ "$tag" != "$KEEP_TAG" ]; then
+              echo "Deleting orphan tag $tag"
+              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${tag}"
+            fi
+          done
+          gh release list --limit 20
